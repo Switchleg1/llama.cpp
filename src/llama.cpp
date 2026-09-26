@@ -316,6 +316,31 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        // --moe-expert-cache-device: must be one of the model's devices (the
+        // explicit device list, or any GPU when none is given).
+        ggml_backend_dev_t moe_expert_dev = nullptr;
+        if (params.moe_expert_cache_device != nullptr && params.moe_expert_cache_slots > 0) {
+            bool listed = false;
+            if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                listed = false;
+            } else if (params.devices != nullptr) {
+                for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+                    listed = listed || *dev == params.moe_expert_cache_device;
+                }
+            } else {
+                const auto type = ggml_backend_dev_type(params.moe_expert_cache_device);
+                listed = type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+            }
+            if (listed) {
+                moe_expert_dev = params.moe_expert_cache_device;
+                LLAMA_LOG_INFO("%s: MoE expert cache, router, shared experts, embeddings and output owned by %s\n",
+                        __func__, ggml_backend_dev_name(moe_expert_dev));
+            } else {
+                LLAMA_LOG_WARN("%s: MoE expert cache device %s is not used by this model; following layer split\n",
+                        __func__, ggml_backend_dev_name(params.moe_expert_cache_device));
+            }
+        }
+
         // If the user enabled the MoE expert cache (--moe-expert-cache-size > 0)
         // and CUDA is available, *prepend* a tensor_buft_override that routes
         // every expert tensor to the CUDA_MoE_Cached buffer type. Prepending
@@ -362,6 +387,22 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
                                "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
             }
+            if (moe_expert_dev != nullptr) {
+                // Keep the whole MoE block (router, shared experts) with the cached
+                // experts so grouped routing stays local, plus the embeddings and
+                // output head. Patterns are anchored: "output\.weight" alone would
+                // also match every attn_output.weight.
+                static const char * MOE_DEVICE_PATTERNS[] = {
+                    "^token_embd\\.weight$",
+                    "^output\\.weight$",
+                    "\\.ffn_gate_inp",
+                    "\\.ffn_[a-z_]*shexp",
+                };
+                ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(moe_expert_dev);
+                for (const char * pattern : MOE_DEVICE_PATTERNS) {
+                    effective_overrides.push_back({pattern, dev_buft});
+                }
+            }
             effective_overrides.push_back({nullptr, nullptr});
             effective_overrides_ptr = effective_overrides.data();
         }
@@ -370,6 +411,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, effective_overrides_ptr);
 
         ml.lazy.mode    = params.lazy_mode;
+        ml.moe_expert_cache_device = moe_expert_dev;
         ml.model_shared = params.model_shared;
 
         ml.print_info();
@@ -378,21 +420,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
         if (!ok) {
             return {-1, nullptr};
-        }
-
-        if (params.moe_expert_cache_device != nullptr && params.moe_expert_cache_slots > 0) {
-            const auto & devs = model_ptr->devices;
-            const bool used = std::any_of(devs.begin(), devs.end(), [&](const llama_device & d) {
-                return !d.is_meta && d.dev == params.moe_expert_cache_device;
-            });
-            if (used) {
-                ml.moe_expert_cache_device = params.moe_expert_cache_device;
-                LLAMA_LOG_INFO("%s: MoE expert cache owned by %s for all layers\n",
-                        __func__, ggml_backend_dev_name(params.moe_expert_cache_device));
-            } else {
-                LLAMA_LOG_WARN("%s: MoE expert cache device %s is not used by this model; following layer split\n",
-                        __func__, ggml_backend_dev_name(params.moe_expert_cache_device));
-            }
         }
 
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
