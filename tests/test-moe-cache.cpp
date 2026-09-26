@@ -12492,6 +12492,17 @@ static void test_grouped_clock_replacement(int device) {
     fixture.key = grouped_decode_key(*fixture.registry, fixture.weights[1], fixture.ids, fixture.group.layout, fixture.group.n_banks);
     const auto replaced = fixture.warm(routes);
     CHECK(replaced.n_slots == 48 && replaced.transaction.acquisition.candidate.generation == 2);
+    for (const uint32_t slots : {32u, 40u, 32u, 40u}) {
+        const uint64_t generation = fixture.registry->state().generation;
+        const auto phase = candidate_snapshot(slots, &fixture.group, 1);
+        CHECK(fixture.registry->replace(&phase) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        CHECK(fixture.registry->state().generation == generation + 1);
+        fixture.key = grouped_decode_key(*fixture.registry, fixture.weights[1], fixture.ids,
+                fixture.group.layout, fixture.group.n_banks);
+        const auto resized = fixture.warm(routes);
+        CHECK(resized.n_slots == slots);
+        CHECK(resized.transaction.acquisition.candidate.generation == generation + 1);
+    }
     CUDA_OK(cudaStreamDestroy(maintenance_stream));
 }
 

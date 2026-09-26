@@ -380,6 +380,21 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-1, nullptr};
         }
 
+        if (params.moe_expert_cache_device != nullptr && params.moe_expert_cache_slots > 0) {
+            const auto & devs = model_ptr->devices;
+            const bool used = std::any_of(devs.begin(), devs.end(), [&](const llama_device & d) {
+                return !d.is_meta && d.dev == params.moe_expert_cache_device;
+            });
+            if (used) {
+                ml.moe_expert_cache_device = params.moe_expert_cache_device;
+                LLAMA_LOG_INFO("%s: MoE expert cache owned by %s for all layers\n",
+                        __func__, ggml_backend_dev_name(params.moe_expert_cache_device));
+            } else {
+                LLAMA_LOG_WARN("%s: MoE expert cache device %s is not used by this model; following layer split\n",
+                        __func__, ggml_backend_dev_name(params.moe_expert_cache_device));
+            }
+        }
+
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
         if (model == nullptr) {
             GGML_ABORT("fatal error: model does not implement llama_model_base");

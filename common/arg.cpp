@@ -2868,6 +2868,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
+        {"--prompt-moe-expert-cache-size"}, "N",
+        "target MoE cache slots during prompt processing; restore --moe-expert-cache-size for generation. "
+        "0 disables resizing (default). Positive values enable phase-aware workspace sizing; resizing clears the target cache.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prompt MoE cache size must be non-negative");
+            }
+            params.prompt_moe_expert_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_PROMPT_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
         {"--moe-expert-cache-l2-pinned-mb"}, "N",
         "MoE expert cache: total mmap-only pinned host L2 cache budget in MiB. 0 disables (default).",
         [](common_params & params, int value) {
@@ -2877,6 +2888,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_expert_cache_l2_pinned_size = (size_t) value * 1024 * 1024;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-device"}, "<dev>",
+        "MoE expert cache: device that owns the cached experts of every layer, so with --split-mode layer "
+        "the other devices hold only attention and KV (default: each layer's split device)",
+        [](common_params & params, const std::string & value) {
+            ggml_backend_load_all();
+            auto * dev = ggml_backend_dev_by_name(value.c_str());
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                throw std::invalid_argument(string_format("invalid device: %s", value.c_str()));
+            }
+            params.moe_expert_cache_device = dev;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_DEVICE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
@@ -4269,6 +4293,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-disable-multimodal"}, "[on|off]",
+        string_format("disable speculative decoding for entire multimodal requests ('on' or 'off', default: '%s')", params.spec_disable_multimodal ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.spec_disable_multimodal = true;
+            } else if (is_falsey(value)) {
+                params.spec_disable_multimodal = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --spec-disable-multimodal: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DISABLE_MULTIMODAL"));
     add_opt(common_arg(
         {"--spec-mtp-rs-planes"}, "N",
         "total target recurrent-state planes for draft-mtp, including the current state (default: 0, allocate spec-draft-n-max + 1)",

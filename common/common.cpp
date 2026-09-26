@@ -1711,6 +1711,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers          = params.n_gpu_layers;
     mparams.moe_expert_cache_slots = params.n_moe_expert_cache_slots;
+    mparams.moe_expert_cache_device = params.moe_expert_cache_device;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
@@ -1777,7 +1778,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_cpu_pinned     = params.kv_cpu_pinned;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.kv_gpu_layers     = (uint32_t) std::max(0, params.kv_gpu_layers);
-    cparams.phase_aware_workspace = params.phase_aware_workspace;
+    cparams.prompt_moe_expert_cache_slots = params.prompt_moe_expert_cache_slots;
+    cparams.phase_aware_workspace = params.phase_aware_workspace || params.prompt_moe_expert_cache_slots > 0;
     cparams.live_context_workspace = params.live_context_workspace;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

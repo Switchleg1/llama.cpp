@@ -764,6 +764,19 @@ llama_context::llama_context(
     cparams.offload_attn_compute    = params.offload_kqv || (params.op_offload && params.kv_cpu_pinned);
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
     cparams.phase_aware_workspace   = params.phase_aware_workspace;
+    cparams.prompt_moe_expert_cache_slots = params.prompt_moe_expert_cache_slots;
+    moe_effective_cache_slots = model.moe_expert_cache_slots();
+    if (cparams.prompt_moe_expert_cache_slots > 0) {
+        const uint32_t min_slots = std::max(1u, hparams.n_expert_used_max());
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || moe_effective_cache_slots <= 0 ||
+                cparams.prompt_moe_expert_cache_slots > uint32_t(moe_effective_cache_slots) ||
+                cparams.prompt_moe_expert_cache_slots < min_slots) {
+            throw std::invalid_argument("prompt MoE cache size requires a target cache and must be between active expert count and --moe-expert-cache-size");
+        }
+        cparams.phase_aware_workspace = true;
+        LLAMA_LOG_INFO("%s: prompt MoE cache = %u, generation = %d; phase-aware workspace enabled\n",
+                __func__, cparams.prompt_moe_expert_cache_slots, moe_effective_cache_slots);
+    }
     cparams.live_context_workspace  = params.live_context_workspace;
     cparams.decode_boundary_overlap = params.decode_boundary_overlap;
     cparams.no_perf                 = params.no_perf;
@@ -1483,6 +1496,16 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     }
 
     synchronize();
+    if (cparams.prompt_moe_expert_cache_slots > 0) {
+        const int32_t requested_slots = n_tokens > n_tokens_tg ?
+            int32_t(cparams.prompt_moe_expert_cache_slots) : model.moe_expert_cache_slots();
+        if (requested_slots != moe_effective_cache_slots) {
+            LLAMA_LOG_INFO("moe-cache-phase-resize: phase=%s slots=%d->%d; clearing target cache\n",
+                    n_tokens > n_tokens_tg ? "prefill" : "decode", moe_effective_cache_slots, requested_slots);
+            moe_effective_cache_slots = requested_slots;
+            moe_candidate_refresh_pending = true;
+        }
+    }
     refresh_moe_candidates();
 
     const int64_t t_start_us = ggml_time_us();
@@ -1676,6 +1699,9 @@ void llama_context::refresh_moe_candidates() {
 
     moe_candidate_refresh_pending = false;
     if (moe_candidate_replace_fns.empty()) {
+        if (cparams.prompt_moe_expert_cache_slots > 0) {
+            throw std::runtime_error("prompt MoE cache resizing requires a supported cache backend");
+        }
         return;
     }
 
@@ -1683,12 +1709,17 @@ void llama_context::refresh_moe_candidates() {
     disabled.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC;
     disabled.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION;
     disabled.struct_size = sizeof(disabled);
-    disabled.n_slots = std::max(model.moe_expert_cache_slots(), 0);
+    disabled.n_slots = std::max(moe_effective_cache_slots, 0);
 
     try {
         const llama_moe_candidate_snapshot candidates(model, *loras);
+        auto snapshot = candidates.get();
+        snapshot.n_slots = std::max(moe_effective_cache_slots, 0);
         for (const auto & endpoint : moe_candidate_replace_fns) {
-            const int32_t result = endpoint.second(endpoint.first, &candidates.get());
+            const int32_t result = endpoint.second(endpoint.first, &snapshot);
+            if (cparams.prompt_moe_expert_cache_slots > 0 && result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED) {
+                throw std::runtime_error("backend rejected phase-sized MoE cache");
+            }
             if (result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED &&
                     result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED) {
                 endpoint.second(endpoint.first, &disabled);
@@ -1697,6 +1728,9 @@ void llama_context::refresh_moe_candidates() {
     } catch (...) {
         for (const auto & endpoint : moe_candidate_replace_fns) {
             endpoint.second(endpoint.first, &disabled);
+        }
+        if (cparams.prompt_moe_expert_cache_slots > 0) {
+            throw;
         }
     }
 }
@@ -5313,6 +5347,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_cpu_pinned               =*/ false,
         /*.recurrent_state_offload     =*/ false,
         /*.phase_aware_workspace       =*/ false,
+        /*.prompt_moe_expert_cache_slots =*/ 0,
         /*.live_context_workspace      =*/ false,
         /*.decode_boundary_overlap     =*/ false,
         /*.sampler                     =*/ nullptr,

@@ -79,6 +79,7 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+    bool speculative_enabled = true;
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;

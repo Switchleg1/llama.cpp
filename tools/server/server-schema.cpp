@@ -194,6 +194,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // Speculative decoding params
     //
 
+    add((new field_bool("speculative.enabled", params.speculative_enabled))
+        ->set_desc("Enable speculative decoding for this request"));
+
     // TODO: to keep things simple, we disable speculative parameter adjustments for now
 #if 0
     // TODO: for now, be able to adjust only the draft-model based speculative parameters

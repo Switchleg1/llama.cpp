@@ -12,11 +12,76 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <mutex>
 #include <regex>
+#include <unordered_set>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+static bool is_moe_cache_buft(ggml_backend_buffer_type_t buft) {
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto is_cache = reinterpret_cast<ggml_backend_moe_cache_is_buffer_type_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME));
+        if (is_cache != nullptr && is_cache(buft)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static ggml_backend_buffer_type_t moe_cache_buft_for_layer(
+        ggml_backend_buffer_type_t cache_buft,
+        ggml_backend_dev_t preferred_dev) {
+    if (preferred_dev == nullptr) {
+        return cache_buft;
+    }
+
+    // Resolve through the registered provider rather than assuming either
+    // buffer type's device points back to the plugin that implements it.
+    // Dynamic backends and wrapper buffer types are allowed to break that
+    // assumption.
+    ggml_backend_buffer_type_t result = nullptr;
+    bool recognized = false;
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto is_cache = reinterpret_cast<ggml_backend_moe_cache_is_buffer_type_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME));
+        if (is_cache == nullptr || !is_cache(cache_buft)) {
+            continue;
+        }
+        recognized = true;
+        auto for_device = reinterpret_cast<ggml_backend_moe_cache_buffer_type_for_device_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FOR_DEVICE_PROC_NAME));
+        if (for_device != nullptr) {
+            result = for_device(preferred_dev);
+        }
+        break;
+    }
+    if (!recognized) {
+        return cache_buft;
+    }
+    if (result == nullptr) {
+        static std::once_flag missing_factory_once;
+        std::call_once(missing_factory_once, [] {
+            LLAMA_LOG_WARN("llama_model_loader: MoE cache override matched, but its backend has no device-local cache factory\n");
+        });
+        return cache_buft;
+    }
+
+    static std::mutex logged_mutex;
+    static std::unordered_set<ggml_backend_dev_t> logged_devices;
+    {
+        std::lock_guard<std::mutex> lock(logged_mutex);
+        if (logged_devices.insert(preferred_dev).second) {
+            LLAMA_LOG_WARN("llama_model_loader: device-local MoE cache routing enabled for %s\n",
+                    ggml_backend_dev_name(preferred_dev));
+        }
+    }
+    return result;
+}
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -1175,7 +1240,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     bool is_lazy = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        // Keep cached experts from each transformer layer in a separate ggml
+        // context.  Buffer allocation happens per context, avoiding the very
+        // large contiguous cudaMallocHost requests produced when every cached
+        // expert assigned to one GPU is coalesced into a single allocation.
+        const int cache_partition = is_moe_cache_buft(buft) ? tn.bid : -1;
+        const ctx_key key { buft, is_lazy, cache_partition };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1303,6 +1373,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        // The device entry is authoritative for layer split;
+                        // do not try to infer it from a possibly wrapped buft.
+                        buft = moe_cache_buft_for_layer(buft, moe_expert_cache_device != nullptr ?
+                                moe_expert_cache_device : buft_list->front().first);
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",

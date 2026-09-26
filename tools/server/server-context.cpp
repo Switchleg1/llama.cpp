@@ -527,6 +527,7 @@ struct server_slot {
 
         return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
+            && can_speculate() == other_slot.can_speculate()
             && are_lora_equal(lora, other_slot.lora);
     }
 
@@ -544,7 +545,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && task && task->params.speculative_enabled;
     }
 
     void add_token(const completion_token_output & token) {
@@ -885,8 +886,8 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
         if (mbatch) {
             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
             if (embd) {
-                void * cb_data = slot.spec;
-                static auto cb = [](llama_batch batch, void * user_data) {
+                void * cb_data = slot.can_speculate() ? slot.spec : nullptr;
+                static mtmd_helper_post_decode_callback cb = [](llama_batch batch, void * user_data) {
                     common_speculative * spec = static_cast<common_speculative *>(user_data);
                     if (!common_speculative_process(spec, batch)) {
                         return 1;
@@ -904,7 +905,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     slot.id,
                     llama_n_batch(slot.ctx_tgt),
                     &new_n_past,
-                    cb,
+                    slot.can_speculate() ? cb : nullptr,
                     cb_data
                 );
                 if (res != 0) {
@@ -1830,6 +1831,8 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+            update_cache = update_cache && task.params.speculative_enabled;
+            update_cache = update_cache && (!ret->task_prev || ret->task_prev->params.speculative_enabled);
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -1897,6 +1900,11 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (slot.task_prev && slot.task_prev->params.speculative_enabled != task.params.speculative_enabled) {
+            SLT_DBG(slot, "%s", "clearing cache for speculative mode change\n");
+            slot.prompt_clear();
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2618,6 +2626,14 @@ private:
                         }
                     }
 
+                    if (params_base.spec_disable_multimodal && task.tokens.find_next_media_chunk(0).first != nullptr && task.params.speculative_enabled) {
+                        SRV_INF("disabling speculative decoding for multimodal task %d\n", task.id);
+                        task.params.speculative_enabled = false;
+                        for (auto & child : task.child_tasks) {
+                            child.params.speculative_enabled = false;
+                        }
+                    }
+
                     const int id_task = task.id;
 
                     server_slot * slot = get_available_slot(task);
@@ -2663,7 +2679,7 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                if ((!slot.task_prev || slot.task_prev->params.speculative_enabled) && slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
@@ -4257,7 +4273,11 @@ private:
             metrics_post_decode(off, batch_view.n_tokens, has_output);
         }
 
-        if (spec) {
+        bool use_spec = !!spec;
+        for (int i = off; i < off + batch_view.n_tokens && use_spec; ++i) {
+            use_spec = slots.at(batch.tokens[i].id_slot).can_speculate();
+        }
+        if (use_spec) {
             bool ok = true;
             try {
                 queue_tasks.yield_to_queue([&]() {

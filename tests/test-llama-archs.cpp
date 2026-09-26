@@ -679,6 +679,10 @@ static void test_phase_workspace_runtime_reserve(size_t seed) {
     phase_workspace_alloc_failures = 0;
 
     llama_context_params ctx_params = llama_context_default_params();
+    GGML_ASSERT(ctx_params.prompt_moe_expert_cache_slots == 0);
+    ctx_params.prompt_moe_expert_cache_slots = 32;
+    GGML_ASSERT(llama_init_from_model(model.get(), ctx_params) == nullptr);
+    ctx_params.prompt_moe_expert_cache_slots = 0;
     ctx_params.n_ctx = 32;
     ctx_params.n_batch = 32;
     ctx_params.n_ubatch = 32;

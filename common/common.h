@@ -515,6 +515,7 @@ struct common_params {
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
     struct common_params_diffusion   diffusion;
+    bool spec_disable_multimodal = false;
 
     struct common_params_model model;
 
@@ -541,6 +542,7 @@ struct common_params {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     int32_t n_moe_expert_cache_slots = 0; // --moe-expert-cache-size: GPU LRU cache for MoE experts; 0 = off
     size_t moe_expert_cache_l2_pinned_size = 0;
+    ggml_backend_dev_t moe_expert_cache_device = nullptr; // --moe-expert-cache-device: owner of all cached experts
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -599,6 +601,7 @@ struct common_params {
     bool kv_cpu_pinned     = false; // use pinned host buffers for CPU-resident KV cache storage
     bool recurrent_state_offload = false; // offload recurrent state independently of attention KV storage
     int32_t kv_gpu_layers  = 0;     // with no_kv_offload, keep this many attention KV layers device-resident
+    int32_t prompt_moe_expert_cache_slots = 0; // 0 keeps the fixed target cache size
     bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases
     bool live_context_workspace = false; // size supported attention workspaces from the padded live KV extent
     bool warmup            = true;  // warmup run

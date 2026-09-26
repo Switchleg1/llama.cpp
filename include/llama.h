@@ -341,6 +341,7 @@ extern "C" {
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         int32_t moe_expert_cache_slots; // # of MoE expert slabs to keep cached on GPU (LRU). 0 = disabled.
+        ggml_backend_dev_t moe_expert_cache_device; // device owning every cached expert layer (NULL = follow layer split)
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
@@ -436,6 +437,7 @@ extern "C" {
         bool kv_cpu_pinned;           // use pinned host buffers for CPU-resident KV cache storage when available
         bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
         bool phase_aware_workspace;   // resize this context's compute scheduler between prompt processing and token generation
+        uint32_t prompt_moe_expert_cache_slots; // 0 keeps fixed cache sizing; positive values resize the target cache by phase
         bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent
         bool decode_boundary_overlap; // experimental: overlap decode boundary preparation and update CUDA graphs
 

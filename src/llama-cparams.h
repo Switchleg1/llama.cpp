@@ -60,6 +60,7 @@ struct llama_cparams {
     bool kv_cpu_pinned;
     bool recurrent_state_offload;
     bool phase_aware_workspace;
+    uint32_t prompt_moe_expert_cache_slots;
     bool live_context_workspace;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

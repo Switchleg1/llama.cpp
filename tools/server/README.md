@@ -4,6 +4,8 @@ Fast, lightweight, pure C/C++ HTTP server based on [httplib](https://github.com/
 
 Set of LLM REST APIs and a web UI to interact with llama.cpp.
 
+For an optional smaller target expert cache during prompt processing, see [prompt MoE cache sizing](../../docs/prompt-moe-cache.md). The default leaves fixed cache sizing unchanged.
+
 **Features:**
  * LLM inference of F16 and quantized models on GPU and CPU
  * [OpenAI API](https://github.com/openai/openai-openapi) compatible chat completions, responses, and embeddings routes
@@ -264,6 +266,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
 | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
 | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
+| `--spec-disable-multimodal [on\|off]` | disable speculative decoding for entire multimodal requests ('on' or 'off', default: 'off')<br/>(env: LLAMA_ARG_SPEC_DISABLE_MULTIMODAL) |
 | `--spec-mtp-rs-planes N` | total target recurrent-state planes for draft-mtp, including the current state (default: 0, use spec-draft-n-max + 1); see [capped MTP recurrent planes](../../docs/speculative.md#capped-mtp-recurrent-planes)<br/>(env: LLAMA_ARG_SPEC_MTP_RS_PLANES) |
 | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |

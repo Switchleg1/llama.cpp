@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -119,6 +120,10 @@ struct llama_model_loader {
 
     const struct llama_model * model_shared = nullptr;
 
+    // When set, cached MoE experts of every layer are owned by this device
+    // instead of the layer's split device.
+    ggml_backend_dev_t moe_expert_cache_device = nullptr;
+
     // cached nextn_shared_target_tensors, -1 until first read
     int shared_target_tensors = -1;
 
@@ -156,6 +161,10 @@ struct llama_model_loader {
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        // Cached MoE tensors are partitioned by transformer layer so each
+        // backing allocation stays reasonably sized.  Non-cache contexts use
+        // -1 and retain the original one-context-per-buffer-type behavior.
+        int cache_partition;
     };
 
     struct ctx_key_comparator {
@@ -163,7 +172,17 @@ struct llama_model_loader {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
             }
-            return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
+            const int name_order = strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft));
+            if (name_order != 0) {
+                return name_order < 0;
+            }
+            // Different devices may expose distinct buffer-type instances
+            // under the same display name. They must not share an allocation
+            // context, or layer-split weights are coalesced back together.
+            if (lhs.buft != rhs.buft) {
+                return std::less<ggml_backend_buffer_type_t>{}(lhs.buft, rhs.buft);
+            }
+            return lhs.cache_partition < rhs.cache_partition;
         }
     };
 

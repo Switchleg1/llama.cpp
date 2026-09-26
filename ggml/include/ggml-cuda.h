@@ -41,6 +41,7 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(v
 // count is configured via llama_model_params::moe_expert_cache_slots.
 // See ggml/src/ggml-cuda/moe-cache.cu and DESIGN.md.
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type_for_device(ggml_backend_dev_t device);
 GGML_BACKEND_API bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);
 GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(void * ptr, size_t size);
 // Compatibility shims. Cache resources are owned by CUDA backend contexts;

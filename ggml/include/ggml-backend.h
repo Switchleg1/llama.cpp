@@ -205,6 +205,7 @@ extern "C" {
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
 #define GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_buffer_type"
+#define GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FOR_DEVICE_PROC_NAME "ggml_backend_moe_cache_buffer_type_for_device"
 #define GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_is_buffer_type"
 #define GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME "ggml_backend_moe_cache_buffer_from_host_ptr"
 #define GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME "ggml_backend_moe_cache_set_slots"
@@ -213,6 +214,7 @@ extern "C" {
 #define GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME "ggml_backend_moe_cache_log_and_reset_stats"
 
     typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_buffer_type_t)(void);
+    typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_buffer_type_for_device_t)(ggml_backend_dev_t device);
     typedef bool (*ggml_backend_moe_cache_is_buffer_type_t)(ggml_backend_buffer_type_t buft);
     typedef ggml_backend_buffer_t (*ggml_backend_moe_cache_buffer_from_host_ptr_t)(void * ptr, size_t size);
     typedef void (*ggml_backend_moe_cache_set_slots_t)(int n_slots);

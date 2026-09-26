@@ -455,6 +455,29 @@ static void test(void) {
     }
 
     {
+        unset_test_env("LLAMA_ARG_PROMPT_MOE_EXPERT_CACHE_SIZE");
+        common_params prompt_params;
+        assert(prompt_params.prompt_moe_expert_cache_slots == 0);
+        assert(!common_context_params_to_llama(prompt_params).phase_aware_workspace);
+        argv = {"binary_name", "--moe-expert-cache-size", "40", "--prompt-moe-expert-cache-size", "32"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), prompt_params, LLAMA_EXAMPLE_SERVER));
+        auto ctx_params = common_context_params_to_llama(prompt_params);
+        assert(ctx_params.prompt_moe_expert_cache_slots == 32);
+        assert(ctx_params.phase_aware_workspace);
+        assert(prompt_params.n_moe_expert_cache_slots == 40);
+
+        prompt_params = common_params();
+        argv = {"binary_name", "--prompt-moe-expert-cache-size", "0"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), prompt_params, LLAMA_EXAMPLE_SERVER));
+        assert(common_context_params_to_llama(prompt_params).prompt_moe_expert_cache_slots == 0);
+        assert(!common_context_params_to_llama(prompt_params).phase_aware_workspace);
+
+        prompt_params = common_params();
+        argv = {"binary_name", "--prompt-moe-expert-cache-size", "-1"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), prompt_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    {
         unset_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE");
         common_params live_params;
         argv = {"binary_name", "-m", "model.gguf"};

@@ -8111,11 +8111,12 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
     }
     // CUDA_MoE_Cached is host-pinned but reads through the CUDA backend's
     // mul_mat_id dispatch hook (which stages slabs to a GPU slot pool on
-    // miss). The buffer's device is set to the first CUDA device; let any
-    // CUDA device claim it so the scheduler routes ops to CUDA instead of
-    // CPU.
+    // miss). The legacy generic type (null context) may be claimed by any
+    // CUDA device so the scheduler routes ops to CUDA instead of CPU.
+    // Device-local types carry the layer-split owner; only that device's
+    // cache accepts their groups, so no other device may claim them.
     if (ggml_backend_buft_is_cuda_moe_cached(buft)) {
-        return true;
+        return buft->context == nullptr || buft->device == dev;
     }
     return false;
 }
@@ -8315,6 +8316,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_cached_buffer_type;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FOR_DEVICE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_cached_buffer_type_for_device;
     }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) == 0) {
         return (void *) ggml_backend_buft_is_cuda_moe_cached;

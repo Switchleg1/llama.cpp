@@ -12,7 +12,8 @@
 //     distinguish them and divert to the cached path.
 //
 // Design choices for v1 (kept deliberately simple):
-//   * Single std::mutex around the cache metadata. Single-GPU only.
+//   * One cache owner per CUDA backend. Layer-split models use device-local
+//     buffer-type identities so each backend owns only its assigned groups.
 //   * Linear scan for LRU eviction. n_slots is typically 16-256, so the
 //     O(n) scan per miss is in the hundreds of ns.
 //   * acquire() hands back a slot_id; the caller is responsible for
@@ -961,6 +962,12 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_source(
 
     ggml_backend_buffer_t buffer = tensor->buffer;
     ggml_backend_buffer_type_t buft = buffer->buft;
+    // A device-local cached buffer retains the layer placement selected by
+    // --tensor-split. Other CUDA backends must ignore that layer's group.
+    // The legacy generic cache type has a null context and remains shareable.
+    if (ggml_backend_buft_is_cuda_moe_cached(buft) && buft->context != nullptr && buft->device != owner) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INACCESSIBLE_SOURCE;
+    }
     if (owner == nullptr || buft == nullptr || owner->iface.supports_buft == nullptr || !ggml_backend_dev_supports_buft(owner, buft)) {
         return GGML_CUDA_MOE_CANDIDATE_REJECT_INACCESSIBLE_SOURCE;
     }
@@ -7702,7 +7709,23 @@ static uint64_t moe_candidate_graph_mmid_fingerprint_finish(uint64_t fingerprint
     return fingerprint != 0 ? fingerprint : UINT64_C(1);
 }
 
+static bool moe_candidate_cache_source_owned_by(
+        ggml_backend_dev_t owner,
+        const ggml_tensor * source) {
+    if (source == nullptr || source->buffer == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(source->buffer);
+    if (!ggml_backend_buft_is_cuda_moe_cached(buft)) {
+        return false;
+    }
+    // A null context identifies the legacy generic cache type. Device-local
+    // cache types store their owning backend device in both device/context.
+    return buft->context == nullptr || buft->device == owner;
+}
+
 static bool moe_candidate_graph_mmid_inventory(
+        ggml_backend_dev_t owner,
         const ggml_cgraph * cgraph,
         uint32_t * mmid_count,
         uint64_t * mmid_fingerprint) {
@@ -7714,9 +7737,7 @@ static bool moe_candidate_graph_mmid_inventory(
     for (int32_t node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         const ggml_tensor * node = cgraph->nodes[node_index];
         const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
-        if (source == nullptr || source->buffer == nullptr ||
-                ggml_is_empty(node) ||
-                !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer))) {
+        if (ggml_is_empty(node) || !moe_candidate_cache_source_owned_by(owner, source)) {
             continue;
         }
         if (count == UINT32_MAX) {
@@ -7746,7 +7767,7 @@ uint64_t ggml_cuda_moe_grouped_context::certify_graph_coverage(
     }
     uint32_t mmid_count = 0;
     uint64_t mmid_fingerprint = 0;
-    if (!moe_candidate_graph_mmid_inventory(cgraph, &mmid_count, &mmid_fingerprint)) {
+    if (!moe_candidate_graph_mmid_inventory(impl_->owner, cgraph, &mmid_count, &mmid_fingerprint)) {
         return 0;
     }
     const impl::graph_coverage_key key = {
@@ -7811,7 +7832,7 @@ bool ggml_cuda_moe_grouped_context::recover_graph_coverage(
     }
     uint32_t mmid_count = 0;
     uint64_t mmid_fingerprint = 0;
-    if (!moe_candidate_graph_mmid_inventory(cgraph, &mmid_count, &mmid_fingerprint)) {
+    if (!moe_candidate_graph_mmid_inventory(impl_->owner, cgraph, &mmid_count, &mmid_fingerprint)) {
         return false;
     }
     const impl::graph_coverage_key key = {
@@ -9609,9 +9630,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     for (int node_index = 0; node_index < plan->graph_node_count_; ++node_index) {
         const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
         const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
-        if (source == nullptr || source->buffer == nullptr ||
-                ggml_is_empty(node) ||
-                !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer))) {
+        if (ggml_is_empty(node) || !moe_candidate_cache_source_owned_by(impl_->owner, source)) {
             continue;
         }
 
@@ -10329,7 +10348,7 @@ bool ggml_cuda_moe_grouped_context::graph_mmid_inventory_matches(
         const ggml_cuda_moe_graph_plan & plan) const {
     uint32_t current_mmid_count = 0;
     uint64_t current_mmid_fingerprint = 0;
-    if (!moe_candidate_graph_mmid_inventory(cgraph, &current_mmid_count, &current_mmid_fingerprint) ||
+    if (!moe_candidate_graph_mmid_inventory(impl_->owner, cgraph, &current_mmid_count, &current_mmid_fingerprint) ||
             current_mmid_count != plan.coverage_mmid_count_ ||
             current_mmid_fingerprint != plan.coverage_mmid_fingerprint_ ||
             !plan.inventory_complete_ || plan.mmid_inventory_.size() != plan.coverage_diagnostics_.cached_mmid ||
@@ -12520,6 +12539,19 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v2(
     } catch (...) {
         return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
     }
+    if (snapshot != nullptr && snapshot->magic == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC &&
+            snapshot->abi_version == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION &&
+            snapshot->struct_size == sizeof(*snapshot)) {
+        const auto previous = ctx->moe_grouped_context->state();
+        if (previous.accepted && previous.n_slots != snapshot->n_slots) {
+            // Captured graphs contain cache addresses. Retire them before replacing the backing.
+            ggml_cuda_set_device(ctx->device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+#ifdef USE_CUDA_GRAPH
+            ctx->cuda_graphs.clear();
+#endif
+        }
+    }
     return ctx->moe_grouped_context->replace(snapshot);
 }
 
@@ -14469,33 +14501,90 @@ static const char * ggml_backend_cuda_moe_cached_buffer_type_name(ggml_backend_b
     return GGML_CUDA_NAME "_MoE_Cached";
 }
 
+static std::mutex g_moe_cached_pinned_owner_mutex;
+static std::unordered_map<void *, int> g_moe_cached_pinned_owners;
+
+static int ggml_cuda_moe_cached_buft_device(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = buft != nullptr && buft->context != nullptr
+        ? static_cast<ggml_backend_dev_t>(buft->context)
+        : (buft != nullptr ? buft->device : nullptr);
+    if (dev == nullptr) {
+        return -1;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return -1;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
 static void ggml_backend_cuda_moe_cached_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    int owner_device = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_moe_cached_pinned_owner_mutex);
+        const auto found = g_moe_cached_pinned_owners.find(buffer->context);
+        if (found != g_moe_cached_pinned_owners.end()) {
+            owner_device = found->second;
+            g_moe_cached_pinned_owners.erase(found);
+        }
+    }
+    int previous_device = -1;
+    (void) cudaGetDevice(&previous_device);
+    if (owner_device >= 0 && owner_device != previous_device) {
+        ggml_cuda_set_device(owner_device);
+    }
     CUDA_CHECK(cudaFreeHost(buffer->context));
+    if (previous_device >= 0 && previous_device != owner_device) {
+        ggml_cuda_set_device(previous_device);
+    }
 }
 
 static void ggml_backend_cuda_moe_cached_mmap_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     moe_cache_unregister_mmap_range(buffer->context, buffer->size);
 }
 
-static void * ggml_cuda_moe_cached_pinned_malloc(size_t size) {
+static void * ggml_cuda_moe_cached_pinned_malloc(ggml_backend_buffer_type_t buft, size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
     }
     void * ptr = nullptr;
+    int previous_device = -1;
+    (void) cudaGetDevice(&previous_device);
+    const int owner_device = ggml_cuda_moe_cached_buft_device(buft);
+    if (owner_device >= 0 && owner_device != previous_device) {
+        ggml_cuda_set_device(owner_device);
+    }
+    // Default pinned memory is context/device associated. Allocate each
+    // split backing buffer while its consuming device is current rather than
+    // requiring one enormous allocation to be portable across all devices.
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+    if (previous_device >= 0 && previous_device != owner_device) {
+        ggml_cuda_set_device(previous_device);
+    }
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        GGML_LOG_DEBUG("%s: failed to allocate %.2f MiB of pinned memory: %s\n",
-                       __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of device-owned pinned memory for CUDA device %d: %s; falling back to pageable CPU memory\n",
+                      __func__, size / 1024.0 / 1024.0, owner_device, cudaGetErrorString(err));
         return nullptr;
     }
+    {
+        std::lock_guard<std::mutex> lock(g_moe_cached_pinned_owner_mutex);
+        g_moe_cached_pinned_owners.emplace(ptr, owner_device);
+    }
+    GGML_LOG_INFO("%s: allocated %.2f MiB of pinned expert backing memory owned by CUDA device %d\n",
+                  __func__, size / 1024.0 / 1024.0, owner_device);
     return ptr;
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer(
         ggml_backend_buffer_type_t buft, size_t size) {
 
-    void * ptr = ggml_cuda_moe_cached_pinned_malloc(size);
+    void * ptr = ggml_cuda_moe_cached_pinned_malloc(buft, size);
 
     if (ptr == nullptr) {
         // Pinned alloc failed -- fall back to a regular CPU buffer. This costs
@@ -14535,6 +14624,38 @@ ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void) {
         /* .context  = */ nullptr,
     };
     return &ggml_backend_cuda_buffer_type_moe_cached;
+}
+
+extern "C"
+ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type_for_device(ggml_backend_dev_t device) {
+    if (device == nullptr) {
+        return ggml_backend_cuda_moe_cached_buffer_type();
+    }
+
+    static std::mutex mutex;
+    static std::unordered_map<ggml_backend_dev_t, std::unique_ptr<ggml_backend_buffer_type>> types;
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = types.find(device);
+    if (found != types.end()) {
+        return found->second.get();
+    }
+
+    auto type = std::make_unique<ggml_backend_buffer_type>();
+    type->iface = {
+        /* .get_name         = */ ggml_backend_cuda_moe_cached_buffer_type_name,
+        /* .alloc_buffer     = */ ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer,
+        /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+        /* .get_max_size     = */ NULL,
+        /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+        /* .is_host          = */ ggml_backend_cuda_moe_cached_buffer_type_is_host,
+    };
+    type->device = device;
+    // Non-null marks this as strict device-local placement. The context is
+    // never dereferenced by the buffer implementation.
+    type->context = device;
+    auto * result = type.get();
+    types.emplace(device, std::move(type));
+    return result;
 }
 
 extern "C"

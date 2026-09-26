@@ -487,6 +487,7 @@ private:
     uint64_t graph_execution_owner_namespace = 0;
     uint64_t graph_execution_owner_generation = 1;
     bool moe_candidate_refresh_pending = true;
+    int32_t moe_effective_cache_slots = 0;
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;
