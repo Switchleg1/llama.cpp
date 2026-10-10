@@ -1026,6 +1026,432 @@ void test_hybrid_ffn_insertion() {
     fprintf(stderr, "test-moe-cache: CUDA/CPU hybrid FFN insertion and unchanged reduction OK\n");
 }
 
+// Frozen partition: residency is whatever is already committed, so no decode is planned and nothing is filled.
+void test_hybrid_frozen_partition() {
+    constexpr uint32_t frozen_slots = 4;
+    ggml_backend_ptr cuda(ggml_backend_cuda_init(0));
+    ggml_backend_ptr cpu(ggml_backend_cpu_init());
+    CHECK(cuda && cpu);
+    auto params = ggml_threadpool_params_default(2);
+    auto * pool = ggml_threadpool_new(&params);
+    CHECK(pool != nullptr);
+    ggml_backend_cpu_set_threadpool(cpu.get(), pool);
+    ggml_backend_cpu_set_n_threads(cpu.get(), params.n_threads);
+    size_t total_cold = 0, total_resident_all = 0, total_mixed = 0, total_hot = 0, total_layers = 0;
+    double half_difference = 0.0, half_square = 0.0;
+    size_t half_count = 0;
+    for (int n_rows : {1, 4}) {
+        layer_fixture cached(0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_0, false, {0, 0},
+                             all_cached_layers, frozen_slots);
+        layer_fixture host(0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_0);
+        cached.build_graph(LLM_FFN_SILU, 0.0f, false, false, n_rows);
+        host.build_graph(LLM_FFN_SILU, 0.0f, false, false, n_rows);
+        const auto & region = cached.result.get_moe_regions().front();
+        const auto & host_region = host.result.get_moe_regions().front();
+        ggml_set_output(host_region.hybrid_ffn.down_output);
+        ggml_set_output(host_region.route);
+        ggml_gallocr_ptr host_allocator(ggml_gallocr_new(ggml_backend_cpu_buffer_type()));
+        CHECK(ggml_gallocr_alloc_graph(host_allocator.get(), host.result.get_gf()));
+        const auto manifest = cached.manifest();
+        CHECK(ggml_backend_cuda_moe_candidate_replace_v2(cuda.get(), &manifest) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        auto * context = ggml_cuda_moe_grouped_context_for_test(cuda.get());
+        CHECK(context != nullptr);
+        ggml_backend_t backends[] = {cuda.get(), cpu.get()};
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 2, 512, false, true));
+        CHECK(sched != nullptr);
+        auto * graph = cached.result.get_gf();
+        for (auto & placed : cached.result.get_moe_regions()) {
+            CHECK(placed.place(sched.get(), cuda.get()));
+        }
+        CHECK(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        ggml_set_output(region.route);
+        ggml_set_output(region.hybrid_ffn.input);
+        // Warm residency through the ordinary cached path; the frozen phase below must add nothing.
+        // DRAFT independent stays grouped-eligible when routes exceed slots, which is the case being frozen.
+        auto certificate = layer_certificate(true);
+        certificate.n_rows = n_rows;
+        certificate.n_sequences = n_rows;
+        cached.set_inputs(0);
+        CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), graph, &certificate) == GGML_STATUS_SUCCESS);
+        ggml_backend_sched_synchronize(sched.get());
+        // Residency lives in the backend context, so a cut reallocation keeps what warming filled.
+        ggml_backend_sched_reset(sched.get());
+        cached.build_graph(LLM_FFN_SILU, 0.0f, false, false, n_rows);
+        graph = cached.result.get_gf();
+        const auto & routed = cached.result.get_moe_regions().front();
+        for (auto & placed : cached.result.get_moe_regions()) {
+            CHECK(placed.place(sched.get(), cuda.get()));
+        }
+        ggml_set_output(routed.route);
+        ggml_set_output(routed.hybrid_ffn.input);
+        ggml_set_output(routed.hybrid_ffn.down_output);
+        ggml_set_output(cached.output[0]);
+        const auto span = llm_graph_moe_hybrid_find_span(graph, routed);
+        CHECK(span.valid());
+        const int routing_end = span.routing_end;
+        const int boundaries[] = {routing_end, span.expert_end, span.region_end};
+        CHECK(ggml_backend_sched_set_split_boundaries(sched.get(), graph, boundaries,
+            span.region_end < graph->n_nodes ? 3 : 2));
+        CHECK(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        const ggml_cuda_moe_candidate_group_key candidate{context->state().generation, 0};
+        const auto stream = ggml_cuda_moe_owner_stream_for_test(cuda.get());
+        CHECK(stream != nullptr);
+        int32_t * device_slots = nullptr;
+        CUDA_OK(cudaMalloc(&device_slots, n_experts * sizeof(int32_t)));
+        llm_graph_moe_hybrid_routes packet;
+        llm_graph_moe_hybrid_executor executor;
+        CHECK(packet.init(n_rows * n_used, n_experts, frozen_slots));
+        CHECK(executor.init(host_region.hybrid_ffn, pool, params.n_threads, n_rows * n_used, n_experts, frozen_slots));
+        executor.certify_domain(certificate.domain, true);
+        std::vector<uint8_t> ids(ggml_nbytes(region.route));
+        std::vector<float> input(n_rows * n_dim), cold(n_rows * n_used * n_dim), oracle(cold.size());
+        size_t cold_columns = 0, mixed_partitions = 0, hot_halves = 0, hybrid_layers = 0;
+        uint32_t total_resident = 0;
+
+        for (int iteration : {1, 3, 5}) {
+            // Holding a transaction blocks the ordinary cached path, so route first, then freeze.
+            ggml_cuda_moe_grouped_acquisition acquisition;
+            ggml_cuda_moe_grouped_transaction held;
+            ggml_backend_buffer_ptr scratch;
+            int32_t * device_hot_slots = nullptr;
+            int32_t * device_hot_rows = nullptr;
+            int32_t * device_hot_columns = nullptr;
+            int32_t * device_counts = nullptr;
+            // Routing only: later batches get routes without executing or filling any expert.
+            cached.set_inputs(iteration);
+            CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &certificate, 0, routing_end) ==
+                GGML_STATUS_SUCCESS);
+            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_tensor_get(routed.route, ids.data(), 0, ids.size());
+            ggml_backend_tensor_get(routed.hybrid_ffn.input, input.data(), 0, input.size() * sizeof(float));
+            host.set_inputs(iteration);
+            ggml_backend_tensor_set(host.input, input.data(), 0, input.size() * sizeof(float));
+            CHECK(ggml_backend_graph_compute(cpu.get(), host.result.get_gf()) == GGML_STATUS_SUCCESS);
+            std::vector<uint8_t> host_ids(ids.size());
+            ggml_backend_tensor_get(host_region.route, host_ids.data(), 0, host_ids.size());
+            CHECK(host_ids == ids);
+            ggml_backend_tensor_get(host_region.hybrid_ffn.down_output, oracle.data(), 0, oracle.size() * sizeof(float));
+            CHECK(context->acquire_group_resources(candidate, &acquisition));
+            CHECK(context->begin_group_transaction(acquisition, &held));
+            ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+            // The committed host map can lag a deferred commit, so the device snapshot is the only authority.
+            const auto snapshot = [&]() {
+                std::array<int32_t, n_experts> slots;
+                slots.fill(-9);
+                CUDA_OK(cudaMemcpyAsync(device_slots, slots.data(), sizeof(slots), cudaMemcpyHostToDevice, stream));
+                CHECK(context->snapshot_resident_slots(held, stream, device_slots, slots.size()));
+                CUDA_OK(cudaMemcpyAsync(slots.data(), device_slots, sizeof(slots), cudaMemcpyDeviceToHost, stream));
+                CUDA_OK(cudaStreamSynchronize(stream));
+                return slots;
+            };
+            CHECK(!context->snapshot_resident_slots(held, stream, device_slots, n_experts - 1));
+            const auto resident = snapshot();
+            uint32_t n_resident = 0;
+            for (int expert = 0; expert < n_experts; ++expert) {
+                CHECK(resident[expert] >= -1 && resident[expert] < (int32_t) frozen_slots);
+                n_resident += resident[expert] >= 0;
+            }
+            // A shape whose routes exceed the slot pool can hold nothing resident; then every column is cold.
+            CHECK(n_resident <= frozen_slots);
+            total_resident += n_resident;
+            CHECK(packet.build(ids.data(), ids.size(), routed.route->nb[1], n_used, n_rows, resident.data(), resident.size()));
+            CHECK(executor.begin(certificate, routed.layer, routed.semantic_group, ids.data(), ids.size(),
+                routed.route->nb[1], n_used, n_rows, resident.data(), resident.size(), input.data(), cold.data()) ==
+                llm_graph_moe_hybrid_admission::ADMITTED);
+            CHECK(executor.wait());
+            const auto * routes = reinterpret_cast<const int32_t *>(ids.data());
+            const size_t row_stride = routed.route->nb[1] / sizeof(int32_t);
+            size_t cold_index = 0;
+            for (int row = 0; row < n_rows; ++row) {
+                for (int used = 0; used < n_used; ++used) {
+                    const int column = row * n_used + used;
+                    const int32_t expert = routes[row * row_stride + used];
+                    CHECK(packet.gpu_ids()[column] == resident[expert]);
+                    if (resident[expert] >= 0) {
+                        continue;
+                    }
+                    CHECK(packet.cold_ids()[cold_index] == expert && packet.cold_columns()[cold_index] == column);
+                    for (int i = 0; i < n_dim; ++i) {
+                        CHECK(cold[cold_index * n_dim + i] == oracle[column * n_dim + i]);
+                    }
+                    ++cold_index;
+                }
+            }
+            CHECK(cold_index == packet.cold_ids().size());
+            // Strata's shape: a compact resident list, each entry carrying the router index it must land on.
+            CHECK(packet.hot_slots().size() + packet.cold_ids().size() == packet.gpu_ids().size());
+            CHECK(packet.hot_slots().size() == packet.hot_columns().size() &&
+                packet.hot_experts().size() == packet.hot_slots().size() &&
+                packet.hot_rows().size() == packet.hot_slots().size());
+            std::vector<int> owner(packet.gpu_ids().size(), 0);
+            for (size_t job = 0; job < packet.hot_slots().size(); ++job) {
+                const auto column = packet.hot_columns()[job];
+                CHECK(column >= 0 && (size_t) column < owner.size() && owner[column]++ == 0);
+                CHECK(packet.hot_rows()[job] == column / n_used);
+                CHECK(packet.hot_slots()[job] == resident[packet.hot_experts()[job]]);
+                CHECK(packet.hot_slots()[job] >= 0 && packet.hot_slots()[job] < (int32_t) frozen_slots);
+                CHECK(packet.hot_experts()[job] == routes[packet.hot_rows()[job] * row_stride + column % n_used]);
+                CHECK(packet.gpu_ids()[column] == packet.hot_slots()[job]);
+            }
+            for (size_t job = 0; job < packet.cold_columns().size(); ++job) {
+                const auto column = packet.cold_columns()[job];
+                CHECK(column >= 0 && (size_t) column < owner.size() && owner[column]++ == 0);
+            }
+            // Every routed column belongs to exactly one side: no duplicate and no dropped contribution.
+            CHECK(std::all_of(owner.begin(), owner.end(), [](int count) { return count == 1; }));
+            cold_columns += cold_index;
+            mixed_partitions += cold_index != 0 && cold_index != packet.gpu_ids().size();
+            // Frozen means the partition itself fills nothing: no bank upload, no slot churn.
+            const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+            CHECK(telemetry.h2d_banks == 0 && telemetry.h2d_bytes == 0 && telemetry.demand_materialized_bytes == 0);
+            CHECK(telemetry.vacant_fills == 0 && telemetry.replacement_fills == 0 && telemetry.invalidation_refills == 0);
+            CHECK(telemetry.host_staged_ops == 0 && telemetry.fallback == 0);
+            // Device-side selection must reproduce the host packet exactly, in route order.
+            {
+                const size_t n_routes = packet.gpu_ids().size();
+                scratch.reset(ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(0),
+                    (5 * n_routes + 2) * sizeof(int32_t) + ids.size()));
+                CHECK(scratch != nullptr);
+                auto * base = static_cast<int32_t *>(ggml_backend_buffer_get_base(scratch.get()));
+                device_hot_slots = base;
+                device_hot_rows = device_hot_slots + n_routes;
+                device_hot_columns = device_hot_rows + n_routes;
+                int32_t * device_cold_ids = device_hot_columns + n_routes;
+                int32_t * device_cold_columns = device_cold_ids + n_routes;
+                device_counts = device_cold_columns + n_routes;
+                int32_t * device_ids = device_counts + 2;
+                CUDA_OK(cudaMemcpyAsync(device_ids, ids.data(), ids.size(), cudaMemcpyHostToDevice, stream));
+                const auto select = [&](int32_t top_k) {
+                    return ggml_cuda_moe_hybrid_select(device_ids, row_stride, top_k, n_rows, device_slots,
+                        n_experts, frozen_slots, device_hot_slots, device_hot_rows, device_hot_columns,
+                        device_cold_ids, device_cold_columns, device_counts, stream);
+                };
+                CHECK(!ggml_cuda_moe_hybrid_select(device_ids, row_stride, n_used, n_rows, device_slots, n_experts,
+                    frozen_slots, device_hot_slots, device_hot_rows, device_hot_columns, device_cold_ids,
+                    device_cold_columns, device_counts, nullptr));
+                CHECK(!select(0) && !select(n_experts + 1));
+                CHECK(select(n_used));
+                std::vector<int32_t> counts(2), got_hot_slots(n_routes), got_hot_rows(n_routes), got_hot_columns(n_routes);
+                std::vector<int32_t> got_cold_ids(n_routes), got_cold_columns(n_routes);
+                const auto fetch = [&](std::vector<int32_t> & out, const int32_t * src) {
+                    CUDA_OK(cudaMemcpyAsync(out.data(), src, out.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                };
+                fetch(counts, device_counts);
+                fetch(got_hot_slots, device_hot_slots);
+                fetch(got_hot_rows, device_hot_rows);
+                fetch(got_hot_columns, device_hot_columns);
+                fetch(got_cold_ids, device_cold_ids);
+                fetch(got_cold_columns, device_cold_columns);
+                CUDA_OK(cudaStreamSynchronize(stream));
+                CHECK(counts[0] == (int32_t) packet.hot_slots().size() && counts[1] == (int32_t) packet.cold_ids().size());
+                got_hot_slots.resize(counts[0]);
+                got_hot_rows.resize(counts[0]);
+                got_hot_columns.resize(counts[0]);
+                got_cold_ids.resize(counts[1]);
+                got_cold_columns.resize(counts[1]);
+                CHECK(got_hot_slots == packet.hot_slots() && got_hot_columns == packet.hot_columns());
+                CHECK(got_hot_rows == packet.hot_rows());
+                CHECK(got_cold_ids == packet.cold_ids() && got_cold_columns == packet.cold_columns());
+                // A route outside the expert range is refused instead of selected.
+                const int32_t invalid = n_experts;
+                CUDA_OK(cudaMemcpyAsync(device_ids, &invalid, sizeof(invalid), cudaMemcpyHostToDevice, stream));
+                CHECK(select(n_used));
+                fetch(counts, device_counts);
+                CUDA_OK(cudaStreamSynchronize(stream));
+                CHECK(counts[0] == -1 && counts[1] == -1);
+                // A refused selection leaves its lists unusable, so the valid one must be produced again.
+                CUDA_OK(cudaMemcpyAsync(device_ids, ids.data(), ids.size(), cudaMemcpyHostToDevice, stream));
+                CHECK(select(n_used));
+                fetch(counts, device_counts);
+                CUDA_OK(cudaStreamSynchronize(stream));
+                CHECK(counts[0] == (int32_t) packet.hot_slots().size() && counts[1] == (int32_t) packet.cold_ids().size());
+            }
+
+            // Strata's hit path in ggml terms: slot-indexed banks, compact routes, results placed by dst.
+            if (!packet.hot_slots().empty()) {
+                ggml_cuda_moe_grouped_bank_descriptor gate_bank, up_bank, down_bank;
+                const auto bank_of = [&](const ggml_tensor * tensor, ggml_cuda_moe_grouped_bank_descriptor * out) {
+                    for (uint32_t slot_index = 0; slot_index < GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS; ++slot_index) {
+                        if (context->get_group_resource_bank(held, slot_index, out) && out->tensor == tensor) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                CHECK(bank_of(cached.gate[0], &gate_bank) && bank_of(cached.up[0], &up_bank) &&
+                    bank_of(cached.down[0], &down_bank));
+                const size_t n_hits = packet.hot_slots().size();
+                ggml_context_ptr hot_ctx(ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false),
+                    nullptr, true}));
+                CHECK(hot_ctx != nullptr);
+                const auto bank_tensor = [&](const ggml_cuda_moe_grouped_bank_descriptor & bank) {
+                    auto * tensor = ggml_new_tensor_3d(hot_ctx.get(), bank.tensor->type, n_dim, n_dim, frozen_slots);
+                    CHECK(bank.expert_stride == ggml_nbytes(tensor) / frozen_slots);
+                    return tensor;
+                };
+                auto * gate_slots = bank_tensor(gate_bank);
+                auto * up_slots = bank_tensor(up_bank);
+                auto * down_slots = bank_tensor(down_bank);
+                // Gather the activation rows on the device from the selector's own row list.
+                auto * hot_rows_ids = ggml_new_tensor_1d(hot_ctx.get(), GGML_TYPE_I32, n_hits);
+                auto * hot_ids = ggml_new_tensor_2d(hot_ctx.get(), GGML_TYPE_I32, 1, n_hits);
+                ggml_set_input(hot_rows_ids);
+                ggml_set_input(hot_ids);
+                auto * batch = ggml_new_tensor_2d(hot_ctx.get(), GGML_TYPE_F32, n_dim, n_rows);
+                ggml_set_input(batch);
+                auto * hot_input = ggml_reshape_3d(hot_ctx.get(),
+                    ggml_get_rows(hot_ctx.get(), batch, hot_rows_ids), n_dim, 1, n_hits);
+                auto * up_act = ggml_mul_mat_id(hot_ctx.get(), up_slots, hot_input, hot_ids);
+                auto * gate_act = ggml_mul_mat_id(hot_ctx.get(), gate_slots, hot_input, hot_ids);
+                auto * hot_out = ggml_mul_mat_id(hot_ctx.get(),
+                    down_slots, ggml_swiglu_split(hot_ctx.get(), gate_act, up_act), hot_ids);
+                ggml_set_output(hot_out);
+                auto * hot_graph = ggml_new_graph_custom(hot_ctx.get(), 32, false);
+                ggml_build_forward_expand(hot_graph, hot_out);
+                ggml_gallocr_ptr hot_allocator(ggml_gallocr_new(ggml_backend_cuda_buffer_type(0)));
+                CHECK(ggml_gallocr_alloc_graph(hot_allocator.get(), hot_graph));
+                // The slot arena is copied so this test owns the storage; the layout and indexing are the bank's.
+                for (const auto & pair : {std::make_pair(gate_slots, &gate_bank), std::make_pair(up_slots, &up_bank),
+                                          std::make_pair(down_slots, &down_bank)}) {
+                    CUDA_OK(cudaMemcpyAsync(pair.first->data, pair.second->source_data, ggml_nbytes(pair.first),
+                        cudaMemcpyDeviceToDevice, stream));
+                }
+                // Ids and rows stay on the device: the selector's output is consumed where it was produced.
+                CUDA_OK(cudaMemcpyAsync(hot_ids->data, device_hot_slots, n_hits * sizeof(int32_t),
+                    cudaMemcpyDeviceToDevice, stream));
+                CUDA_OK(cudaMemcpyAsync(hot_rows_ids->data, device_hot_rows, n_hits * sizeof(int32_t),
+                    cudaMemcpyDeviceToDevice, stream));
+                // The batch is staged once; the per-route gather stays on the device via the selector's rows.
+                ggml_backend_tensor_set(batch, input.data(), 0, input.size() * sizeof(float));
+                CUDA_OK(cudaStreamSynchronize(stream));
+                CHECK(ggml_backend_graph_compute(cuda.get(), hot_graph) == GGML_STATUS_SUCCESS);
+                std::vector<float> hot_values(n_hits * n_dim);
+                ggml_backend_tensor_get(hot_out, hot_values.data(), 0, hot_values.size() * sizeof(float));
+
+                // The same half through the backend entry point, reading the arena in place instead of a copy.
+                {
+                    const size_t scratch_bytes = ggml_backend_cuda_moe_hybrid_hot_scratch_bytes(n_hits, n_dim);
+                    CHECK(scratch_bytes != 0);
+                    ggml_backend_buffer_ptr hot_buffer(ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(0),
+                        scratch_bytes + n_hits * n_dim * sizeof(float)));
+                    CHECK(hot_buffer != nullptr);
+                    auto * hot_base = static_cast<char *>(ggml_backend_buffer_get_base(hot_buffer.get()));
+                    auto * in_place = reinterpret_cast<float *>(hot_base + scratch_bytes);
+                    const auto execute = [&](size_t bytes) {
+                        return ggml_backend_cuda_moe_hybrid_execute_hot(cuda.get(), held, cached.gate[0], cached.up[0],
+                            cached.down[0], static_cast<const float *>(hot_input->data), device_hot_slots, n_hits,
+                            false, hot_base, bytes, in_place);
+                    };
+                    CHECK(!execute(scratch_bytes - 1));
+                    CHECK(execute(scratch_bytes));
+                    CUDA_OK(cudaStreamSynchronize(stream));
+                    std::vector<float> in_place_values(hot_values.size());
+                    CUDA_OK(cudaMemcpy(in_place_values.data(), in_place, in_place_values.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+                    double place_error = 0.0, place_norm = 0.0;
+                    for (size_t i = 0; i < hot_values.size(); ++i) {
+                        CHECK(std::isfinite(in_place_values[i]));
+                        const double difference = (double) in_place_values[i] - hot_values[i];
+                        place_error += difference * difference;
+                        place_norm += (double) hot_values[i] * hot_values[i];
+                    }
+                    const double place_nmse = place_norm > 0.0 ? place_error / place_norm : place_error;
+                    if (place_nmse != 0.0) {
+                        fprintf(stderr, "frozen in-place hot rows=%d hits=%zu NMSE=%g\n", n_rows, n_hits, place_nmse);
+                    }
+                    CHECK(place_nmse == 0.0);
+                }
+                double error = 0.0, norm = 0.0;
+                for (size_t job = 0; job < n_hits; ++job) {
+                    const auto column = packet.hot_columns()[job];
+                    for (int i = 0; i < n_dim; ++i) {
+                        const double reference = oracle[column * n_dim + i];
+                        const double difference = (double) hot_values[job * n_dim + i] - reference;
+                        error += difference * difference;
+                        norm += reference * reference;
+                        // Strata measured 4.761e-04 here and it changed generated tokens, so it is recorded.
+                        // Scaled by the signal, because near-zero elements make a raw ratio meaningless.
+                        half_difference = std::max(half_difference, std::abs(difference));
+                        half_square += reference * reference;
+                        ++half_count;
+                    }
+                }
+                const double nmse = norm > 0.0 ? error / norm : error;
+                if (nmse > 5e-4) {
+                    fprintf(stderr, "frozen hot half rows=%d iteration=%d hits=%zu NMSE=%g\n",
+                        n_rows, iteration, n_hits, nmse);
+                }
+                CHECK(nmse <= 5e-4);
+                hot_halves += n_hits;
+
+                // Strata's merge: the CPU half owns its rows and leaves the hot rows at zero, then the GPU adds.
+                std::vector<float> parts(packet.gpu_ids().size() * n_dim, 0.0f);
+                for (size_t job = 0; job < packet.cold_columns().size(); ++job) {
+                    memcpy(parts.data() + packet.cold_columns()[job] * n_dim, cold.data() + job * n_dim,
+                        n_dim * sizeof(float));
+                }
+                ggml_backend_tensor_set(routed.hybrid_ffn.down_output, parts.data(), 0, parts.size() * sizeof(float));
+                CHECK(ggml_cuda_moe_hybrid_scatter_add(
+                    static_cast<float *>(routed.hybrid_ffn.down_output->data), static_cast<const float *>(hot_out->data),
+                    device_hot_columns, device_counts, packet.gpu_ids().size(), n_dim, stream));
+                CUDA_OK(cudaStreamSynchronize(stream));
+                CHECK(!ggml_cuda_moe_hybrid_scatter_add(nullptr, static_cast<const float *>(hot_out->data),
+                    device_hot_columns, device_counts, packet.gpu_ids().size(), n_dim, stream));
+                // Every column must now be covered: the scatter filled exactly the rows the CPU left at zero.
+                std::vector<float> merged(parts.size());
+                ggml_backend_tensor_get(routed.hybrid_ffn.down_output, merged.data(), 0, merged.size() * sizeof(float));
+                CHECK(std::none_of(merged.begin(), merged.end(), [](float value) { return value == 0.0f; }));
+                for (size_t job = 0; job < n_hits; ++job) {
+                    const auto column = packet.hot_columns()[job];
+                    CHECK(memcmp(merged.data() + column * n_dim, hot_values.data() + job * n_dim,
+                        n_dim * sizeof(float)) == 0);
+                }
+                CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &certificate, span.expert_end,
+                    span.region_end) == GGML_STATUS_SUCCESS);
+                ggml_backend_sched_synchronize(sched.get());
+                std::vector<float> combined(n_rows * n_dim), reference(combined.size());
+                ggml_backend_tensor_get(cached.output[0], combined.data(), 0, combined.size() * sizeof(float));
+                ggml_backend_tensor_get(host.output[0], reference.data(), 0, reference.size() * sizeof(float));
+                double combine_error = 0.0, combine_norm = 0.0;
+                for (size_t i = 0; i < combined.size(); ++i) {
+                    CHECK(std::isfinite(combined[i]));
+                    const double difference = (double) combined[i] - reference[i];
+                    combine_error += difference * difference;
+                    combine_norm += (double) reference[i] * reference[i];
+                }
+                const double combine_nmse = combine_norm > 0.0 ? combine_error / combine_norm : combine_error;
+                if (combine_nmse > 5e-4) {
+                    fprintf(stderr, "frozen hybrid layer rows=%d iteration=%d NMSE=%g\n", n_rows, iteration, combine_nmse);
+                }
+                CHECK(combine_nmse <= 5e-4);
+                ++hybrid_layers;
+            }
+            CHECK(snapshot() == resident);
+            ggml_cuda_moe_grouped_decode_acquisition finish;
+            finish.transaction = held;
+            CHECK(context->finish_decode(finish, stream));
+            CHECK(!context->snapshot_resident_slots(held, stream, device_slots, resident.size()));
+        }
+        total_cold += cold_columns;
+        total_resident_all += total_resident;
+        total_mixed += mixed_partitions;
+        CUDA_OK(cudaFree(device_slots));
+        total_hot += hot_halves;
+        total_layers += hybrid_layers;
+        fprintf(stderr, "test-moe-cache: frozen partition rows=%d resident=%u hot=%zu cold=%zu mixed=%d layers=%zu OK\n",
+            n_rows, total_resident, hot_halves, cold_columns, (int) mixed_partitions, hybrid_layers);
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    // A mixed partition is the point of the split; all-hot or all-cold alone would not test it.
+    CHECK(total_cold != 0 && total_resident_all != 0 && total_mixed != 0 && total_hot != 0 && total_layers != 0);
+    // A hit and a miss must eventually produce the same number; this records how far apart they are today.
+    const double half_rms = half_count != 0 ? std::sqrt(half_square / half_count) : 0.0;
+    fprintf(stderr, "test-moe-cache: hybrid half disagreement max_abs=%g rms=%g ratio=%g (GPU resident vs CPU cold, q4_0)\n",
+        half_difference, half_rms, half_rms > 0.0 ? half_difference / half_rms : 0.0);
+    cpu.reset();
+    ggml_threadpool_free(pool);
+}
+
 void test_sched_compute_range(bool cpu_output = false, bool semantic_cuts = false, int n_rows = 1) {
     layer_fixture fixture(0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_0, false, {0, 0}, 0);
     fixture.build_graph(LLM_FFN_SILU, 0.0f, false, false, n_rows);
@@ -1972,6 +2398,7 @@ void test_moe_sched_compute_range() {
 
 void test_moe_hybrid_ffn_insertion() {
     test_hybrid_ffn_insertion();
+    test_hybrid_frozen_partition();
 }
 
 void test_grouped_layer_placement() {

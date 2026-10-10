@@ -660,16 +660,22 @@ static void test_grouped_decode_type(
         CHECK(packet.init(8, actual.size(), n_slots));
         CHECK(packet.build(routes, sizeof(routes), 2 * sizeof(int32_t), 2, 4, actual.data(), actual.size()));
         CHECK(packet.gpu_ids().size() == 8);
-        size_t cold = 0;
+        size_t cold = 0, hot = 0;
         for (int column = 0; column < 8; ++column) {
             CHECK(packet.gpu_ids()[column] == expected[routes[column]]);
             if (packet.gpu_ids()[column] < 0) {
                 CHECK(packet.cold_ids()[cold] == routes[column] && packet.cold_rows()[cold] == column / 2 &&
                     packet.cold_columns()[cold] == column);
                 ++cold;
+            } else {
+                // Compact resident work keeps route order and carries its router index.
+                CHECK(packet.hot_slots()[hot] == expected[routes[column]] && packet.hot_experts()[hot] == routes[column]);
+                CHECK(packet.hot_rows()[hot] == column / 2 && packet.hot_columns()[hot] == column);
+                ++hot;
             }
         }
-        CHECK(cold == packet.cold_ids().size());
+        CHECK(cold == packet.cold_ids().size() && hot == packet.hot_slots().size());
+        CHECK(hot + cold == packet.gpu_ids().size() && hot != 0 && cold != 0);
         for (uint32_t expert = 0; expert < after.size(); ++expert) {
             after[expert] = ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, expert);
         }

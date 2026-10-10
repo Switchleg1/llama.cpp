@@ -924,7 +924,137 @@ This is still cached-engine scaffolding, not frozen residency or CPU/GPU hybrid 
 
 Validation: Release build/relink, focused runner, two grouped-layer runs, insertion probe, full MoE suite, CUDA `MUL_MAT_ID` 929/929 cases, 3/3 architecture MoE CTests and `git diff --check` passed with fusion enabled. The architecture executables launched successfully on this run; no security policy was changed. Earlier Application Control failures remain recorded as historical launch failures. Artifacts: `build/hybrid-route-binding-{build,focused,layer-0,layer-1,probe,full,ops,ctest}.log`.
 
-Next: build the frozen complete-bank residency partition and certify the derived masked resident ids against its transaction/slot ownership, then join it to the existing CPU executor and bounded D2H path. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
+### Frozen residency partition without demand refill
+
+No planner change was needed. The hybrid path can simply never call `prepare_decode()`: `acquire_group_resources()` and `begin_group_transaction()` take ownership, `snapshot_resident_slots()` publishes the committed map, and `llm_graph_moe_hybrid_routes::build()` turns that map into masked GPU ids plus cold ids/rows/columns. `test_hybrid_frozen_partition()` in the insertion runner exercises that sequence with 8 experts, top-k 2 and a 4-slot pool at one and four rows.
+
+Each iteration routes through the ordinary cached path, then holds a transaction only for snapshot, partition, CPU execution and `finish_decode`. The frozen phase must prove it filled nothing, so telemetry taken inside that phase requires zero `h2d_banks`, `h2d_bytes`, `demand_materialized_bytes`, `vacant_fills`, `replacement_fills`, `invalidation_refills`, host-staged ops and fallback. A re-snapshot inside the phase must equal the first, every cold column must equal the CPU oracle exactly, and an undersized capacity and a finished transaction are both refused.
+
+Three facts came from running it, not from assumption. First, the committed host map can lag a deferred commit: `device_slot_for_expert` reported no residency while the device snapshot showed two resident experts, so the snapshot is the only authority and the original equality assertion was wrong. Second, a held transaction blocks the ordinary cached path, so the frozen phase has to be scoped per iteration. Third, residency depends on shape: at one row (2 routes, 4 slots) everything routed stays resident, and at four rows (8 routes over 4 slots) nothing is resident, so every column is cold.
+
+The first version reached only all-hot and all-cold partitions, because a batch that just executed through the cached path has already filled exactly the experts it routes. A mixed partition needs routes for a batch whose experts were never filled. Warming on a cut allocation does not work: a cut graph cannot satisfy required-grouped execution without a published route origin, and the following `begin_group_transaction` is then refused.
+
+The working order is warm first on an uncut allocation, then reset, rebuild the graph, set the routing boundary and reallocate. Residency lives in the backend context, so it survives that reallocation. Later batches then execute only `[0, routing_end)` through `ggml_backend_sched_graph_compute_range()`, which advances routes without running or filling any expert. That is also the production order. With it, the one-row shape reports `resident=6 cold_columns=5 mixed=1`: resident experts stay on the GPU while never-filled experts go to the CPU, with the no-refill telemetry still zero and cold columns still exactly equal to the CPU oracle. The four-row shape keeps nothing resident and sends all 24 columns to the CPU. The test now requires at least one mixed partition, so losing the split would fail instead of passing quietly.
+
+Windows Application Control blocked execution of freshly linked test binaries during this work, including a renamed copy, which is the same block previously seen for the architecture tests. No security policy was changed; the runs below were completed after the block cleared on the owner's machine.
+
+### Masked ids are not accepted by the grouped cached path
+
+Executing the resident half of a frozen mixed batch was attempted by writing masked ids into the route tensor, where a resident route keeps its expert and a cold route becomes `-1`, then running the expert range. Every surviving id names a resident expert, so that execution should hit only and fill nothing.
+
+It aborts the process: `CUDA error: unspecified launch failure` during stream synchronize after the expert range. The earlier negative-id skip was added to the non-grouped MMID kernels (MMVQ/MMVF/MMQ), while the grouped path remaps ids through its own slot plan and indexes bank storage with the value, so `-1` is an out-of-range access rather than a skip. Grouped execution therefore has no masked-route capability today.
+
+The attempt was reverted, including its route-origin publication and extra split boundaries, so no crashing or disabled test was left behind. No claim is made that frozen GPU-side execution works.
+
+### What Strata actually does, and the compact hot list
+
+Strata never puts a sentinel through a general matmul. In `expert_hit_run()` (`src/core/expert_source.cpp`, `HitPhase::Launch`) it asks the cache for each routed expert's slot and appends resident ones to two compact arrays, `h_slot` with the VRAM slot and `h_dst` with the router index that result must land on. A private kernel, `moe_hit_grouped_s2(cache_base, d_slot, d_dst, n_hits, ...)`, walks only those `n_hits` entries, so a cold expert is simply absent rather than encoded.
+
+Three points from that source bear on this port. The split is by router index and both halves write back to that index, because that is the order the combine weights against, which matches the column seam chosen here. The GPU half writes a separate `hit_out` buffer that is zeroed each layer, with a comment that a row hot last layer and cold this layer would otherwise keep stale output and still be summed in. And Strata is not frozen: a miss is admitted and filled on the same stream, becoming a hit on that call, and only a refused admission stays with the CPU, so the no-refill behavior qualified here is stricter than Strata.
+
+So neither earlier option matched Strata. The `-1` crash happened because absence was expressed in a representation that has no value for it. Following Strata, `llm_graph_moe_hybrid_routes` now also produces the compact resident list: `hot_slots`, `hot_experts`, `hot_rows` and `hot_columns`, built in route order alongside the existing cold lists. `hot_columns` is the `h_dst` equivalent.
+
+Tests require that hot and cold sizes add up to the route count, that each column is claimed exactly once by exactly one side, that each hot entry's slot equals the residency map for its expert and stays inside the slot pool, and that its recorded row and expert match the route it came from. The grouped staging fixture checks the same compaction against a real transaction snapshot and requires both a hot and a cold entry. Duplicate or dropped contributions therefore fail instead of passing quietly.
+
+This is the route description only. No kernel or graph consumes the hot list yet, so resident-half execution is still not performed and nothing here is a speed or overlap claim.
+
+Validation: Release build/relink, insertion probe with the frozen test, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and `git diff --check` passed. Artifacts: `build/hybrid-hotlist-{build,probe,layer,range,staging,full}.log`.
+
+Real-model regression smoke, because this work changed production CUDA and scheduler code: the 48-layer IQ3_S model served with GPU layers and CPU experts produced greedy output identical to the preserved page-align baseline (`<think>\nThe user is asking me to`), ready in 10.62 s against 10.67 s, peak RSS 11.53 GiB against 11.39 GiB. Those timings are not a performance claim; they only show no regression in load or generation. Artifacts: `build/run-qwen-hotlist-smoke.{py,json,log}`.
+
+About Strata's zeroed `hit_out`: adopting it now would change no result. The probe poisons the whole raw-down tensor before each pass and then writes every cold column, so a stale row from a previous pass fails the sentinel or parity check instead of surviving. The zero-init becomes a real requirement only once resident columns are computed into a buffer the scheduler may reuse across layers and batches, so it is folded into the hot-list consumer slice rather than added as an unused buffer.
+
+One Strata behavior is deliberately not copied: `expert_hit_run()` admits and fills a missed expert on the same stream, making it a hit on that call. That is demand refill and conflicts with the frozen partition. It remains the natural basis for adaptive residency later, promoting experts between batches rather than inside a layer.
+
+Validation after reverting: Release build/relink, insertion probe with the frozen test, grouped-layer run, ranged runner, full MoE suite and `git diff --check` passed. Artifact: `build/hybrid-frozen-gpu.log` keeps the crash evidence.
+
+Still missing: the GPU half of a frozen mixed batch is not executed here. The resident columns are proven to be identified correctly, but masked resident ids have not been run against the bank views in this frozen path, and the CPU results are not inserted back. Inputs and ids are still read to the host instead of a bounded D2H, and no overlap or speed is claimed.
+
+Validation: Release build/relink, two insertion probe runs including the frozen test, grouped-layer run, ranged runner, full MoE suite, 3/3 MoE CTests and `git diff --check` passed. Insertion parity is unchanged at `bf16 9.86851e-06` and `q4_0 1.57814e-04`. Artifacts: `build/hybrid-frozen-{build,probe,probe-2,layer,range,full,ctest}.log`.
+
+### Resident half executed from the compact hot list
+
+Strata's hit kernel takes the slot arena plus `slot_index` and `dst_index`, evaluates the expert at `blob_base + slot_index[h] * blob_bytes`, and writes to `out + dst_index[h] * n_embd`. Its mature path also builds that list on device (`moe_hit_select`), reads the count from device memory, and merges with `moe_hit_add`. The equivalent shape in this tree is slot-indexed bank weights with compacted routes, so no sentinel ever enters a matmul, which is why the masked attempt faulted.
+
+The frozen test now executes the resident half that way. It takes bank descriptors from the held transaction, builds weights shaped `[n_embd, n_ff, n_slots]`, and checks each descriptor's `expert_stride` against the tensor's own per-slot size instead of assuming the layout. Routes are compacted: ids are `hot_slots`, and the activation rows are gathered by `hot_rows`, so the expert pass runs only resident work. Each result is then compared to the CPU oracle at `hot_columns[j]`, which is the `dst_index` equivalence: a wrong placement lands on another route's row and fails.
+
+The mixed one-row shape reports `hot=1 cold=5`, and the test requires a non-zero hot half, so losing resident execution fails instead of passing quietly. Parity uses the existing quantized bound of `5e-4` taken from `test_mul_mat_id`.
+
+Test scaffolding that is not production shape: the slot arena is copied into test-owned storage because a device pointer cannot be wrapped as a ggml buffer here, the hit list is built on the host rather than by a device selector, and results are compared rather than scatter-added into the combine input. No separate zeroed `hit_out` buffer and no add kernel exist yet, so Strata's stale-row hazard is still handled by writing every column and poisoning, not by zero-init.
+
+Also relevant for later token-identity work: Strata added fp32 `x_scales` because a hit and a miss must produce the same number. Their CPU used fp32 `ActQ::scale` while the kernel read the fp16 `d` of `block_q8_0`, measured at max relative `4.761e-04` on 80 of 80 chunks, which changed generated tokens. The CPU and GPU halves here also quantize activations through different paths, and the probe's `q4_0` NMSE of `1.57814e-04` is the same order, so greedy-token identity must be measured rather than assumed.
+
+Validation: Release build/relink, two insertion probe runs, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and `git diff --check` passed. Artifacts: `build/hybrid-hothalf-{build,probe,probe-2,layer,range,staging,full}.log`.
+
+### A full hybrid layer matches the reference
+
+The merge now follows Strata: a parts buffer cleared per layer, each half written at its routed index, and the combine left untouched. Resident columns come from the compact hot list and cold columns from the CPU executor, both placed by their route column. The test then runs only `[expert_end, region_end)` through ranged execution, so the region's own weighting and reduction consume the merged parts without any modification.
+
+The merged buffer must be completely covered: every element is required to be non-zero after both halves are placed, so a dropped column would fail rather than quietly contribute zero. The region output is then compared against the CPU reference for the same batch, within the existing `5e-4` quantized bound. The mixed one-row shape reports `hot=1 cold=5 layers=1`, and a non-zero layer count is required.
+
+This is a single region executed from test scaffolding, not an inference path. Selection still happens on the host, the slot arena is still copied into test storage, the merge is staged through host memory rather than a device scatter-add, and nothing measures overlap or speed.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and `git diff --check` passed. The real-model smoke again produced greedy output identical to the preserved baseline (`<think>\nThe user is asking me to`), ready in 5.55 s with peak RSS 11.85 GiB; load time varies with page cache and is not a performance claim. Artifacts: `build/hybrid-merge-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-merge-smoke.{py,json,log}`.
+
+### Device-side hot-list selection
+
+Added `ggml_cuda_moe_hybrid_select()` in `moe-cache.cu`, the equivalent of Strata's `moe_hit_select`. It reads routed ids and a residency map from device memory and writes the compact hot and cold lists plus their counts, so route ids no longer need a host round-trip. Compaction is sequential because route order decides placement, matching the host packet exactly. Refusal is explicit: an out-of-range expert, a duplicate inside a row, or an out-of-range slot leaves both counts at `-1` rather than producing a partial list, and bad arguments are rejected before launch.
+
+The frozen test now runs the selector on the same ids and snapshot as the host packet and requires identical hot slots, hot columns, cold ids and cold counts. It also checks argument refusal and that an out-of-range route yields `-1` counts instead of a selection.
+
+The definition first landed inside an anonymous namespace in `moe-cache.cu` and failed to link; it was moved to file scope rather than worked around in the test.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, CUDA `MUL_MAT_ID` 929/929 cases, 3/3 MoE CTests and `git diff --check` passed. The real-model smoke again matched the preserved baseline output exactly, peak RSS 11.68 GiB. Artifacts: `build/hybrid-select-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-select-smoke.{py,json,log}`.
+
+One thread performs the compaction, which is fine for the route counts tested here but is not a tuned kernel.
+
+### The resident half now consumes the device lists
+
+The selector also emits `hot_rows`, so the resident half is driven by device data: slot ids and row indices are copied device to device into the expert graph's inputs, and the activation rows are gathered on the device with `get_rows` from the selector's row list. Ids and per-route activations no longer travel through host memory.
+
+Two failures found on the way, both fixed rather than worked around. A refused selection leaves its compact lists unusable, and the test reused them after the refusal case, which faulted; the valid selection is now produced again and its counts rechecked before use. Then a device-to-device copy of the region's activation failed with `invalid argument`, because that leaf is not necessarily device resident, the scheduler may place it on the CPU. The batch is therefore staged once through the existing host read, while the per-route gather stays on the device.
+
+Remaining host staging: the batch activation, the slot arena copy, and the merged columns. The arena copy stays until the execution path lives in backend code, where the bank view can be used in place as grouped execution already does.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and `git diff --check` passed. The real-model smoke again matched the preserved baseline output exactly, peak RSS 11.83 GiB. Artifacts: `build/hybrid-device-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-device-smoke.{py,json,log}`.
+
+### Strata's token-graph order, and the device merge
+
+Strata's mature path (`src/core/session.cpp`) enqueues the whole layer: `moe_hit_select` on device, `quantize_q8_0_scaled` once per layer with fp32 scales, `moe_hit_grouped_s2_dev` reading its count from device memory, `doorbell_wait` for the CPU's misses, `copy_from_mapped`, `moe_hit_add`, then the unchanged combine. There is no buffer abstraction anywhere: `cache_base` is the raw device slot arena held by the session and passed straight to kernels, which is why in-place arena use is only reachable from backend code.
+
+Two details correct earlier plans. `copy_from_mapped` is deliberately a kernel rather than a memcpy node, because "a copy-engine node splits the WDDM submission (measured 67 flushes/token)" - the same WDDM this fork runs on, so the bounded cold-half transfer should target mapped memory plus a copy kernel rather than a plain copy. And the activation is quantized once per layer and shared by both halves, so the fp32 `x_scales` parity fix is structural in their design rather than a patch.
+
+Added `ggml_cuda_moe_hybrid_scatter_add()`, the `moe_hit_add` equivalent: it adds each compact row of the resident output into the parts buffer at its routed column, reading the hot count from device memory. The frozen test now merges that way instead of assembling parts on the host: the CPU half writes its own columns and leaves resident rows at zero, the device scatter-add fills them, and the merged buffer is then required to have no zero element left and to match the resident results exactly at their routed columns. Null arguments are refused.
+
+Still outstanding and not claimed: the resident FFN itself is still executed from test-built graphs against a copied arena, selection is not yet fused into one enqueued sequence, the cold half is staged through host memory rather than mapped memory with a copy kernel, and no doorbell exists, so there is still a host synchronization per layer.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and `git diff --check` passed. The real-model smoke again matched the preserved baseline output exactly, peak RSS 11.82 GiB. Artifacts: `build/hybrid-scatter-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-scatter-smoke.{py,json,log}`.
+
+### Resident half executed in place by the backend
+
+Added `ggml_backend_cuda_moe_hybrid_execute_hot()` and `ggml_backend_cuda_moe_hybrid_hot_scratch_bytes()`. Like Strata's hit path, the entry point takes raw device pointers and the slot arena is read in place: bank views are taken from the held transaction's descriptors, the weight's own descriptor is kept and only `data` and the slot extent are replaced, exactly as the grouped path does. Each descriptor's `expert_stride` must equal the stride the view assumes, so a layout disagreement is refused rather than indexed blindly.
+
+It runs up, gate, the gated activation and down over the compact routes, with ids being the hot slots. Scratch is caller-owned and sized by the helper, so nothing allocates on the execution path, which also keeps it capture-legal. Missing arguments, a stale or inactive transaction, geometry disagreement and undersized scratch are all refused before any launch.
+
+The frozen test now runs the same half both ways and requires the in-place result to be bit-identical to the test-built graph (`NMSE == 0.0`), not merely close. Undersized scratch is checked as a refusal.
+
+A first version synthesized bank tensors from scratch and crashed in `ggml_backend_buffer_get_usage`, because the CUDA matmul paths read the weight's buffer for padding and cached-buffer checks. Copying the weight tensor and replacing only `data`, `ne[2]` and `nb[3]`, which is what the grouped path already does, fixed it; the test was not adjusted to hide it.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, CUDA `MUL_MAT_ID` 929/929 cases, 3/3 MoE CTests and `git diff --check` passed. The real-model smoke again matched the preserved baseline output exactly, peak RSS 11.84 GiB. Artifacts: `build/hybrid-hotexec-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-hotexec-smoke.{py,json,log}`.
+
+Deliberate deviations from Strata at this stage: the hit count is a host argument rather than read from device memory, so a synchronization after selection is still needed; the activation batch is staged once from the host and each half still quantizes independently; the cold half is not handed over through mapped memory with a copy kernel; and there is no doorbell.
+
+### The two halves disagree, measured
+
+Strata's `x_scales` exists because a hit and a miss must produce the same number; they measured max relative `4.761e-04` from fp16 against fp32 activation scales and it changed generated tokens. The same quantity is now measured here rather than assumed: the frozen test compares the GPU resident output against the CPU output for the same routes and reports it.
+
+A first version reported `max_relative=0.131`, which is meaningless because near-zero reference elements dominate a raw ratio. Scaled by the signal instead, the result is `max_abs=9.98e-04` against an RMS of `3.29e-02`, a worst-element ratio of about `3.0e-02`, with the aggregate NMSE unchanged at `1.57814e-04`.
+
+This is not directly comparable to Strata's number: theirs isolates activation quantization, this covers a whole Q4_0 expert chain evaluated by two different implementations. What it does establish is that the halves disagree at quantization scale rather than at machine precision, so a hybrid layer cannot be assumed to reproduce full-GPU tokens. Greedy-token identity has to be measured on a real model, and if it fails, the shared-activation-quantization path is the structural fix Strata already took.
+
+Validation: Release build, insertion probe with the measurement, grouped-layer run, ranged runner, full MoE suite and `git diff --check` passed. Artifact: `build/hybrid-parity-{focused,layer,range,full}.log`.
+
+Next: shared activation quantization so both halves consume identical inputs, a device-count form of the hot execution, and the mapped-memory handoff with a copy kernel. Speculative parity, greedy-token identity and overlap all remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
 ### Stream-ordered insertion without an intermediate drain
 

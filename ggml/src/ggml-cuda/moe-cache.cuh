@@ -1107,6 +1107,34 @@ private:
 
 ggml_cuda_moe_grouped_context * ggml_cuda_moe_grouped_context_for_test(ggml_backend_t backend);
 size_t ggml_cuda_moe_ids_cache_count_for_test(ggml_backend_t backend);
+
+// Splits routed ids against a residency map, in route order, without a host round-trip.
+// All pointers are device memory. counts[0] is the hot count, counts[1] the cold count, both -1 on refusal.
+// Capacity of every compact array must be top_k * n_rows.
+bool ggml_cuda_moe_hybrid_select(
+        const int32_t * ids, size_t row_stride, int32_t top_k, int32_t n_rows,
+        const int32_t * resident, int32_t n_experts, int32_t n_slots,
+        int32_t * hot_slots, int32_t * hot_rows, int32_t * hot_columns, int32_t * cold_ids, int32_t * cold_columns,
+        int32_t * counts, ggml_cuda_moe_stream_t stream);
+
+// Scratch bytes ggml_backend_cuda_moe_hybrid_execute_hot needs for n_hits compact routes.
+size_t ggml_backend_cuda_moe_hybrid_hot_scratch_bytes(int64_t n_hits, int64_t n_ff);
+
+// Runs the resident half in place against the transaction's slot arena: for each compact route h, the expert in
+// slot hot_slots[h] is evaluated on activation row h and written to hot_out row h. Caller owns every buffer.
+// Transaction and stream bound, no allocation here, and no decode is planned so nothing is filled.
+bool ggml_backend_cuda_moe_hybrid_execute_hot(
+        ggml_backend_t backend,
+        const ggml_cuda_moe_grouped_transaction & transaction,
+        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
+        const float * activation, const int32_t * hot_slots, int64_t n_hits, bool gelu,
+        void * scratch, size_t scratch_bytes, float * hot_out);
+
+// Adds each compact row of hot_out into parts at its routed column, reading the count from device memory.
+// parts holds the other half already; rows it owns must be left at zero by the producer.
+bool ggml_cuda_moe_hybrid_scatter_add(
+        float * parts, const float * hot_out, const int32_t * columns, const int32_t * count,
+        int64_t capacity, int64_t n_embd, ggml_cuda_moe_stream_t stream);
 ggml_cuda_moe_stream_t ggml_cuda_moe_owner_stream_for_test(ggml_backend_t backend);
 
 struct ggml_cuda_graph_capture_state_for_test {

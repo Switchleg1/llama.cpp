@@ -10242,6 +10242,96 @@ bool ggml_cuda_moe_grouped_context::snapshot_resident_slots(
     return true;
 }
 
+// Route order decides where each half lands, so the compaction is sequential by construction.
+static __global__ void moe_hybrid_select(
+        const int32_t * ids, size_t row_stride, int32_t top_k, int32_t n_rows,
+        const int32_t * resident, int32_t n_experts, int32_t n_slots,
+        int32_t * hot_slots, int32_t * hot_rows, int32_t * hot_columns, int32_t * cold_ids, int32_t * cold_columns,
+        int32_t * counts) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    counts[0] = -1;
+    counts[1] = -1;
+    int32_t n_hot = 0;
+    int32_t n_cold = 0;
+    for (int32_t row = 0; row < n_rows; ++row) {
+        for (int32_t rank = 0; rank < top_k; ++rank) {
+            const int32_t expert = ids[row * (int64_t) row_stride + rank];
+            if (expert < 0 || expert >= n_experts) {
+                return;
+            }
+            for (int32_t previous = 0; previous < rank; ++previous) {
+                if (ids[row * (int64_t) row_stride + previous] == expert) {
+                    return;
+                }
+            }
+            const int32_t slot = resident[expert];
+            if (slot < -1 || slot >= n_slots) {
+                return;
+            }
+            const int32_t column = row * top_k + rank;
+            if (slot >= 0) {
+                hot_slots[n_hot] = slot;
+                hot_rows[n_hot] = row;
+                hot_columns[n_hot] = column;
+                ++n_hot;
+            } else {
+                cold_ids[n_cold] = expert;
+                cold_columns[n_cold] = column;
+                ++n_cold;
+            }
+        }
+    }
+    counts[0] = n_hot;
+    counts[1] = n_cold;
+}
+
+bool ggml_cuda_moe_hybrid_select(
+        const int32_t * ids, size_t row_stride, int32_t top_k, int32_t n_rows,
+        const int32_t * resident, int32_t n_experts, int32_t n_slots,
+        int32_t * hot_slots, int32_t * hot_rows, int32_t * hot_columns, int32_t * cold_ids, int32_t * cold_columns,
+        int32_t * counts, ggml_cuda_moe_stream_t stream) {
+    if (ids == nullptr || resident == nullptr || hot_slots == nullptr || hot_rows == nullptr || hot_columns == nullptr ||
+            cold_ids == nullptr || cold_columns == nullptr || counts == nullptr || stream == nullptr ||
+            top_k <= 0 || n_rows <= 0 || n_experts <= 0 || n_slots < 0 || top_k > n_experts ||
+            row_stride < (size_t) top_k || n_rows > INT32_MAX / top_k) {
+        return false;
+    }
+    moe_hybrid_select<<<1, 1, 0, (cudaStream_t) stream>>>(ids, row_stride, top_k, n_rows, resident, n_experts,
+        n_slots, hot_slots, hot_rows, hot_columns, cold_ids, cold_columns, counts);
+    return moe_grouped_cuda_success(cudaGetLastError());
+}
+
+static __global__ void moe_hybrid_scatter_add(
+        float * parts, const float * hot_out, const int32_t * columns, const int32_t * count,
+        int64_t capacity, int64_t n_embd) {
+    const int64_t job = blockIdx.x;
+    const int32_t n_hot = *count;
+    if (n_hot < 0 || job >= n_hot) {
+        return;
+    }
+    const int32_t column = columns[job];
+    if (column < 0 || column >= capacity) {
+        return;
+    }
+    for (int64_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        parts[column * n_embd + i] += hot_out[job * n_embd + i];
+    }
+}
+
+bool ggml_cuda_moe_hybrid_scatter_add(
+        float * parts, const float * hot_out, const int32_t * columns, const int32_t * count,
+        int64_t capacity, int64_t n_embd, ggml_cuda_moe_stream_t stream) {
+    if (parts == nullptr || hot_out == nullptr || columns == nullptr || count == nullptr || stream == nullptr ||
+            capacity <= 0 || n_embd <= 0 || capacity > INT32_MAX) {
+        return false;
+    }
+    moe_hybrid_scatter_add<<<(unsigned) capacity, 256, 0, (cudaStream_t) stream>>>(
+        parts, hot_out, columns, count, capacity, n_embd);
+    return moe_grouped_cuda_success(cudaGetLastError());
+}
+
 bool ggml_cuda_moe_grouped_context::get_group_resources(
         const ggml_cuda_moe_grouped_acquisition & acquisition,
         ggml_cuda_moe_grouped_resource_info * info) const {

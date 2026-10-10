@@ -2415,6 +2415,111 @@ static ggml_cuda_moe_ids_cache_state & ggml_cuda_moe_ids_cache_get(ggml_backend_
     return *ctx.moe_ids_cache;
 }
 
+size_t ggml_backend_cuda_moe_hybrid_hot_scratch_bytes(int64_t n_hits, int64_t n_ff) {
+    if (n_hits <= 0 || n_ff <= 0 || n_hits > INT32_MAX / 3 || n_ff > INT32_MAX / (3 * n_hits)) {
+        return 0;
+    }
+    return (size_t) 3 * n_hits * n_ff * sizeof(float);
+}
+
+static ggml_tensor ggml_cuda_moe_hybrid_plane(ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, void * data) {
+    ggml_tensor tensor = {};
+    tensor.type = type;
+    tensor.ne[0] = ne0;
+    tensor.ne[1] = ne1;
+    tensor.ne[2] = ne2;
+    tensor.ne[3] = 1;
+    tensor.nb[0] = ggml_type_size(type);
+    tensor.nb[1] = tensor.nb[0] * (ne0 / ggml_blck_size(type));
+    tensor.nb[2] = tensor.nb[1] * ne1;
+    tensor.nb[3] = tensor.nb[2] * ne2;
+    tensor.data = data;
+    return tensor;
+}
+
+bool ggml_backend_cuda_moe_hybrid_execute_hot(
+        ggml_backend_t backend,
+        const ggml_cuda_moe_grouped_transaction & transaction,
+        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
+        const float * activation, const int32_t * hot_slots, int64_t n_hits, bool gelu,
+        void * scratch, size_t scratch_bytes, float * hot_out) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || gate == nullptr || up == nullptr || down == nullptr ||
+            activation == nullptr || hot_slots == nullptr || scratch == nullptr || hot_out == nullptr || n_hits <= 0) {
+        return false;
+    }
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    auto * context = cuda_ctx->moe_grouped_context;
+    if (context == nullptr) {
+        return false;
+    }
+    const int64_t n_embd = down->ne[0];
+    const int64_t n_ff = down->ne[1];
+    const size_t required = ggml_backend_cuda_moe_hybrid_hot_scratch_bytes(n_hits, n_ff);
+    if (required == 0 || scratch_bytes < required || gate->ne[0] != n_embd || up->ne[0] != n_embd ||
+            gate->ne[1] != n_ff || up->ne[1] != n_ff || gate->type != up->type) {
+        return false;
+    }
+    ggml_cuda_moe_grouped_resource_info info;
+    if (!context->get_group_resources(transaction.acquisition, &info) || !info.transaction_active ||
+            info.n_slots == 0 || info.n_slots > INT32_MAX) {
+        return false;
+    }
+    const auto bank_of = [&](const ggml_tensor * weight, ggml_tensor * view) {
+        for (uint32_t bank_index = 0; bank_index < info.n_banks; ++bank_index) {
+            ggml_cuda_moe_grouped_bank_descriptor descriptor;
+            if (!context->get_group_resource_bank(transaction, bank_index, &descriptor) ||
+                    descriptor.tensor != weight || descriptor.source_data == nullptr) {
+                continue;
+            }
+            // Keep the weight's own descriptor, like the grouped path does, and point it at the slot arena.
+            *view = *weight;
+            view->data = const_cast<void *>(descriptor.source_data);
+            view->ne[2] = info.n_slots;
+            view->nb[3] = view->nb[2] * info.n_slots;
+            // The arena is read in place, so its per-slot stride must be the one this view assumes.
+            return descriptor.expert_stride == view->nb[2];
+        }
+        return false;
+    };
+    ggml_tensor gate_view, up_view, down_view;
+    if (!bank_of(gate, &gate_view) || !bank_of(up, &up_view) || !bank_of(down, &down_view)) {
+        return false;
+    }
+
+    auto * floats = static_cast<float *>(scratch);
+    ggml_tensor input = ggml_cuda_moe_hybrid_plane(GGML_TYPE_F32, n_embd, 1, n_hits, const_cast<float *>(activation));
+    ggml_tensor ids = ggml_cuda_moe_hybrid_plane(GGML_TYPE_I32, 1, n_hits, 1, const_cast<int32_t *>(hot_slots));
+    ggml_tensor up_result = ggml_cuda_moe_hybrid_plane(GGML_TYPE_F32, n_ff, 1, n_hits, floats);
+    ggml_tensor gate_result = ggml_cuda_moe_hybrid_plane(GGML_TYPE_F32, n_ff, 1, n_hits, floats + n_hits * n_ff);
+    ggml_tensor activated = ggml_cuda_moe_hybrid_plane(GGML_TYPE_F32, n_ff, 1, n_hits, floats + 2 * n_hits * n_ff);
+    ggml_tensor result = ggml_cuda_moe_hybrid_plane(GGML_TYPE_F32, n_embd, 1, n_hits, hot_out);
+
+    const auto project = [&](ggml_tensor & weight, ggml_tensor & dst) {
+        dst.op = GGML_OP_MUL_MAT_ID;
+        dst.src[0] = &weight;
+        dst.src[1] = &input;
+        dst.src[2] = &ids;
+        return ggml_cuda_mul_mat_id_impl(*cuda_ctx, &dst, ggml_cuda_moe_use_mmq(&weight, n_hits));
+    };
+    if (!project(up_view, up_result) || !project(gate_view, gate_result)) {
+        return false;
+    }
+    activated.op = GGML_OP_GLU;
+    activated.src[0] = &gate_result;
+    activated.src[1] = &up_result;
+    ggml_set_op_params_i32(&activated, 0, gelu ? GGML_GLU_OP_GEGLU : GGML_GLU_OP_SWIGLU);
+    if (gelu) {
+        ggml_cuda_op_geglu(*cuda_ctx, &activated);
+    } else {
+        ggml_cuda_op_swiglu(*cuda_ctx, &activated);
+    }
+    result.op = GGML_OP_MUL_MAT_ID;
+    result.src[0] = &down_view;
+    result.src[1] = &activated;
+    result.src[2] = &ids;
+    return ggml_cuda_mul_mat_id_impl(*cuda_ctx, &result, ggml_cuda_moe_use_mmq(&down_view, n_hits));
+}
+
 ggml_cuda_moe_stream_t ggml_cuda_moe_owner_stream_for_test(ggml_backend_t backend) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return nullptr;

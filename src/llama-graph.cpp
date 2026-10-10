@@ -1565,6 +1565,10 @@ void llm_graph_result::add_moe_region(int32_t       layer,
 bool llm_graph_moe_hybrid_routes::init(size_t max_routes, int32_t n_experts, int32_t n_slots) {
     capacity_ = 0;
     gpu_ids_.clear();
+    hot_slots_.clear();
+    hot_experts_.clear();
+    hot_rows_.clear();
+    hot_columns_.clear();
     cold_ids_.clear();
     cold_rows_.clear();
     cold_columns_.clear();
@@ -1572,6 +1576,10 @@ bool llm_graph_moe_hybrid_routes::init(size_t max_routes, int32_t n_experts, int
         return false;
     }
     gpu_ids_.reserve(max_routes);
+    hot_slots_.reserve(max_routes);
+    hot_experts_.reserve(max_routes);
+    hot_rows_.reserve(max_routes);
+    hot_columns_.reserve(max_routes);
     cold_ids_.reserve(max_routes);
     cold_rows_.reserve(max_routes);
     cold_columns_.reserve(max_routes);
@@ -1586,6 +1594,10 @@ bool llm_graph_moe_hybrid_routes::build(
         const void * ids, size_t bytes, size_t row_stride, int32_t top_k, int32_t n_rows,
         const int32_t * slots, size_t n_slots_entries) {
     gpu_ids_.clear();
+    hot_slots_.clear();
+    hot_experts_.clear();
+    hot_rows_.clear();
+    hot_columns_.clear();
     cold_ids_.clear();
     cold_rows_.clear();
     cold_columns_.clear();
@@ -1634,6 +1646,11 @@ bool llm_graph_moe_hybrid_routes::build(
                 cold_ids_.push_back(expert);
                 cold_rows_.push_back(row);
                 cold_columns_.push_back(row * top_k + rank);
+            } else {
+                hot_slots_.push_back(slot);
+                hot_experts_.push_back(expert);
+                hot_rows_.push_back(row);
+                hot_columns_.push_back(row * top_k + rank);
             }
         }
     }
@@ -1641,7 +1658,9 @@ bool llm_graph_moe_hybrid_routes::build(
 }
 
 size_t llm_graph_moe_hybrid_routes::workspace_bytes() const {
-    return sizeof(int32_t) * (slot_owners_.capacity() + gpu_ids_.capacity() + cold_ids_.capacity() + cold_rows_.capacity() + cold_columns_.capacity());
+    return sizeof(int32_t) * (slot_owners_.capacity() + gpu_ids_.capacity() +
+        hot_slots_.capacity() + hot_experts_.capacity() + hot_rows_.capacity() + hot_columns_.capacity() +
+        cold_ids_.capacity() + cold_rows_.capacity() + cold_columns_.capacity());
 }
 
 struct llm_graph_moe_hybrid_cpu::impl {

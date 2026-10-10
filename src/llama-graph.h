@@ -951,6 +951,11 @@ public:
     bool build(const void * ids, size_t bytes, size_t row_stride, int32_t top_k, int32_t n_rows,
                const int32_t * slots, size_t n_slots_entries);
     const std::vector<int32_t> & gpu_ids() const { return gpu_ids_; }
+    // Compact resident work: hot_slots[j] is computed and belongs at route column hot_columns[j].
+    const std::vector<int32_t> & hot_slots() const { return hot_slots_; }
+    const std::vector<int32_t> & hot_experts() const { return hot_experts_; }
+    const std::vector<int32_t> & hot_rows() const { return hot_rows_; }
+    const std::vector<int32_t> & hot_columns() const { return hot_columns_; }
     const std::vector<int32_t> & cold_ids() const { return cold_ids_; }
     const std::vector<int32_t> & cold_rows() const { return cold_rows_; }
     const std::vector<int32_t> & cold_columns() const { return cold_columns_; }
@@ -962,6 +967,10 @@ private:
     int32_t n_slots_ = 0;
     std::vector<int32_t> slot_owners_;
     std::vector<int32_t> gpu_ids_;
+    std::vector<int32_t> hot_slots_;
+    std::vector<int32_t> hot_experts_;
+    std::vector<int32_t> hot_rows_;
+    std::vector<int32_t> hot_columns_;
     std::vector<int32_t> cold_ids_;
     std::vector<int32_t> cold_rows_;
     std::vector<int32_t> cold_columns_;
