@@ -815,7 +815,7 @@ Consecutive range calls reuse one allocation because `is_alloc` stays set until 
 
 Added a focused runner `test-moe-cache --sched-range-only`. It allocates the two-layer fixture graph, reads every split boundary from the scheduler, executes all ranges in order, and requires the result to equal whole-graph execution exactly. It also checks that unaligned, inverted, negative and out-of-range requests are refused and leave the output unchanged, and that whole-graph execution still works afterwards.
 
-Pre-existing defect found, not caused by this work: running this fixture graph through the scheduler on CUDA aborts in `topk-moe.cu:389`, `GGML_ASSERT(ids->nb[1] / ggml_type_size(ids->type) == n_experts)`. It was confirmed to fire on plain whole-graph `ggml_backend_sched_graph_compute()` with no ranged call involved, and disappears with `GGML_CUDA_DISABLE_FUSION=1`. The region's route view is correct (`nb[1] = 32`, `n_experts = 8`), so the mismatch is inside the fused topk path, where `ggml_cuda_should_use_topk_moe()` derives the expert count from the ids strides while the kernel asserts against `logits->ne[0]`. The focused runner therefore requires `GGML_CUDA_DISABLE_FUSION=1` and is not part of the default runs. No production code was changed to hide it.
+Historical diagnosis (superseded by the lifecycle correction below): running this fixture graph through the scheduler on CUDA aborts in `topk-moe.cu:389`, `GGML_ASSERT(ids->nb[1] / ggml_type_size(ids->type) == n_experts)`. It was confirmed to fire on plain whole-graph `ggml_backend_sched_graph_compute()` with no ranged call involved, and disappears with `GGML_CUDA_DISABLE_FUSION=1`. The region's route view is correct (`nb[1] = 32`, `n_experts = 8`), so the mismatch is inside the fused topk path, where `ggml_cuda_should_use_topk_moe()` derives the expert count from the ids strides while the kernel asserts against `logits->ne[0]`. The focused runner therefore requires `GGML_CUDA_DISABLE_FUSION=1` and is not part of the default runs. No production code was changed to hide it.
 
 Validation: Release build/relink passed; the focused ranged runner passed with fusion disabled; layer fixture (~0.69 s), insertion probe (~0.67 s), full MoE suite (~22.49 s), 929/929 CUDA `MUL_MAT_ID` backend-op cases and 3/3 MoE CTests passed; `git diff --check` passed.
 
@@ -823,7 +823,7 @@ Artifacts: `build/hybrid-range-build.log`, `build/hybrid-range-focused.log`, `bu
 
 Owner decision needed: whether to investigate the `topk-moe` fusion assert now, since it affects ordinary scheduler execution of small MoE graphs on CUDA and is independent of the hybrid port.
 
-### `topk-moe` assert investigated; cause not established, no fix applied
+### `topk-moe` investigation: historical hypotheses (superseded)
 
 Temporary diagnostics (all reverted) established these facts.
 
@@ -849,6 +849,18 @@ Validation after reverting everything: Release build/relink passed; ranged runne
 Artifacts: `build/hybrid-topk-guard-build.log`, `build/hybrid-topk-guard-range.log`, `build/hybrid-topk-guard-layer.log` (guard regression), `build/hybrid-topk-guard-full.log` (guard regression), `build/hybrid-topk-revert-build.log`, `build/hybrid-topk-revert-{layer,probe,full}.log`.
 
 Open question for the owner: the next step is to dump each scheduler split's node list with tensor pointers and compare `src[0]` of the gating node at fusion time against execution time, which is a focused scheduler investigation rather than hybrid-port work.
+
+### `topk-moe` resolved: invalid test graph reuse
+
+The earlier diagnosis of a pre-existing fusion bug was incorrect. The ranged fixture reserved its graph, reset the scheduler, and allocated the same graph again. Splitting rewrites source pointers into the scheduler context; the next split frees and recreates that context. The reset API explicitly requires discarding deallocated tensors and creating new ones. The fixture violated that lifecycle.
+
+The stale 8-wide logits pointer landed on a newly created 256-wide dependency view named `node_14 (view)`. Fusion exposed this invalid graph through its expert-count assertion. Disabling fusion did not make the test valid. The earlier direct-backend comparison reused the modified graph, so it was not independent and did not prove unfused correctness.
+
+Fixed the test to allocate once and keep that allocation for whole-graph and consecutive ranged calls. The reference now uses a separate fresh fixture graph and allocator. With fusion enabled, the scheduler matches that independent reference within the existing Q4_0 bound, and ranged output matches whole-graph output bit-exactly. No topk fusion guard or production CUDA change was needed.
+
+The ranged test is now included in the default grouped-layer run and retains its focused `--sched-range-only` entry. It no longer requires `GGML_CUDA_DISABLE_FUSION`. The range API comment records the keep-allocation-alive requirement. The insertion probe's output flags limit fusion coverage but do not demonstrate a fusion defect.
+
+Artifacts: `build/hybrid-topk-lifecycle.log`, `build/hybrid-topk-final-*.log`. Earlier guard/revert logs record failed hypotheses, not confirmed production defects.
 
 Next: drive region spans from `llama-context` using ranged execution, with resident GPU work queued first, then CPU cold experts, then scatter and combine. Graph reuse and CUDA capture interaction with partial execution still need validation.
 

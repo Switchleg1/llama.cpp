@@ -16,7 +16,6 @@ int main(int argc, char ** argv) {
         test_mmid_direct_source_view(device);
         return 0;
     }
-    // Needs GGML_CUDA_DISABLE_FUSION=1: this fixture graph trips a pre-existing topk-moe fusion assert.
     if (argc == 2 && strcmp(argv[1], "--sched-range-only") == 0) {
         test_moe_sched_compute_range();
         return 0;

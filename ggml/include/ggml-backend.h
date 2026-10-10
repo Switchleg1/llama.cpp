@@ -362,6 +362,7 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_ext(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate);
     // Executes only the splits covering [node_begin, node_end) of an allocated graph.
     // The range must start and end on split boundaries. Host work can run between calls.
+    // Keep the allocation alive between calls; after reset, discard the graph and rebuild it.
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_range(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate, int node_begin, int node_end);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 

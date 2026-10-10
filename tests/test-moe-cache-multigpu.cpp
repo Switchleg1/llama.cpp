@@ -1021,10 +1021,8 @@ void test_sched_compute_range() {
     for (auto & region : fixture.result.get_moe_regions()) {
         CHECK(region.place(sched.get(), backends[0]));
     }
-    CHECK(ggml_backend_sched_reserve(sched.get(), graph));
+    CHECK(ggml_backend_sched_alloc_graph(sched.get(), graph));
     const auto run_whole = [&]() {
-        ggml_backend_sched_reset(sched.get());
-        CHECK(ggml_backend_sched_alloc_graph(sched.get(), graph));
         fixture.set_inputs(2);
         CHECK(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
         std::vector<float> values(ggml_nelements(fixture.output[1]));
@@ -1033,13 +1031,17 @@ void test_sched_compute_range() {
     };
     const auto expected = run_whole();
     {
-        // The scheduler result must match the same graph computed directly on one backend.
+        // Use a fresh graph because scheduler splitting rewrites source pointers.
+        layer_fixture reference_fixture(0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_0, false, {0, 0}, 0);
+        reference_fixture.build_graph(LLM_FFN_SILU, 0.0f, false, false, 1);
+        auto * reference_graph = reference_fixture.result.get_gf();
+        ggml_set_output(reference_fixture.output[1]);
         ggml_gallocr_ptr allocator(ggml_gallocr_new(ggml_backend_cuda_buffer_type(0)));
-        CHECK(ggml_gallocr_alloc_graph(allocator.get(), graph));
-        fixture.set_inputs(2);
-        CHECK(ggml_backend_graph_compute(backends[0], graph) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_gallocr_alloc_graph(allocator.get(), reference_graph));
+        reference_fixture.set_inputs(2);
+        CHECK(ggml_backend_graph_compute(backends[0], reference_graph) == GGML_STATUS_SUCCESS);
         std::vector<float> reference(expected.size());
-        ggml_backend_tensor_get(fixture.output[1], reference.data(), 0, reference.size() * sizeof(float));
+        ggml_backend_tensor_get(reference_fixture.output[1], reference.data(), 0, reference.size() * sizeof(float));
         double error = 0.0, norm = 0.0;
         for (size_t i = 0; i < reference.size(); ++i) {
             const double difference = (double) expected[i] - reference[i];
@@ -1048,14 +1050,12 @@ void test_sched_compute_range() {
         }
         const double nmse = norm > 0.0 ? error / norm : error;
         if (nmse > 5e-4) {
-            fprintf(stderr, "scheduler CUDA vs CPU mismatch NMSE=%g\n", nmse);
+            fprintf(stderr, "scheduler vs direct CUDA mismatch NMSE=%g\n", nmse);
         }
         CHECK(nmse <= 5e-4);
     }
 
-    // Split boundaries come from the scheduler, so the test cannot invent them.
-    ggml_backend_sched_reset(sched.get());
-    CHECK(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    // Keep the allocation and discover its split boundaries.
     fixture.set_inputs(2);
     std::vector<std::pair<int, int>> ranges;
     const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
@@ -1534,6 +1534,7 @@ void test_grouped_layer_placement() {
     test_hybrid_route_packet();
     test_hybrid_admission();
     test_hybrid_span();
+    test_sched_compute_range();
     test_hybrid_cpu_experts();
     {
         layer_fixture fixture(0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_0);
