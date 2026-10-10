@@ -1,4 +1,5 @@
 #include "test-moe-cache.h"
+#include "../src/llama-graph.h"
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -630,6 +631,58 @@ static void test_grouped_decode_type(
     check_payload(first_ids);
     CHECK(!registry.finish_decode(decode, wrong_stream));
     CHECK(registry.finish_decode(decode, stream));
+    const auto check_resident_snapshot = [&](const std::array<int32_t, grouped_decode_fixture::N_EXPERTS> & expected) {
+        ggml_cuda_moe_grouped_acquisition acquisition;
+        ggml_cuda_moe_grouped_transaction held;
+        CHECK(registry.acquire_group_resources(key.candidate, &acquisition));
+        CHECK(registry.begin_group_transaction(acquisition, &held));
+        std::array<int32_t, grouped_decode_fixture::N_EXPERTS> before, after, actual;
+        for (uint32_t expert = 0; expert < before.size(); ++expert) {
+            before[expert] = ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, expert);
+        }
+        int32_t * output = nullptr;
+        CUDA_OK(cudaMalloc(&output, sizeof(actual)));
+        actual.fill(-9);
+        CUDA_OK(cudaMemcpy(output, actual.data(), sizeof(actual), cudaMemcpyHostToDevice));
+        CHECK(!registry.snapshot_resident_slots(held, wrong_stream, output, actual.size() - 1));
+        auto stale = held;
+        ++stale.transaction_token;
+        CHECK(!registry.snapshot_resident_slots(stale, wrong_stream, output, actual.size()));
+        CUDA_OK(cudaMemcpy(after.data(), output, sizeof(after), cudaMemcpyDeviceToHost));
+        CHECK(after == actual);
+        CHECK(registry.snapshot_resident_slots(held, wrong_stream, output, actual.size()));
+        CHECK(!registry.snapshot_resident_slots(held, stream, output, actual.size()));
+        CUDA_OK(cudaMemcpyAsync(actual.data(), output, sizeof(actual), cudaMemcpyDeviceToHost, wrong_stream));
+        CUDA_OK(cudaStreamSynchronize(wrong_stream));
+        CHECK(actual == expected);
+        const int32_t routes[] = {3, 2, 1, 7, 6, 0, 3, 7};
+        llm_graph_moe_hybrid_routes packet;
+        CHECK(packet.init(8, actual.size(), n_slots));
+        CHECK(packet.build(routes, sizeof(routes), 2 * sizeof(int32_t), 2, 4, actual.data(), actual.size()));
+        CHECK(packet.gpu_ids().size() == 8);
+        size_t cold = 0;
+        for (int column = 0; column < 8; ++column) {
+            CHECK(packet.gpu_ids()[column] == expected[routes[column]]);
+            if (packet.gpu_ids()[column] < 0) {
+                CHECK(packet.cold_ids()[cold] == routes[column] && packet.cold_rows()[cold] == column / 2 &&
+                    packet.cold_columns()[cold] == column);
+                ++cold;
+            }
+        }
+        CHECK(cold == packet.cold_ids().size());
+        for (uint32_t expert = 0; expert < after.size(); ++expert) {
+            after[expert] = ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, expert);
+        }
+        CHECK(before == after);
+        auto finish = decode;
+        finish.transaction = held;
+        CHECK(registry.finish_decode(finish, wrong_stream));
+        CHECK(!registry.snapshot_resident_slots(held, wrong_stream, output, actual.size()));
+        CUDA_OK(cudaFree(output));
+    };
+    if (check_deferred_commit) {
+        check_resident_snapshot({-1, 1, -1, 0, -1, -1, 2, -1});
+    }
 
     const int32_t second_ids[] = {6, 2, 7, 6};
     CUDA_OK(cudaMemcpyAsync(ids->data, second_ids, sizeof(second_ids), cudaMemcpyHostToDevice, stream));
@@ -648,6 +701,10 @@ static void test_grouped_decode_type(
         CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 7) == -1);
     }
     CHECK(registry.finish_decode(decode, stream));
+    if (check_deferred_commit) {
+        check_resident_snapshot({-1, 1, 3, -1, -1, -1, 2, 0});
+        fprintf(stderr, "test-moe-cache: grouped residency snapshot pending overlay without publication OK\n");
+    }
 
     CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
     CUDA_OK(cudaStreamSynchronize(stream));

@@ -288,6 +288,46 @@ static void moe_host_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_buffer_clear(static_cast<moe_host_buffer *>(buffer->context)->backing, value);
 }
 
+static void moe_host_page_aligned_free(ggml_backend_buffer_t buffer) {
+#ifdef _WIN32
+    _aligned_free(buffer->context);
+#else
+    free(buffer->context);
+#endif
+}
+
+// Host registration pins whole pages, so a bank must never share a page with another allocation.
+static ggml_backend_buffer_t moe_host_page_aligned_buffer(size_t size) {
+    const size_t page = moe_host_page_size();
+    size_t rounded = 0;
+    if (page == 0 || !moe_host_round_size(size, rounded) || rounded == 0) {
+        return nullptr;
+    }
+#ifdef _WIN32
+    void * ptr = _aligned_malloc(rounded, page);
+#else
+    void * ptr = nullptr;
+    if (posix_memalign(&ptr, page, rounded) != 0) {
+        ptr = nullptr;
+    }
+#endif
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (buffer == nullptr) {
+#ifdef _WIN32
+        _aligned_free(ptr);
+#else
+        free(ptr);
+#endif
+        return nullptr;
+    }
+    buffer->context = ptr;
+    buffer->iface.free_buffer = moe_host_page_aligned_free;
+    return buffer;
+}
+
 static ggml_backend_buffer_t moe_host_buffer_wrap(
         ggml_backend_buffer_type_t buft, ggml_backend_buffer_t backing, bool read_only, bool auto_pin = false) {
     if (backing == nullptr) {
@@ -339,7 +379,7 @@ static ggml_backend_buffer_t ggml_cuda_moe_cached_registered_buffer(ggml_backend
         (void) cudaGetLastError();
         return nullptr;
     }
-    auto * buffer = moe_host_buffer_wrap(buft, ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size), false);
+    auto * buffer = moe_host_buffer_wrap(buft, moe_host_page_aligned_buffer(size), false);
     if (buffer == nullptr) {
         return nullptr;
     }
@@ -388,7 +428,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
         ggml_backend_buffer_type_t buft, size_t size) {
 
     if (moe_host_budget_for(buft) != nullptr) {
-        return moe_host_buffer_wrap(buft, ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size), false);
+        return moe_host_buffer_wrap(buft, moe_host_page_aligned_buffer(size), false);
     }
 
 #if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -402,7 +442,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
     void * ptr = ggml_cuda_moe_cached_pinned_malloc(size);
 
     if (ptr == nullptr) {
-        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        ggml_backend_buffer_t buffer = moe_host_page_aligned_buffer(size);
         if (buffer == nullptr) {
             return nullptr;
         }
@@ -411,7 +451,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
             if (wrapped != nullptr) {
                 return wrapped;
             }
-            buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+            buffer = moe_host_page_aligned_buffer(size);
             if (buffer == nullptr) {
                 return nullptr;
             }
@@ -501,6 +541,11 @@ extern "C"
 bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
     return buft != nullptr
         && buft->iface.get_name == ggml_backend_cuda_moe_cached_buffer_type_name;
+}
+
+extern "C"
+ggml_backend_buffer_t ggml_backend_cuda_moe_cached_page_aligned_buffer_for_test(size_t size) {
+    return moe_host_page_aligned_buffer(size);
 }
 
 extern "C"

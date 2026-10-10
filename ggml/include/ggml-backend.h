@@ -337,6 +337,8 @@ extern "C" {
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
+    // Node range of one split of the allocated graph; use it to pick valid ranged-execution boundaries.
+    GGML_API bool                 ggml_backend_sched_get_split_range(ggml_backend_sched_t sched, int split_id, int * node_begin, int * node_end);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
@@ -358,6 +360,9 @@ extern "C" {
     // Backends must synchronously validate and copy required fields before returning and must not retain its address.
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_ext(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_ext(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate);
+    // Executes only the splits covering [node_begin, node_end) of an allocated graph.
+    // The range must start and end on split boundaries. Host work can run between calls.
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_range(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate, int node_begin, int node_end);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

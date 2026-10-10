@@ -2274,6 +2274,16 @@ bool ggml_cuda_mmid_direct_source_view_compute_for_test(
     }
     auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
     ggml_cuda_set_device(context->device);
+    // Exercise the native float vector kernel even when the production chooser selects MMF.
+    if (consumer == GGML_CUDA_MMID_CONSUMER_MMVF && view != nullptr) {
+        if (!ggml_cuda_mmid_direct_source_view_valid(dst->src[0], *view, consumer) || dst->src[2] == nullptr ||
+                dst->src[1]->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+                dst->ne[2] <= 0 || dst->ne[2] > MMVF_MAX_BATCH_SIZE) {
+            return false;
+        }
+        ggml_cuda_mul_mat_vec_f(*context, dst->src[0], dst->src[1], dst->src[2], dst);
+        return true;
+    }
     return ggml_cuda_mul_mat_id_impl(
         *context, dst, ggml_cuda_moe_use_mmq(dst->src[0], dst->src[1]->ne[2]), nullptr, consumer, view);
 }

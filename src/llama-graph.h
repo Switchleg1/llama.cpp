@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
@@ -930,6 +931,189 @@ struct llm_graph_fused_node {
     int il;
 };
 
+struct llm_graph_moe_hybrid_ffn {
+    ggml_tensor * input       = nullptr;
+    ggml_tensor * up          = nullptr;
+    ggml_tensor * gate        = nullptr;
+    ggml_tensor * gate_up     = nullptr;
+    ggml_tensor * activation  = nullptr;
+    ggml_tensor * down        = nullptr;
+    ggml_tensor * down_output = nullptr;
+    llm_ffn_op_type type_op   = LLM_FFN_SILU;
+};
+
+// Geometry only; the caller must hold residency and certify the current submission.
+class llm_graph_moe_hybrid_routes {
+public:
+    bool init(size_t max_routes, int32_t n_experts, int32_t n_slots);
+    // IDs are contiguous within each strided row; slots has one entry per expert.
+    // Failed builds clear outputs. Input bytes must cover the full row extent.
+    bool build(const void * ids, size_t bytes, size_t row_stride, int32_t top_k, int32_t n_rows,
+               const int32_t * slots, size_t n_slots_entries);
+    const std::vector<int32_t> & gpu_ids() const { return gpu_ids_; }
+    const std::vector<int32_t> & cold_ids() const { return cold_ids_; }
+    const std::vector<int32_t> & cold_rows() const { return cold_rows_; }
+    const std::vector<int32_t> & cold_columns() const { return cold_columns_; }
+    size_t workspace_bytes() const;
+
+private:
+    size_t capacity_ = 0;
+    int32_t n_experts_ = 0;
+    int32_t n_slots_ = 0;
+    std::vector<int32_t> slot_owners_;
+    std::vector<int32_t> gpu_ids_;
+    std::vector<int32_t> cold_ids_;
+    std::vector<int32_t> cold_rows_;
+    std::vector<int32_t> cold_columns_;
+};
+
+class llm_graph_moe_hybrid_cpu {
+public:
+    llm_graph_moe_hybrid_cpu();
+    ~llm_graph_moe_hybrid_cpu();
+
+    llm_graph_moe_hybrid_cpu(const llm_graph_moe_hybrid_cpu &) = delete;
+    llm_graph_moe_hybrid_cpu & operator=(const llm_graph_moe_hybrid_cpu &) = delete;
+
+    // Host banks and pool must outlive this helper. Use one job at a time; n_threads must match the pool.
+    bool init(const llm_graph_moe_hybrid_ffn & ffn, ggml_threadpool_t threadpool, int n_threads);
+    // Rows index a contiguous input batch; output columns follow compact route order.
+    bool compute(const float * input, const int32_t * ids, size_t n_routes, float * output, const int32_t * rows = nullptr);
+    size_t workspace_bytes() const;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
+
+// Row semantics classify a submission; a row count alone never does.
+enum llm_graph_moe_hybrid_kind : uint32_t {
+    LLM_GRAPH_MOE_HYBRID_KIND_NONE = 0,
+    LLM_GRAPH_MOE_HYBRID_KIND_ORDINARY,            // MAIN, independent rows
+    LLM_GRAPH_MOE_HYBRID_KIND_TARGET_VERIFICATION, // MAIN, speculative rows
+    LLM_GRAPH_MOE_HYBRID_KIND_DRAFT,               // DRAFT/MTP, independent rows
+    LLM_GRAPH_MOE_HYBRID_KIND_DRAFT_SEQUENTIAL,    // DRAFT/MTP, sequential rows
+};
+
+// Full identity of one hybrid submission. Reused graphs or tensors cannot authorize a stale completion.
+struct llm_graph_moe_hybrid_submission {
+    uint64_t owner_namespace  = 0;
+    uint64_t owner_generation = 0;
+    uint64_t submission_id    = 0;
+    uint32_t domain           = UINT32_MAX;
+    uint32_t semantic_group   = UINT32_MAX;
+    int32_t  layer            = -1;
+    llm_graph_moe_hybrid_kind kind = LLM_GRAPH_MOE_HYBRID_KIND_NONE;
+
+    bool valid() const {
+        return owner_namespace != 0 && owner_generation != 0 && submission_id != 0 && layer >= 0 &&
+               kind != LLM_GRAPH_MOE_HYBRID_KIND_NONE;
+    }
+    bool operator==(const llm_graph_moe_hybrid_submission & other) const {
+        return owner_namespace == other.owner_namespace && owner_generation == other.owner_generation &&
+               submission_id == other.submission_id && domain == other.domain &&
+               semantic_group == other.semantic_group && layer == other.layer && kind == other.kind;
+    }
+};
+
+// Turns an execution certificate into a fresh submission identity.
+// A rejected certificate only means this submission runs the ordinary path; it never disables speculation.
+class llm_graph_moe_hybrid_admission {
+public:
+    enum result {
+        ADMITTED = 0,
+        REJECTED_CERTIFICATE,   // malformed, uncertified or unknown owner
+        REJECTED_DOMAIN,        // domain not certified for hybrid execution
+        REJECTED_ROWS,          // certificate rows do not describe this ubatch
+        REJECTED_SEMANTICS,     // domain and row semantics are not a recognized combination
+        REJECTED_GENERATION,    // owner state was replaced, or the generation went backwards
+        REJECTED_EXHAUSTED,     // submission ids exhausted
+    };
+
+    // Domains must be certified one at a time: MAIN target verification does not certify DRAFT or MTP.
+    void certify_domain(uint32_t domain, bool certified);
+    bool domain_certified(uint32_t domain) const;
+    result admit(const ggml_graph_execution_certificate & certificate, int32_t layer, uint32_t semantic_group,
+                 int32_t n_rows, llm_graph_moe_hybrid_submission * submission);
+    // Forget per-owner state. Callers must drain outstanding work first.
+    void reset();
+
+private:
+    static constexpr size_t N_DOMAINS = 4;
+    std::array<bool, N_DOMAINS> certified_ = {};
+    uint64_t owner_namespace_ = 0;
+    uint64_t owner_generation_ = 0;
+    uint64_t next_submission_ = 0;
+};
+
+// Runs one CPU job at a time on a borrowed pool. Input, ids, rows and output must outlive the job.
+class llm_graph_moe_hybrid_worker {
+public:
+    llm_graph_moe_hybrid_worker();
+    ~llm_graph_moe_hybrid_worker();
+
+    llm_graph_moe_hybrid_worker(const llm_graph_moe_hybrid_worker &) = delete;
+    llm_graph_moe_hybrid_worker & operator=(const llm_graph_moe_hybrid_worker &) = delete;
+
+    bool init(const llm_graph_moe_hybrid_ffn & ffn, ggml_threadpool_t threadpool, int n_threads);
+    bool submit(const llm_graph_moe_hybrid_submission & submission, const float * input, const int32_t * ids,
+                size_t n_routes, float * output, const int32_t * rows);
+    // Only the exact pending submission can collect the result.
+    bool wait(const llm_graph_moe_hybrid_submission & submission);
+    // Finishes any pending job and discards its result. Required before reuse, restore or teardown.
+    void drain();
+    bool busy() const;
+    size_t workspace_bytes() const;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
+
+// Node ranges of one MoE region, split where the CPU contributions are inserted.
+// Strata runs the same shape per layer: resident GPU experts, then cold CPU experts, then the combine.
+struct llm_graph_moe_hybrid_span {
+    int routing_end = -1;  // nodes before this produce the routes and the expert input
+    int expert_end  = -1;  // nodes before this finish the raw down output
+    int region_end  = -1;  // nodes before this finish the region output
+
+    bool valid() const {
+        return routing_end > 0 && expert_end > routing_end && region_end >= expert_end;
+    }
+};
+
+// Ties admission, route packing and the CPU worker into one per-layer unit.
+// The caller still owns residency, GPU submission and the scatter of cold results.
+class llm_graph_moe_hybrid_executor {
+public:
+    bool init(const llm_graph_moe_hybrid_ffn & ffn, ggml_threadpool_t threadpool, int n_threads,
+              size_t max_routes, int32_t n_experts, int32_t n_slots);
+    void certify_domain(uint32_t domain, bool certified);
+    bool domain_certified(uint32_t domain) const;
+
+    // Admits the certificate, packs the strided ids against the residency snapshot and starts the cold experts.
+    // cold_output must hold top_k * n_rows embedding rows and outlive the job.
+    llm_graph_moe_hybrid_admission::result begin(
+            const ggml_graph_execution_certificate & certificate, int32_t layer, uint32_t semantic_group,
+            const void * ids, size_t bytes, size_t row_stride, int32_t top_k, int32_t n_rows,
+            const int32_t * slots, size_t n_slots_entries, const float * input, float * cold_output);
+    // Resident slot per route, or -1 where the CPU owns the contribution.
+    const std::vector<int32_t> & gpu_ids() const { return routes.gpu_ids(); }
+    const std::vector<int32_t> & cold_columns() const { return routes.cold_columns(); }
+    bool wait();
+    void drain();
+    bool busy() const { return worker.busy(); }
+    void reset();
+    size_t workspace_bytes() const { return routes.workspace_bytes() + worker.workspace_bytes(); }
+
+private:
+    llm_graph_moe_hybrid_admission  admission;
+    llm_graph_moe_hybrid_routes     routes;
+    llm_graph_moe_hybrid_worker     worker;
+    llm_graph_moe_hybrid_submission pending;
+    bool ready = false;
+};
+
 struct llm_graph_moe_region {
     int32_t                    layer          = -1;
     uint32_t                   semantic_group = UINT32_MAX;
@@ -938,12 +1122,16 @@ struct llm_graph_moe_region {
     ggml_tensor *              route          = nullptr;
     ggml_tensor *              output         = nullptr;
     bool                       external_route = false;
+    llm_graph_moe_hybrid_ffn    hybrid_ffn;
     std::vector<ggml_tensor *> operations;
     std::vector<ggml_tensor *> inputs;
     ggml_backend_t             backend = nullptr;
 
     bool place(ggml_backend_sched_t sched, ggml_backend_t owner);
 };
+
+// Finds the split points of a region that the hybrid path can execute, or an invalid span.
+llm_graph_moe_hybrid_span llm_graph_moe_hybrid_find_span(const ggml_cgraph * gf, const llm_graph_moe_region & region);
 
 class llm_graph_result {
 public:

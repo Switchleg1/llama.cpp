@@ -633,6 +633,16 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
+    if (ncols_dst == 1 && ids) {
+        bool skip = ids[channel_dst] < 0;
+        if constexpr (has_fusion) {
+            skip = skip || (fusion.gate && fusion.gate_ids && fusion.gate_ids[channel_dst] < 0);
+        }
+        if (skip) {
+            ggml_cuda_pdl_lc();
+            return;
+        }
+    }
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
     gate_channel_x = ncols_dst == 1 && fusion.gate_ids ? fusion.gate_ids[channel_dst] : channel_x;
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
@@ -907,7 +917,12 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    const int32_t expert = ids[channel_dst + token_idx * ids_stride];
+    if (expert < 0) {
+        ggml_cuda_pdl_lc();
+        return;
+    }
+    const uint32_t channel_x = expert;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;

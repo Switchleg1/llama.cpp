@@ -4897,6 +4897,44 @@ static void moe_early_hc_project(const ggml_tensor * weights, const float * inpu
     }
 }
 
+static __global__ void moe_grouped_snapshot_residents(
+        const int32_t * residents, const int32_t * experts_in_slots,
+        const moe_grouped_decode_plan * prior, uint32_t n_experts, uint32_t capacity, int32_t * output) {
+    const uint32_t expert = blockIdx.x * blockDim.x + threadIdx.x;
+    if (expert >= n_experts) {
+        return;
+    }
+    output[expert] = -2;
+    if (prior->status != MOE_GROUPED_PLAN_READY &&
+            !(prior->status == MOE_GROUPED_PLAN_BUILDING && prior->n_routes == 0)) {
+        return;
+    }
+    if (prior->n_routes > capacity || prior->n_unique > prior->n_routes || prior->n_misses > prior->n_unique) {
+        return;
+    }
+    const int32_t old_slot = residents[expert];
+    if (old_slot < -1 || (old_slot >= 0 && ((uint32_t) old_slot >= capacity || experts_in_slots[old_slot] != (int32_t) expert))) {
+        return;
+    }
+    const int32_t * incoming = moe_grouped_plan_array_ptr(prior, capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
+    const int32_t * incoming_slots = moe_grouped_plan_array_ptr(prior, capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
+    int32_t slot = old_slot;
+    for (uint32_t miss = 0; miss < prior->n_misses; ++miss) {
+        const int32_t incoming_expert = incoming[miss];
+        const int32_t incoming_slot = incoming_slots[miss];
+        if (incoming_expert < 0 || (uint32_t) incoming_expert >= n_experts ||
+                incoming_slot < 0 || (uint32_t) incoming_slot >= capacity) {
+            return;
+        }
+        if (incoming_expert == (int32_t) expert) {
+            slot = incoming_slot;
+        } else if (incoming_slot == old_slot && slot == old_slot) {
+            slot = -1;
+        }
+    }
+    output[expert] = slot;
+}
+
 template<int items, bool batched = false, bool ordered_ids = false>
 static __global__ void moe_early_router_select(
         float * scores, int experts, int top_k, const int32_t * residents,
@@ -9847,6 +9885,50 @@ bool ggml_cuda_moe_grouped_context::end_group_transaction(const ggml_cuda_moe_gr
     resource->active_transaction_token = 0;
     resource->active_decode_stream = nullptr;
     impl_->resource_cv.notify_all();
+    return true;
+}
+
+bool ggml_cuda_moe_grouped_context::snapshot_resident_slots(
+        const ggml_cuda_moe_grouped_transaction & transaction,
+        cudaStream_t stream,
+        int32_t * slots,
+        size_t capacity) {
+    if (stream == nullptr || slots == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto * resource = impl_->find_resource(transaction);
+    if (impl_->draining || impl_->replacement_pending || resource == nullptr || resource->legacy_dirty ||
+            resource->device == nullptr || resource->snapshot.n_slot_auxiliaries != 0 ||
+            impl_->prepack_callbacks.count(transaction.acquisition.candidate.group_index) != 0 ||
+            impl_->device_prefetch_callbacks.count(transaction.acquisition.candidate.group_index) != 0) {
+        return false;
+    }
+    auto & device = *resource->device;
+    if (capacity < device.n_experts || !device.has_completion ||
+            (resource->active_decode_stream != nullptr && resource->active_decode_stream != stream) ||
+            slots == device.slot_for_expert || slots == device.expert_for_slot) {
+        return false;
+    }
+    cudaPointerAttributes attributes = {};
+    if (!moe_grouped_cuda_success(cudaSetDevice(device.device)) ||
+            !moe_grouped_cuda_success(cudaPointerGetAttributes(&attributes, slots)) ||
+            attributes.type != cudaMemoryTypeDevice || attributes.device != device.device) {
+        return false;
+    }
+    cudaStreamCaptureStatus capture;
+    if (!moe_grouped_cuda_success(cudaStreamIsCapturing(stream, &capture)) || capture != cudaStreamCaptureStatusNone) {
+        return false;
+    }
+    if (device.completion_stream != stream && !moe_grouped_cuda_success(cudaStreamWaitEvent(stream, device.completion, 0))) {
+        return false;
+    }
+    moe_grouped_snapshot_residents<<<(device.n_experts + 255) / 256, 256, 0, stream>>>(
+        device.slot_for_expert, device.expert_for_slot, device.plan, device.n_experts, resource->snapshot.n_slots, slots);
+    if (!moe_grouped_cuda_success(cudaGetLastError())) {
+        return false;
+    }
+    resource->active_decode_stream = stream;
     return true;
 }
 

@@ -1724,8 +1724,11 @@ static enum ggml_status ggml_backend_sched_dispatch_split(
 static enum ggml_status ggml_backend_sched_compute_splits(
         ggml_backend_sched_t sched,
         uint64_t source_graph_uid,
-        struct ggml_graph_execution_certificate certificate) {
+        struct ggml_graph_execution_certificate certificate,
+        int split_begin,
+        int split_end) {
     GGML_ASSERT(sched);
+    GGML_ASSERT(split_begin >= 0 && split_begin <= split_end && split_end <= sched->n_splits);
     struct ggml_backend_sched_split * splits = sched->splits;
     const bool required_grouped =
         (certificate.flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
@@ -1764,7 +1767,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(
 
     int prev_backend_id = -1;
 
-    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+    for (int split_id = split_begin; split_id < split_end; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -2215,7 +2218,70 @@ enum ggml_status ggml_backend_sched_graph_compute_async_ext(
         certificate_value = {};
     }
 
-    return ggml_backend_sched_compute_splits(sched, sched->source_graph_uid, certificate_value);
+    return ggml_backend_sched_compute_splits(sched, sched->source_graph_uid, certificate_value, 0, sched->n_splits);
+}
+
+// Executes only the splits that cover [node_begin, node_end). The range must start and end on split
+// boundaries, so a split is never run twice or in part. The graph stays allocated between calls.
+enum ggml_status ggml_backend_sched_graph_compute_range(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph,
+        const struct ggml_graph_execution_certificate * certificate,
+        int node_begin,
+        int node_end) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(graph);
+    if (node_begin < 0 || node_begin >= node_end || node_end > graph->n_nodes) {
+        GGML_LOG_ERROR("%s: invalid node range [%d, %d) of %d nodes\n", __func__, node_begin, node_end, graph->n_nodes);
+        return GGML_STATUS_FAILED;
+    }
+    struct ggml_graph_execution_certificate certificate_value = {};
+    const bool certificate_valid = ggml_backend_sched_execution_certificate_valid(certificate);
+    const bool required_grouped = certificate != nullptr &&
+        (certificate->flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
+    if (required_grouped && !certificate_valid) {
+        GGML_LOG_ERROR("%s: invalid required grouped execution certificate\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (sched->callback_eval != nullptr) {
+        GGML_LOG_ERROR("%s: ranged execution does not support callback evaluation\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (certificate_valid) {
+        certificate_value = *certificate;
+    }
+
+    if (!sched->is_reset && !sched->is_alloc) {
+        ggml_backend_sched_reset(sched);
+    }
+    if (!sched->is_alloc) {
+        if (!ggml_backend_sched_alloc_graph(sched, graph)) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+    }
+    if (graph != sched->source_graph || graph->uid != sched->source_graph_uid) {
+        GGML_LOG_ERROR("%s: the node range does not belong to the allocated source graph\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+
+    int split_begin = -1;
+    int split_end = -1;
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[split_id];
+        if (split->i_start == node_begin) {
+            split_begin = split_id;
+        }
+        if (split->i_end == node_end) {
+            split_end = split_id + 1;
+        }
+    }
+    if (split_begin < 0 || split_end < 0 || split_begin >= split_end) {
+        GGML_LOG_ERROR("%s: node range [%d, %d) does not start and end on split boundaries\n",
+                       __func__, node_begin, node_end);
+        return GGML_STATUS_FAILED;
+    }
+
+    return ggml_backend_sched_compute_splits(sched, sched->source_graph_uid, certificate_value, split_begin, split_end);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
@@ -2235,6 +2301,20 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+bool ggml_backend_sched_get_split_range(ggml_backend_sched_t sched, int split_id, int * node_begin, int * node_end) {
+    GGML_ASSERT(sched);
+    if (split_id < 0 || split_id >= sched->n_splits) {
+        return false;
+    }
+    if (node_begin != nullptr) {
+        *node_begin = sched->splits[split_id].i_start;
+    }
+    if (node_end != nullptr) {
+        *node_end = sched->splits[split_id].i_end;
+    }
+    return true;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

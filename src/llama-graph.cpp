@@ -16,9 +16,17 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#ifdef GGML_USE_CPU
+#include "ggml-cpu.h"
+#include "ggml-backend-moe.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -1554,6 +1562,605 @@ void llm_graph_result::add_moe_region(int32_t       layer,
     moe_regions.push_back(std::move(region));
 }
 
+bool llm_graph_moe_hybrid_routes::init(size_t max_routes, int32_t n_experts, int32_t n_slots) {
+    capacity_ = 0;
+    gpu_ids_.clear();
+    cold_ids_.clear();
+    cold_rows_.clear();
+    cold_columns_.clear();
+    if (max_routes == 0 || max_routes > INT32_MAX || n_experts <= 0 || n_slots < 0) {
+        return false;
+    }
+    gpu_ids_.reserve(max_routes);
+    cold_ids_.reserve(max_routes);
+    cold_rows_.reserve(max_routes);
+    cold_columns_.reserve(max_routes);
+    slot_owners_.resize(n_slots);
+    n_experts_ = n_experts;
+    n_slots_ = n_slots;
+    capacity_ = max_routes;
+    return true;
+}
+
+bool llm_graph_moe_hybrid_routes::build(
+        const void * ids, size_t bytes, size_t row_stride, int32_t top_k, int32_t n_rows,
+        const int32_t * slots, size_t n_slots_entries) {
+    gpu_ids_.clear();
+    cold_ids_.clear();
+    cold_rows_.clear();
+    cold_columns_.clear();
+    if (capacity_ == 0 || !ids || !slots || top_k <= 0 || top_k > n_experts_ || n_rows <= 0 ||
+            n_slots_entries != (size_t) n_experts_ || (size_t) n_rows > capacity_ / top_k) {
+        return false;
+    }
+    const size_t row_bytes = (size_t) top_k * sizeof(int32_t);
+    if (row_stride < row_bytes || row_bytes > bytes || (size_t) (n_rows - 1) > (bytes - row_bytes) / row_stride) {
+        return false;
+    }
+    std::fill(slot_owners_.begin(), slot_owners_.end(), -1);
+    for (int32_t expert = 0; expert < n_experts_; ++expert) {
+        const int32_t slot = slots[expert];
+        if (slot < -1 || slot >= n_slots_ || (slot >= 0 && slot_owners_[slot] != -1)) {
+            return false;
+        }
+        if (slot >= 0) {
+            slot_owners_[slot] = expert;
+        }
+    }
+    const auto read_id = [&](int32_t row, int32_t rank) {
+        int32_t expert;
+        memcpy(&expert, static_cast<const uint8_t *>(ids) + row * row_stride + rank * sizeof(int32_t), sizeof(expert));
+        return expert;
+    };
+    for (int32_t row = 0; row < n_rows; ++row) {
+        for (int32_t rank = 0; rank < top_k; ++rank) {
+            const int32_t expert = read_id(row, rank);
+            if (expert < 0 || expert >= n_experts_) {
+                return false;
+            }
+            for (int32_t previous = 0; previous < rank; ++previous) {
+                if (read_id(row, previous) == expert) {
+                    return false;
+                }
+            }
+        }
+    }
+    for (int32_t row = 0; row < n_rows; ++row) {
+        for (int32_t rank = 0; rank < top_k; ++rank) {
+            const int32_t expert = read_id(row, rank);
+            const int32_t slot = slots[expert];
+            gpu_ids_.push_back(slot);
+            if (slot < 0) {
+                cold_ids_.push_back(expert);
+                cold_rows_.push_back(row);
+                cold_columns_.push_back(row * top_k + rank);
+            }
+        }
+    }
+    return true;
+}
+
+size_t llm_graph_moe_hybrid_routes::workspace_bytes() const {
+    return sizeof(int32_t) * (slot_owners_.capacity() + gpu_ids_.capacity() + cold_ids_.capacity() + cold_rows_.capacity() + cold_columns_.capacity());
+}
+
+struct llm_graph_moe_hybrid_cpu::impl {
+#ifdef GGML_USE_CPU
+    llm_graph_moe_hybrid_ffn ffn;
+    ggml_context_ptr ctx;
+    ggml_gallocr_ptr allocator;
+    ggml_threadpool_t threadpool = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * ids = nullptr;
+    ggml_tensor * output = nullptr;
+    int64_t n_embd = 0;
+    int64_t n_ff = 0;
+    int64_t n_experts = 0;
+    int64_t n_rows = 0;
+    size_t capacity = 0;
+    size_t metadata_bytes = 0;
+    int n_threads = 0;
+    std::vector<uint8_t> work;
+    char down_params[GGML_MAX_OP_PARAMS] = {};
+
+    ggml_cgraph * build(size_t n_routes) {
+        ggml_reset(ctx.get());
+        input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_embd, 1, n_routes);
+        ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, n_routes);
+        ggml_set_input(input);
+        ggml_set_input(ids);
+        auto * up = ggml_mul_mat_id(ctx.get(), ffn.gate_up ? ffn.gate_up : ffn.up, input, ids);
+        ggml_tensor * gate = nullptr;
+        if (ffn.gate_up) {
+            gate = ggml_view_3d(ctx.get(), up, n_ff, 1, n_routes, up->nb[1], up->nb[2], 0);
+            up = ggml_view_3d(ctx.get(), up, n_ff, 1, n_routes, up->nb[1], up->nb[2], n_ff * up->nb[0]);
+        } else if (ffn.gate) {
+            gate = ggml_mul_mat_id(ctx.get(), ffn.gate, input, ids);
+        }
+        ggml_tensor * act = gate ?
+            (ffn.type_op == LLM_FFN_SILU ? ggml_swiglu_split(ctx.get(), gate, up) : ggml_geglu_split(ctx.get(), gate, up)) :
+            (ffn.type_op == LLM_FFN_SILU ? ggml_silu(ctx.get(), up) : ggml_gelu(ctx.get(), up));
+        output = ggml_mul_mat_id(ctx.get(), ffn.down, act, ids);
+        memcpy(output->op_params, down_params, sizeof(down_params));
+        ggml_set_output(output);
+        auto * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+        ggml_build_forward_expand(graph, output);
+        return graph;
+    }
+#endif
+};
+
+llm_graph_moe_hybrid_cpu::llm_graph_moe_hybrid_cpu() = default;
+llm_graph_moe_hybrid_cpu::~llm_graph_moe_hybrid_cpu() = default;
+
+bool llm_graph_moe_hybrid_cpu::init(const llm_graph_moe_hybrid_ffn & ffn, ggml_threadpool_t threadpool, int n_threads) {
+    pimpl.reset();
+#ifdef GGML_USE_CPU
+    if (!threadpool) {
+        return false;
+    }
+    if (!ffn.input || !ffn.down || !ffn.down_output || !ffn.activation ||
+        (!ffn.up && !ffn.gate_up) || (ffn.gate_up && (ffn.up || ffn.gate)) ||
+        ffn.down_output->op != GGML_OP_MUL_MAT_ID || ffn.down_output->src[0] != ffn.down ||
+        ffn.down_output->src[1] != ffn.activation || ffn.down_output->type != GGML_TYPE_F32 ||
+        (ffn.type_op != LLM_FFN_SILU && ffn.type_op != LLM_FFN_GELU) ||
+        n_threads < 1 || n_threads > GGML_MAX_N_THREADS ||
+        ffn.input->type != GGML_TYPE_F32 || ffn.input->ne[1] != 1 || ffn.input->ne[2] <= 0 || ffn.input->ne[3] != 1 ||
+        ffn.down_output->ne[1] <= 0 || ffn.down_output->ne[1] > LLAMA_MAX_EXPERTS ||
+        ffn.down_output->ne[2] != ffn.input->ne[2] || ffn.down_output->ne[3] != 1) {
+        return false;
+    }
+    auto state = std::make_unique<impl>();
+    state->ffn.up      = ffn.up;
+    state->ffn.gate    = ffn.gate;
+    state->ffn.gate_up = ffn.gate_up;
+    state->ffn.down    = ffn.down;
+    state->ffn.type_op = ffn.type_op;
+    state->n_embd = ffn.input->ne[0];
+    state->n_ff = ffn.down->ne[0];
+    state->n_experts = ffn.down->ne[2];
+    state->n_rows = ffn.input->ne[2];
+    if (state->n_rows > INT32_MAX / ffn.down_output->ne[1]) {
+        return false;
+    }
+    state->capacity = ffn.down_output->ne[1] * state->n_rows;
+    state->n_threads = n_threads;
+    if (state->n_embd <= 0 || state->n_embd > INT32_MAX || state->n_ff <= 0 || state->n_ff > INT32_MAX ||
+        state->n_experts <= 0 || state->n_experts > INT32_MAX ||
+        state->capacity > SIZE_MAX / (std::max(state->n_embd, 2 * state->n_ff) * sizeof(float)) ||
+        ffn.down_output->ne[0] != state->n_embd) {
+        return false;
+    }
+    ggml_cpu_init();
+    const auto bank_valid = [&](ggml_tensor * bank, int64_t width, int64_t rows) {
+        auto * buft = bank && bank->buffer ? ggml_backend_buffer_get_type(bank->buffer) : nullptr;
+        auto * dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto is_cached = reg ? reinterpret_cast<ggml_backend_moe_cache_is_buffer_type_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME)) : nullptr;
+        // Cached sources are host bytes, but advertise non-host storage for scheduler placement.
+        const bool host_source = buft && (ggml_backend_buft_is_host(buft) || (is_cached && is_cached(buft)));
+        if (!bank || !bank->data || !host_source || ggml_backend_buffer_get_size(bank->buffer) == 0 ||
+            bank->op != GGML_OP_NONE || !ggml_is_contiguous(bank) ||
+            bank->ne[0] != width || bank->ne[1] != rows || bank->ne[2] != state->n_experts || bank->ne[3] != 1) {
+            return false;
+        }
+        const auto * traits = ggml_get_type_traits_cpu(bank->type);
+        return traits->vec_dot && width % ggml_blck_size(bank->type) == 0 &&
+            width % ggml_blck_size(traits->vec_dot_type) == 0 &&
+            ggml_get_type_traits_cpu(traits->vec_dot_type)->from_float;
+    };
+    if (!bank_valid(ffn.down, state->n_ff, state->n_embd) ||
+        !bank_valid(ffn.gate_up ? ffn.gate_up : ffn.up, state->n_embd, ffn.gate_up ? 2 * state->n_ff : state->n_ff) ||
+        (ffn.gate && !bank_valid(ffn.gate, state->n_embd, state->n_ff))) {
+        return false;
+    }
+    memcpy(state->down_params, ffn.down_output->op_params, sizeof(state->down_params));
+    state->metadata_bytes = 32 * ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false);
+    state->ctx.reset(ggml_init({state->metadata_bytes, nullptr, true}));
+    state->allocator.reset(ggml_gallocr_new(ggml_backend_cpu_buffer_type()));
+    state->threadpool = threadpool;
+    if (!state->ctx || !state->allocator) {
+        return false;
+    }
+    auto * graph = state->build(state->capacity);
+    if (!ggml_gallocr_reserve(state->allocator.get(), graph)) {
+        return false;
+    }
+    const auto plan = ggml_graph_plan(graph, n_threads, state->threadpool);
+    state->work.resize(plan.work_size);
+    pimpl = std::move(state);
+    return true;
+#else
+    GGML_UNUSED(ffn);
+    GGML_UNUSED(threadpool);
+    GGML_UNUSED(n_threads);
+    return false;
+#endif
+}
+
+bool llm_graph_moe_hybrid_cpu::compute(const float * input, const int32_t * ids, size_t n_routes, float * output, const int32_t * rows) {
+#ifdef GGML_USE_CPU
+    if (!pimpl || n_routes > pimpl->capacity) {
+        return false;
+    }
+    if (n_routes == 0) {
+        return true;
+    }
+    if (!input || !ids || !output || (!rows && pimpl->n_rows != 1)) {
+        return false;
+    }
+    for (size_t i = 0; i < n_routes; ++i) {
+        if (ids[i] < 0 || ids[i] >= pimpl->n_experts || (rows && (rows[i] < 0 || rows[i] >= pimpl->n_rows))) {
+            return false;
+        }
+    }
+    auto * graph = pimpl->build(n_routes);
+    if (!ggml_gallocr_alloc_graph(pimpl->allocator.get(), graph)) {
+        return false;
+    }
+    for (size_t i = 0; i < n_routes; ++i) {
+        const size_t row = rows ? rows[i] : 0;
+        ggml_backend_tensor_set(pimpl->input, input + row * pimpl->n_embd, i * pimpl->n_embd * sizeof(float), pimpl->n_embd * sizeof(float));
+    }
+    ggml_backend_tensor_set(pimpl->ids, ids, 0, n_routes * sizeof(int32_t));
+    auto plan = ggml_graph_plan(graph, pimpl->n_threads, pimpl->threadpool);
+    if (plan.work_size > pimpl->work.size()) {
+        return false;
+    }
+    plan.work_data = pimpl->work.data();
+    if (ggml_graph_compute(graph, &plan) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    ggml_backend_tensor_get(pimpl->output, output, 0, n_routes * pimpl->n_embd * sizeof(float));
+    return true;
+#else
+    GGML_UNUSED(input);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(n_routes);
+    GGML_UNUSED(output);
+    GGML_UNUSED(rows);
+    return false;
+#endif
+}
+
+size_t llm_graph_moe_hybrid_cpu::workspace_bytes() const {
+#ifdef GGML_USE_CPU
+    return pimpl ? pimpl->metadata_bytes + pimpl->work.size() + ggml_gallocr_get_buffer_size(pimpl->allocator.get(), 0) : 0;
+#else
+    return 0;
+#endif
+}
+
+void llm_graph_moe_hybrid_admission::certify_domain(uint32_t domain, bool certified) {
+    if (domain < certified_.size()) {
+        certified_[domain] = certified;
+    }
+}
+
+bool llm_graph_moe_hybrid_admission::domain_certified(uint32_t domain) const {
+    return domain < certified_.size() && certified_[domain];
+}
+
+llm_graph_moe_hybrid_admission::result llm_graph_moe_hybrid_admission::admit(
+        const ggml_graph_execution_certificate & certificate, int32_t layer, uint32_t semantic_group,
+        int32_t n_rows, llm_graph_moe_hybrid_submission * submission) {
+    if (submission == nullptr) {
+        return REJECTED_CERTIFICATE;
+    }
+    *submission = {};
+    if (certificate.magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC ||
+            certificate.abi_version != GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION ||
+            certificate.struct_size != sizeof(certificate) ||
+            certificate.owner_namespace == 0 || certificate.owner_generation == 0 ||
+            layer < 0 || semantic_group == UINT32_MAX) {
+        return REJECTED_CERTIFICATE;
+    }
+    if (certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID ||
+            certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_INVALID || !domain_certified(certificate.domain)) {
+        return REJECTED_DOMAIN;
+    }
+    // Row count alone cannot classify a submission, but it must describe the rows actually packed.
+    if (n_rows <= 0 || certificate.n_rows != (uint32_t) n_rows || certificate.n_sequences == 0 ||
+            certificate.n_sequences > certificate.n_rows) {
+        return REJECTED_ROWS;
+    }
+    // Same combinations the CUDA seam recognizes; anything else stays on the ordinary path.
+    const bool speculative_domain = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT ||
+        certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP;
+    llm_graph_moe_hybrid_kind kind = LLM_GRAPH_MOE_HYBRID_KIND_NONE;
+    switch (certificate.row_semantics) {
+        case GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT:
+            if (certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN) {
+                kind = LLM_GRAPH_MOE_HYBRID_KIND_ORDINARY;
+            } else if (speculative_domain && certificate.n_rows == certificate.n_sequences) {
+                kind = LLM_GRAPH_MOE_HYBRID_KIND_DRAFT;
+            }
+            break;
+        case GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL:
+            if (speculative_domain) {
+                kind = LLM_GRAPH_MOE_HYBRID_KIND_DRAFT_SEQUENTIAL;
+            }
+            break;
+        case GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE:
+            if (certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+                    certificate.n_sequences < certificate.n_rows) {
+                kind = LLM_GRAPH_MOE_HYBRID_KIND_TARGET_VERIFICATION;
+            }
+            break;
+        default:
+            break;
+    }
+    if (kind == LLM_GRAPH_MOE_HYBRID_KIND_NONE) {
+        return REJECTED_SEMANTICS;
+    }
+    if (owner_namespace_ != certificate.owner_namespace || owner_generation_ != certificate.owner_generation) {
+        if (owner_namespace_ == certificate.owner_namespace && certificate.owner_generation < owner_generation_) {
+            return REJECTED_GENERATION;
+        }
+        owner_namespace_ = certificate.owner_namespace;
+        owner_generation_ = certificate.owner_generation;
+        next_submission_ = 0;
+    }
+    if (next_submission_ == UINT64_MAX) {
+        return REJECTED_EXHAUSTED;
+    }
+    submission->owner_namespace = certificate.owner_namespace;
+    submission->owner_generation = certificate.owner_generation;
+    submission->submission_id = ++next_submission_;
+    submission->domain = certificate.domain;
+    submission->semantic_group = semantic_group;
+    submission->layer = layer;
+    submission->kind = kind;
+    return ADMITTED;
+}
+
+void llm_graph_moe_hybrid_admission::reset() {
+    certified_.fill(false);
+    owner_namespace_ = 0;
+    owner_generation_ = 0;
+    next_submission_ = 0;
+}
+
+struct llm_graph_moe_hybrid_worker::impl {
+    llm_graph_moe_hybrid_cpu cpu;
+    std::thread worker;
+    mutable std::mutex mutex;
+    std::condition_variable submitted;
+    std::condition_variable done;
+    llm_graph_moe_hybrid_submission pending;
+    const float * input = nullptr;
+    const int32_t * ids = nullptr;
+    const int32_t * rows = nullptr;
+    float * output = nullptr;
+    size_t n_routes = 0;
+    bool has_job = false;
+    bool finished = false;
+    bool result = false;
+    bool stop = false;
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            submitted.wait(lock, [&]() { return stop || (has_job && !finished); });
+            if (stop) {
+                return;
+            }
+            const auto job_input = input;
+            const auto job_ids = ids;
+            const auto job_rows = rows;
+            auto * job_output = output;
+            const auto job_routes = n_routes;
+            lock.unlock();
+            const bool computed = cpu.compute(job_input, job_ids, job_routes, job_output, job_rows);
+            lock.lock();
+            result = computed;
+            finished = true;
+            done.notify_all();
+        }
+    }
+};
+
+llm_graph_moe_hybrid_worker::llm_graph_moe_hybrid_worker() = default;
+
+llm_graph_moe_hybrid_worker::~llm_graph_moe_hybrid_worker() {
+    if (!pimpl) {
+        return;
+    }
+    drain();
+    {
+        std::lock_guard<std::mutex> lock(pimpl->mutex);
+        pimpl->stop = true;
+    }
+    pimpl->submitted.notify_all();
+    if (pimpl->worker.joinable()) {
+        pimpl->worker.join();
+    }
+}
+
+bool llm_graph_moe_hybrid_worker::init(const llm_graph_moe_hybrid_ffn & ffn, ggml_threadpool_t threadpool, int n_threads) {
+    if (pimpl) {
+        return false;
+    }
+    auto created = std::make_unique<impl>();
+    if (!created->cpu.init(ffn, threadpool, n_threads)) {
+        return false;
+    }
+    pimpl = std::move(created);
+    pimpl->worker = std::thread([this]() { pimpl->run(); });
+    return true;
+}
+
+bool llm_graph_moe_hybrid_worker::submit(
+        const llm_graph_moe_hybrid_submission & submission, const float * input, const int32_t * ids,
+        size_t n_routes, float * output, const int32_t * rows) {
+    if (!pimpl || !submission.valid()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (pimpl->has_job) {
+        return false;
+    }
+    pimpl->pending = submission;
+    pimpl->input = input;
+    pimpl->ids = ids;
+    pimpl->rows = rows;
+    pimpl->output = output;
+    pimpl->n_routes = n_routes;
+    pimpl->has_job = true;
+    pimpl->finished = false;
+    pimpl->result = false;
+    pimpl->submitted.notify_one();
+    return true;
+}
+
+bool llm_graph_moe_hybrid_worker::wait(const llm_graph_moe_hybrid_submission & submission) {
+    if (!pimpl) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->has_job || !(pimpl->pending == submission)) {
+        return false;
+    }
+    pimpl->done.wait(lock, [&]() { return pimpl->finished; });
+    const bool result = pimpl->result;
+    pimpl->has_job = false;
+    return result;
+}
+
+void llm_graph_moe_hybrid_worker::drain() {
+    if (!pimpl) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->has_job) {
+        return;
+    }
+    pimpl->done.wait(lock, [&]() { return pimpl->finished; });
+    pimpl->has_job = false;
+    pimpl->result = false;
+}
+
+bool llm_graph_moe_hybrid_worker::busy() const {
+    if (!pimpl) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    return pimpl->has_job;
+}
+
+size_t llm_graph_moe_hybrid_worker::workspace_bytes() const {
+    return pimpl ? pimpl->cpu.workspace_bytes() : 0;
+}
+
+llm_graph_moe_hybrid_span llm_graph_moe_hybrid_find_span(const ggml_cgraph * gf, const llm_graph_moe_region & region) {
+    llm_graph_moe_hybrid_span span;
+    const auto & ffn = region.hybrid_ffn;
+    if (gf == nullptr || ffn.input == nullptr || ffn.down == nullptr || ffn.down_output == nullptr ||
+            region.output == nullptr || region.route == nullptr) {
+        return {};
+    }
+    const std::unordered_set<ggml_tensor *> local(region.operations.begin(), region.operations.end());
+    int first_expert = -1;
+    for (int i = 0; i < ggml_graph_n_nodes(const_cast<ggml_cgraph *>(gf)); ++i) {
+        auto * node = ggml_graph_node(const_cast<ggml_cgraph *>(gf), i);
+        const bool expert_mmid = node->op == GGML_OP_MUL_MAT_ID &&
+            (node->src[0] == ffn.up || node->src[0] == ffn.gate || node->src[0] == ffn.gate_up || node->src[0] == ffn.down);
+        if (expert_mmid) {
+            if (local.count(node) == 0) {
+                return {};  // an expert matmul outside the region cannot be split here
+            }
+            if (first_expert < 0) {
+                first_expert = i;
+            }
+        }
+        if (node == ffn.down_output) {
+            span.expert_end = i + 1;
+        }
+        if (node == region.output) {
+            span.region_end = i + 1;
+        }
+    }
+    span.routing_end = first_expert;
+    if (!span.valid() || span.expert_end > span.region_end) {
+        return {};
+    }
+    // The routes and the expert input must exist before the split, and nothing may write the region output early.
+    bool have_route = false;
+    bool have_input = false;
+    for (int i = 0; i < span.routing_end; ++i) {
+        auto * node = ggml_graph_node(const_cast<ggml_cgraph *>(gf), i);
+        have_route = have_route || node == region.route;
+        have_input = have_input || node == ffn.input;
+    }
+    for (int i = span.routing_end; i < span.expert_end - 1; ++i) {
+        if (ggml_graph_node(const_cast<ggml_cgraph *>(gf), i) == region.output) {
+            return {};
+        }
+    }
+    return have_route && have_input ? span : llm_graph_moe_hybrid_span{};
+}
+
+bool llm_graph_moe_hybrid_executor::init(
+        const llm_graph_moe_hybrid_ffn & ffn, ggml_threadpool_t threadpool, int n_threads,
+        size_t max_routes, int32_t n_experts, int32_t n_slots) {
+    if (ready || !routes.init(max_routes, n_experts, n_slots)) {
+        return false;
+    }
+    if (!worker.init(ffn, threadpool, n_threads)) {
+        return false;
+    }
+    ready = true;
+    return true;
+}
+
+void llm_graph_moe_hybrid_executor::certify_domain(uint32_t domain, bool certified) {
+    admission.certify_domain(domain, certified);
+}
+
+bool llm_graph_moe_hybrid_executor::domain_certified(uint32_t domain) const {
+    return admission.domain_certified(domain);
+}
+
+llm_graph_moe_hybrid_admission::result llm_graph_moe_hybrid_executor::begin(
+        const ggml_graph_execution_certificate & certificate, int32_t layer, uint32_t semantic_group,
+        const void * ids, size_t bytes, size_t row_stride, int32_t top_k, int32_t n_rows,
+        const int32_t * slots, size_t n_slots_entries, const float * input, float * cold_output) {
+    if (!ready || worker.busy()) {
+        return llm_graph_moe_hybrid_admission::REJECTED_CERTIFICATE;
+    }
+    llm_graph_moe_hybrid_submission submission;
+    const auto result = admission.admit(certificate, layer, semantic_group, n_rows, &submission);
+    if (result != llm_graph_moe_hybrid_admission::ADMITTED) {
+        return result;
+    }
+    if (!routes.build(ids, bytes, row_stride, top_k, n_rows, slots, n_slots_entries)) {
+        return llm_graph_moe_hybrid_admission::REJECTED_ROWS;
+    }
+    if (!worker.submit(submission, input, routes.cold_ids().data(), routes.cold_ids().size(),
+                       cold_output, routes.cold_rows().data())) {
+        return llm_graph_moe_hybrid_admission::REJECTED_CERTIFICATE;
+    }
+    pending = submission;
+    return llm_graph_moe_hybrid_admission::ADMITTED;
+}
+
+bool llm_graph_moe_hybrid_executor::wait() {
+    const bool completed = worker.wait(pending);
+    pending = {};
+    return completed;
+}
+
+void llm_graph_moe_hybrid_executor::drain() {
+    worker.drain();
+    pending = {};
+}
+
+void llm_graph_moe_hybrid_executor::reset() {
+    drain();
+    admission.reset();
+}
+
 bool llm_graph_moe_region::place(ggml_backend_sched_t sched, ggml_backend_t owner) {
     if (!owner || external_route || !route || route->op != GGML_OP_VIEW || !route->src[0] ||
         route->src[0]->op != GGML_OP_ARGSORT) {
@@ -2449,7 +3056,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    ggml_tensor * expert_activation = cur;
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    ggml_tensor * expert_down_output = experts;
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
@@ -2504,6 +3113,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     res->add_moe_region(il, down_exps, selected_experts, ffn_input, moe_out, selected_experts_in != nullptr);
+
+    // Record only plain expert arithmetic. Runtime placement and shape checks are separate.
+    bool hybrid_simple = !weight_before_ffn && !selected_experts_in &&
+        !up_exps_b && !gate_exps_b && !gate_up_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
+    if (type_op == LLM_FFN_SILU && gate_exps && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
+        hybrid_simple = false;
+    }
+    ggml_tensor * expert_banks[] = {up_exps, gate_exps, gate_up_exps, down_exps};
+    for (const auto & lora : *loras) {
+        for (auto * bank : expert_banks) {
+            if (bank && lora.first->get_weight(bank)) {
+                hybrid_simple = false;
+            }
+        }
+    }
+    if (hybrid_simple) {
+        auto & hybrid = res->get_moe_regions().back().hybrid_ffn;
+        hybrid.input       = ffn_input;
+        hybrid.up          = up_exps;
+        hybrid.gate        = gate_exps;
+        hybrid.gate_up     = gate_up_exps;
+        hybrid.activation  = expert_activation;
+        hybrid.down        = down_exps;
+        hybrid.down_output = expert_down_output;
+        hybrid.type_op     = type_op;
+    }
 
     return moe_out;
 }

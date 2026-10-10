@@ -1088,7 +1088,6 @@ static void test_active_grouped_multirow_graph_modes_case(
     }
     std::vector<float> direct_expected;
     std::vector<float> direct_actual;
-    uintptr_t captured_graph = 0;
     uintptr_t captured_instance = 0;
     uint64_t captured_semantic_key = 0;
     uint64_t captured_resource_fingerprint = 0;
@@ -1136,13 +1135,13 @@ static void test_active_grouped_multirow_graph_modes_case(
         } else if (pass == 1) {
             CHECK(candidate_graph.instance != 0 && candidate_graph.graph != 0 &&
                 candidate_graph.warmup_complete && candidate_graph.moe_resource_fingerprint != 0);
-            captured_graph = candidate_graph.graph;
             captured_instance = candidate_graph.instance;
             captured_semantic_key = candidate_graph.execution_semantic_key;
             captured_resource_fingerprint = candidate_graph.moe_resource_fingerprint;
             CHECK(captured_semantic_key != 0 && captured_resource_fingerprint != 0);
         } else {
-            CHECK(candidate_graph.graph == captured_graph && candidate_graph.instance == captured_instance &&
+            // cudaStreamEndCapture gives a new description on update, so only the instance identity is stable
+            CHECK(candidate_graph.graph != 0 && candidate_graph.instance == captured_instance &&
                 candidate_graph.warmup_complete && candidate_graph.moe_resource_fingerprint != 0 &&
                 candidate_graph.execution_semantic_key == captured_semantic_key);
             if (transition_executed) {
@@ -1168,7 +1167,7 @@ static void test_active_grouped_multirow_graph_modes_case(
             if (capture_available) {
                 ggml_cuda_graph_capture_state_for_test retained_graph;
                 CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &retained_graph));
-                CHECK(retained_graph.graph == captured_graph && retained_graph.instance == captured_instance &&
+                CHECK(retained_graph.graph != 0 && retained_graph.instance == captured_instance &&
                     retained_graph.warmup_complete && retained_graph.execution_semantic_key == captured_semantic_key &&
                     retained_graph.moe_resource_fingerprint == captured_resource_fingerprint);
             }
@@ -1281,7 +1280,7 @@ static void test_active_grouped_multirow_graph_modes_case(
         (void) run_cached_mmid_path_test(
             candidate_backend.get(), reference_backend.get(), candidate_prefill, reference_prefill, prefill_ids);
         CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &invalidated_graph));
-        CHECK(invalidated_graph.graph == captured_graph && invalidated_graph.instance == captured_instance &&
+        CHECK(invalidated_graph.graph != 0 && invalidated_graph.instance == captured_instance &&
             invalidated_graph.warmup_complete && invalidated_graph.execution_semantic_key == captured_semantic_key &&
             invalidated_graph.moe_resource_fingerprint == captured_resource_fingerprint);
 

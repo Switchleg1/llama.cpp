@@ -51,6 +51,8 @@ void test_speculative_grouped_intent_splits();
 
 int  test_grouped_multigpu();
 void test_grouped_layer_placement();
+void test_moe_hybrid_ffn_insertion();
+void test_moe_sched_compute_range();
 
 void test_speculative_required_grouped_backend_capability(int device);
 
@@ -717,7 +719,9 @@ cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         int64_t n_out,
         int64_t n_used,
         int64_t n_tokens,
-        int64_t n_experts = 8);
+        int64_t n_experts = 8,
+        bool per_expert_input = false,
+        bool strided_ids = false);
 
 cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         ggml_backend_t backend,

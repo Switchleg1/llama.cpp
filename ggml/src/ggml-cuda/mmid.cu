@@ -137,6 +137,8 @@ ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_cap
         result.selection = GGML_CUDA_MMID_CONSUMER_GENERIC;
     }
     result.reason = GGML_CUDA_MMID_CAPABILITY_OK;
+    result.skips_negative_ids = !mapped && (result.selection == GGML_CUDA_MMID_CONSUMER_MMVQ ||
+        result.selection == GGML_CUDA_MMID_CONSUMER_MMVF || result.selection == GGML_CUDA_MMID_CONSUMER_MMQ);
     return result;
 }
 
@@ -242,7 +244,10 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                nex_prev += expert_used >= 0 && expert_used < expert;
+                if (write_inverse && expert == 0 && expert_used < 0) {
+                    ids_src1[it*n_expert_used + iex] = -1;
+                }
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -267,7 +272,10 @@ static __global__ void mm_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used >= 0 && expert_used < expert;
+            if (write_inverse && expert == 0 && expert_used < 0) {
+                ids_src1[it*n_expert_used + iex] = -1;
+            }
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -306,6 +314,12 @@ static __global__ void mm_ids_helper(
         }
     }
 
+    // Only the last expert writes the unused tail; resident compact rows do not overlap it.
+    if (!write_inverse && expert == static_cast<int>(gridDim.x) - 1) {
+        for (int i = nex_prev + it_compact + threadIdx.x; i < n_tokens*n_expert_used; i += warp_size) {
+            ids_src1[i] = -1;
+        }
+    }
     if (threadIdx.x != 0) {
         return;
     }

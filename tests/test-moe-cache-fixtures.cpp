@@ -239,8 +239,9 @@ std::vector<uint8_t> cached_fusion_test_data(const ggml_tensor * tensor, size_t 
 
 ggml_backend_buffer_type_t pageable_cached_buffer_type() {
     static ggml_backend_buffer_type buft = *ggml_backend_cuda_moe_cached_buffer_type();
+    // Pageable, but still page-aligned: cached banks must never share a page with other allocations.
     buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t size) {
-        auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        auto * buffer = ggml_backend_cuda_moe_cached_page_aligned_buffer_for_test(size);
         if (buffer != nullptr) {
             buffer->buft = ggml_backend_cuda_moe_cached_buffer_type();
         }

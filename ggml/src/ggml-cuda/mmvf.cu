@@ -39,6 +39,11 @@ static __global__ void mul_mat_vec_f(
         sample_dst = ids ? 0                                                   : blockIdx.z;
     }
 
+    if (ids && channel_x < 0) {
+        ggml_cuda_pdl_lc();
+        return;
+    }
+
     const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
     const int sample_y    = sample_dst;
 

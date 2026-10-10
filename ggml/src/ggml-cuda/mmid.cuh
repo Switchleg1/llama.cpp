@@ -73,6 +73,8 @@ struct ggml_cuda_mmid_capability {
     ggml_cuda_mmid_source_capability source;
     ggml_cuda_mmid_consumer selection = GGML_CUDA_MMID_CONSUMER_UNSUPPORTED;
     ggml_cuda_mmid_capability_reason reason = GGML_CUDA_MMID_CAPABILITY_UNADVERTISED_SOURCE;
+    // Native consumer only; surrounding fusion and scatter still need certification.
+    bool skips_negative_ids = false;
 };
 
 struct ggml_cuda_mmid_direct_source_view {

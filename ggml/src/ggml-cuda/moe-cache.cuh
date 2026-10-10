@@ -856,6 +856,13 @@ public:
     bool acquire_group_resources(const ggml_cuda_moe_candidate_group_key & key, ggml_cuda_moe_grouped_acquisition * acquisition);
     bool begin_group_transaction(const ggml_cuda_moe_grouped_acquisition & acquisition, ggml_cuda_moe_grouped_transaction * transaction);
     bool end_group_transaction(const ggml_cuda_moe_grouped_transaction & transaction);
+    // Enqueues one slot per expert: -1 is cold, -2 is invalid. Validate every entry before use.
+    // Output is separate device storage. Keep the transaction until finish_decode on the same stream.
+    bool snapshot_resident_slots(
+            const ggml_cuda_moe_grouped_transaction & transaction,
+            ggml_cuda_moe_stream_t stream,
+            int32_t * slots,
+            size_t capacity);
     bool get_group_resources(const ggml_cuda_moe_grouped_acquisition & acquisition, ggml_cuda_moe_grouped_resource_info * info) const;
     bool get_group_resource_bank(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index, ggml_cuda_moe_grouped_bank_descriptor * descriptor) const;
     ggml_cuda_moe_legacy_operation_lease begin_legacy_operation();
@@ -1114,6 +1121,7 @@ struct ggml_cuda_moe_cache;
 
 ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void);
 ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_bounded_buffer_type(size_t bytes);
+ggml_backend_buffer_t ggml_backend_cuda_moe_cached_page_aligned_buffer_for_test(size_t bytes);
 bool ggml_backend_cuda_moe_staging_size_v1(
     const struct ggml_backend_moe_staging_query_v1 * query,
     struct ggml_backend_moe_staging_size_v1 * result);

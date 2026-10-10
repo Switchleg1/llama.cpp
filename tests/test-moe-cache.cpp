@@ -10,6 +10,21 @@ int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--grouped-multigpu-only") == 0) {
         return test_grouped_multigpu();
     }
+    if (argc == 2 && strcmp(argv[1], "--mmid-source-view-only") == 0) {
+        int device = 0;
+        CUDA_OK(cudaGetDevice(&device));
+        test_mmid_direct_source_view(device);
+        return 0;
+    }
+    // Needs GGML_CUDA_DISABLE_FUSION=1: this fixture graph trips a pre-existing topk-moe fusion assert.
+    if (argc == 2 && strcmp(argv[1], "--sched-range-only") == 0) {
+        test_moe_sched_compute_range();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--hybrid-ffn-insertion-only") == 0) {
+        test_moe_hybrid_ffn_insertion();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--grouped-layer-only") == 0) {
         test_grouped_layer_placement();
         return 0;
