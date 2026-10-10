@@ -347,6 +347,11 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // Add sorted, unique interior node boundaries before splitting or allocating a graph. The indices are copied.
+    // Boundaries are graph-bound, preserve normal backend splits, and are cleared by reset (including reserve).
+    // Use a fresh graph after reserve; set its boundaries again before allocation. Zero boundaries clears the setting.
+    GGML_API bool                 ggml_backend_sched_set_split_boundaries(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const int * boundaries, int n_boundaries);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 

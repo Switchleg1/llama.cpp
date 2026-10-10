@@ -813,6 +813,12 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_split * splits;
     int n_splits;
     int splits_capacity;
+    int last_compute_backend_id;
+    struct ggml_cgraph * split_boundary_graph;
+    uint64_t split_boundary_graph_uid;
+    int split_boundary_n_nodes;
+    int * split_boundaries;
+    int n_split_boundaries;
 
     // pipeline parallelism support
     int n_copies;
@@ -1065,7 +1071,44 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+static bool ggml_backend_sched_split_boundaries_match(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return sched->n_split_boundaries == 0 ||
+        (sched->split_boundary_graph == graph && sched->split_boundary_graph_uid == graph->uid &&
+         sched->split_boundary_n_nodes == graph->n_nodes);
+}
+
+bool ggml_backend_sched_set_split_boundaries(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph, const int * boundaries, int n_boundaries) {
+    GGML_ASSERT(sched);
+    if (sched->source_graph != nullptr || sched->is_alloc || n_boundaries < 0 ||
+            (n_boundaries > 0 && (graph == nullptr || boundaries == nullptr))) {
+        return false;
+    }
+    for (int i = 0; i < n_boundaries; ++i) {
+        if (boundaries[i] <= 0 || boundaries[i] >= graph->n_nodes ||
+                (i > 0 && boundaries[i] <= boundaries[i - 1])) {
+            return false;
+        }
+    }
+    int * copy = nullptr;
+    if (n_boundaries > 0) {
+        copy = (int *) malloc((size_t) n_boundaries * sizeof(int));
+        if (copy == nullptr) {
+            return false;
+        }
+        memcpy(copy, boundaries, (size_t) n_boundaries * sizeof(int));
+    }
+    free(sched->split_boundaries);
+    sched->split_boundaries = copy;
+    sched->n_split_boundaries = n_boundaries;
+    sched->split_boundary_graph = n_boundaries > 0 ? graph : nullptr;
+    sched->split_boundary_graph_uid = n_boundaries > 0 ? graph->uid : 0;
+    sched->split_boundary_n_nodes = n_boundaries > 0 ? graph->n_nodes : 0;
+    return true;
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    GGML_ASSERT(ggml_backend_sched_split_boundaries_match(sched, graph));
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1087,6 +1130,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     graph->uid = ggml_graph_next_uid();
     sched->source_graph = graph;
     sched->source_graph_uid = graph->uid;
+    if (sched->n_split_boundaries > 0) {
+        sched->split_boundary_graph_uid = graph->uid;
+    }
 
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -1314,14 +1360,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
-        for (; i < graph->n_nodes; i++) {
+        int boundary_id = 0;
+        for (i = 0; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
-
-            if (ggml_is_view_op(node->op)) {
+            const bool is_view = ggml_is_view_op(node->op);
+            const bool forced_split = boundary_id < sched->n_split_boundaries &&
+                sched->split_boundaries[boundary_id] == i;
+            if (forced_split) {
+                ++boundary_id;
+            }
+            if (is_view && !forced_split) {
                 continue;
             }
 
-            const int node_backend_id = tensor_backend_id(node);
+            const int node_backend_id = is_view ? cur_backend_id : tensor_backend_id(node);
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
@@ -1345,7 +1397,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
-            if (node_backend_id != cur_backend_id || need_new_split) {
+            if (node_backend_id != cur_backend_id || need_new_split || forced_split) {
                 split->i_end = i;
                 i_split++;
                 if (i_split >= sched->splits_capacity) {
@@ -1363,6 +1415,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
+            }
+
+            if (is_view) {
+                continue;
             }
 
             // find inputs that are not on the same backend
@@ -1765,7 +1821,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
-    int prev_backend_id = -1;
+    int prev_backend_id = sched->last_compute_backend_id;
 
     for (int split_id = split_begin; split_id < split_end; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1968,6 +2024,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         }
 
         prev_backend_id = split_backend_id;
+        sched->last_compute_backend_id = split_backend_id;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2061,6 +2118,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         free(sched->splits[i].inputs);
     }
     free(sched->splits);
+    free(sched->split_boundaries);
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
@@ -2104,6 +2162,11 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
     sched->source_graph = nullptr;
     sched->source_graph_uid = 0;
+    sched->last_compute_backend_id = -1;
+    sched->n_split_boundaries = 0;
+    sched->split_boundary_graph = nullptr;
+    sched->split_boundary_graph_uid = 0;
+    sched->split_boundary_n_nodes = 0;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -2122,6 +2185,9 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
+    if (!ggml_backend_sched_split_boundaries_match(sched, measure_graph)) {
+        return false;
+    }
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
@@ -2139,6 +2205,9 @@ static bool ggml_backend_sched_alloc_graph_impl(ggml_backend_sched_t sched, stru
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
+    if (!ggml_backend_sched_split_boundaries_match(sched, graph)) {
+        return false;
+    }
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
@@ -2150,6 +2219,7 @@ static bool ggml_backend_sched_alloc_graph_impl(ggml_backend_sched_t sched, stru
     }
 
     sched->is_alloc = true;
+    sched->last_compute_backend_id = -1;
 
     return true;
 }
@@ -2200,7 +2270,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_ext(
         certificate_value = *certificate;
     }
 
-    if (!sched->is_reset && !sched->is_alloc) {
+    if (!sched->is_reset && !sched->is_alloc && sched->n_split_boundaries == 0) {
         ggml_backend_sched_reset(sched);
     }
 
@@ -2251,7 +2321,7 @@ enum ggml_status ggml_backend_sched_graph_compute_range(
         certificate_value = *certificate;
     }
 
-    if (!sched->is_reset && !sched->is_alloc) {
+    if (!sched->is_reset && !sched->is_alloc && sched->n_split_boundaries == 0) {
         ggml_backend_sched_reset(sched);
     }
     if (!sched->is_alloc) {

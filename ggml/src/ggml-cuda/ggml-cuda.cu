@@ -2415,6 +2415,13 @@ static ggml_cuda_moe_ids_cache_state & ggml_cuda_moe_ids_cache_get(ggml_backend_
     return *ctx.moe_ids_cache;
 }
 
+ggml_cuda_moe_stream_t ggml_cuda_moe_owner_stream_for_test(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    return static_cast<ggml_backend_cuda_context *>(backend->context)->stream();
+}
+
 size_t ggml_cuda_moe_ids_cache_count_for_test(ggml_backend_t backend) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return 0;
@@ -6902,9 +6909,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * coverage_nodes = nullptr;
     uint32_t coverage_mmid_count = 0;
 
-    if (graph != nullptr && graph->moe_resource_fingerprint != 0 && cuda_ctx->moe_grouped_context != nullptr &&
-            graph->moe_registry_generation != cuda_ctx->moe_grouped_context->state().generation) {
-        ggml_cuda_graph_invalidate_moe_capture(graph, true);
+    if (cuda_ctx->moe_grouped_context != nullptr) {
+        const auto generation = cuda_ctx->moe_grouped_context->state().generation;
+        if (cuda_ctx->moe_graph_registry_generation != generation) {
+            // Routing-only graphs can retain warmup state without a grouped resource fingerprint.
+            for (auto & entry : cuda_ctx->cuda_graphs) {
+                ggml_cuda_graph_invalidate_moe_capture(entry.second.get(), true);
+            }
+            cuda_ctx->moe_graph_registry_generation = generation;
+        }
     }
 
 #ifdef USE_CUDA_GRAPH

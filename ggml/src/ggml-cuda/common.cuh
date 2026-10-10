@@ -1477,6 +1477,7 @@ struct ggml_backend_cuda_context {
     uint32_t moe_early_router_max_rows = 1;
     std::once_flag moe_grouped_context_once;
     ggml_cuda_moe_grouped_context * moe_grouped_context = nullptr;
+    uint64_t moe_graph_registry_generation = 0;
     std::vector<std::unique_ptr<ggml_backend_cuda_context>> moe_router_contexts;
     std::unique_ptr<ggml_cuda_moe_ids_cache_state> moe_ids_cache;
 

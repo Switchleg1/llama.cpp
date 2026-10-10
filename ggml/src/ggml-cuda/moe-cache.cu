@@ -5734,6 +5734,17 @@ struct ggml_cuda_moe_grouped_context::impl {
     std::mutex telemetry_mutex;
     std::condition_variable resource_cv;
     ggml_cuda_moe_candidate_registry_state state;
+    ggml_graph_execution_certificate split_route_certificate = {};
+    uint64_t split_route_source_uid = 0;
+    const ggml_cgraph * split_route_source_graph = nullptr;
+    const void * split_route_source_nodes = nullptr;
+    int split_route_source_n_nodes = 0;
+    uint64_t split_route_submission = 0;
+    uint64_t split_route_epoch = 0;
+    ggml_cuda_moe_stream_t split_route_stream = nullptr;
+    std::array<bool, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> split_routes_published = {};
+    std::array<std::shared_ptr<const ggml_cuda_moe_split_route_origin>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> split_route_origins;
+    bool split_routes_active = false;
     moe_candidate_table table;
     std::shared_ptr<moe_host_budget> pageable_sources;
     std::shared_ptr<auxiliary_budget> original_auxiliary_budget = std::make_shared<auxiliary_budget>();
@@ -7609,8 +7620,32 @@ struct ggml_cuda_moe_grouped_context::impl {
         return true;
     }
 
+    void drain_split_routes() {
+        ggml_cuda_moe_stream_t stream = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stream = split_route_stream;
+            split_routes_active = false;
+            split_route_stream = nullptr;
+            split_route_source_graph = nullptr;
+            split_route_source_nodes = nullptr;
+            split_route_source_n_nodes = 0;
+        }
+        if (stream != nullptr) {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                resource_cv.wait(lock, [&]() { return !has_active_group_call() && !has_active_transaction(); });
+            }
+            moe_grouped_device_scope scope(device);
+            CUDA_CHECK(cudaStreamSynchronize((cudaStream_t) stream));
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        split_route_origins.fill(nullptr);
+    }
+
     int32_t publish_failure(ggml_cuda_moe_candidate_rejection rejection, uint32_t n_slots, int32_t result) {
         std::lock_guard<std::mutex> lifecycle_lock(resource_lifecycle_mutex);
+        drain_split_routes();
         legacy_record_map retired_legacy;
         resource_slots retired;
         uint32_t old_registered_groups = 0;
@@ -7662,6 +7697,7 @@ struct ggml_cuda_moe_grouped_context::impl {
 
     int32_t publish(moe_candidate_table && replacement) {
         std::lock_guard<std::mutex> lifecycle_lock(resource_lifecycle_mutex);
+        drain_split_routes();
         moe_candidate_set_prefill_resident_policy(replacement, prefill_resident_auxiliary_budget);
         auto sources = make_pageable_sources(replacement);
         legacy_record_map retired_legacy;
@@ -9289,6 +9325,280 @@ bool ggml_cuda_moe_grouped_context::get_group(
         info->n_slots = impl_->table.n_slots;
     }
     return true;
+}
+
+struct ggml_cuda_moe_split_route_origin {
+    const ggml_cuda_moe_grouped_context * owner_ = nullptr;
+    ggml_cuda_moe_candidate_group_key candidate_;
+    ggml_cuda_moe_ids_signature ids_, root_, source_, indices_;
+    uint64_t epoch_ = 0;
+    uint64_t producer_uid_ = 0;
+    uint32_t source_root_index_ = 0;
+    uint32_t source_ids_index_ = 0;
+    int device_ = -1;
+    ggml_cuda_moe_stream_t stream_ = nullptr;
+    cudaEvent_t ready_ = nullptr;
+
+    ~ggml_cuda_moe_split_route_origin() {
+        if (ready_ != nullptr) {
+            moe_grouped_device_scope scope(device_);
+            CUDA_CHECK(cudaEventSynchronize(ready_));
+            CUDA_CHECK(cudaEventDestroy(ready_));
+        }
+    }
+};
+
+ggml_cuda_moe_split_route_lease::~ggml_cuda_moe_split_route_lease() {
+    reset();
+}
+
+void ggml_cuda_moe_split_route_lease::reset() noexcept {
+    if (origin_ != nullptr) {
+        moe_grouped_device_scope scope(origin_->device_);
+        CUDA_CHECK(cudaEventSynchronize(origin_->ready_));
+    }
+    origin_.reset();
+}
+
+static bool moe_split_route_certificate_matches(
+        const ggml_cgraph * graph, const ggml_graph_execution_certificate & expected, uint64_t source_uid) {
+    ggml_graph_execution_certificate actual;
+    if (!moe_candidate_execution_certificate(graph, &actual, nullptr)) {
+        return false;
+    }
+    return actual.source_graph_uid == source_uid && actual.flags == expected.flags &&
+        actual.domain == expected.domain && actual.row_semantics == expected.row_semantics &&
+        actual.owner_namespace == expected.owner_namespace && actual.owner_generation == expected.owner_generation &&
+        actual.n_rows == expected.n_rows && actual.n_sequences == expected.n_sequences;
+}
+
+bool ggml_cuda_moe_grouped_context::begin_split_routes(
+        const ggml_cgraph * source, const ggml_graph_execution_certificate & certificate, uint64_t submission_id) {
+    if (source == nullptr || source->uid == 0 || submission_id == 0 || certificate.source_graph_uid != 0 ||
+            certificate.split_graph_uid != 0 || certificate.n_sequences > certificate.n_rows) {
+        return false;
+    }
+    ggml_cgraph witness = *source;
+    witness.uid = ggml_graph_next_uid();
+    witness.execution_certificate = certificate;
+    witness.execution_certificate.source_graph_uid = source->uid;
+    witness.execution_certificate.split_graph_uid = witness.uid;
+    if (!moe_candidate_execution_certificate(&witness, nullptr, nullptr)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto & previous = impl_->split_route_certificate;
+    if (!impl_->state.accepted || impl_->draining || impl_->replacement_pending || impl_->split_routes_active ||
+            impl_->split_route_epoch == UINT64_MAX ||
+            (previous.owner_namespace != 0 && previous.owner_namespace != certificate.owner_namespace) ||
+            certificate.owner_generation < previous.owner_generation ||
+            (certificate.owner_generation == previous.owner_generation && submission_id <= impl_->split_route_submission)) {
+        return false;
+    }
+    impl_->split_route_certificate = certificate;
+    impl_->split_route_source_uid = source->uid;
+    impl_->split_route_source_graph = source;
+    impl_->split_route_source_nodes = source->nodes;
+    impl_->split_route_source_n_nodes = source->n_nodes;
+    impl_->split_route_submission = submission_id;
+    ++impl_->split_route_epoch;
+    impl_->split_route_stream = nullptr;
+    impl_->split_routes_published.fill(false);
+    impl_->split_routes_active = true;
+    return true;
+}
+
+void ggml_cuda_moe_grouped_context::end_split_routes() {
+    std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
+    impl_->drain_split_routes();
+}
+
+bool ggml_cuda_moe_grouped_context::publish_split_route(
+        const ggml_cgraph * source, const ggml_cgraph * producer,
+        const ggml_cuda_moe_candidate_group_key & candidate, const ggml_tensor * ids,
+        ggml_cuda_moe_stream_t stream, ggml_cuda_moe_split_route_lease * lease) {
+    if (source == nullptr || producer == nullptr || ids == nullptr || stream == nullptr || lease == nullptr || lease->origin_ != nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->split_routes_active || impl_->draining || impl_->replacement_pending ||
+            source != impl_->split_route_source_graph || source->uid != impl_->split_route_source_uid ||
+            source->nodes != impl_->split_route_source_nodes || source->n_nodes != impl_->split_route_source_n_nodes ||
+            candidate.generation != impl_->state.generation ||
+            candidate.group_index >= impl_->table.groups.size() || impl_->split_routes_published[candidate.group_index] ||
+            (impl_->split_route_stream != nullptr && impl_->split_route_stream != stream) ||
+            !moe_split_route_certificate_matches(producer, impl_->split_route_certificate, source->uid)) {
+        return false;
+    }
+    const auto & group = impl_->table.groups[candidate.group_index];
+    moe_candidate_route_proof proof;
+    if (group.down == nullptr || !moe_candidate_validate_route(ids, group.down->ne[2], proof) ||
+            proof.root.tensor == nullptr || proof.root.tensor->op != GGML_OP_ARGSORT || proof.indices.tensor != nullptr ||
+            !moe_candidate_discover_route(producer, producer->n_nodes, proof)) {
+        return false;
+    }
+    for (const auto * tensor : {proof.ids.tensor, proof.root.tensor, proof.source.tensor}) {
+        if (tensor == nullptr || tensor->data == nullptr || tensor->buffer == nullptr ||
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) != impl_->owner) {
+            return false;
+        }
+    }
+    int consumer_index = -1;
+    for (int i = 0; i < source->n_nodes; ++i) {
+        const auto * node = source->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == group.down && node->src[2] == ids) {
+            const auto geometry = moe_candidate_execution_geometry_for(producer, node, group.down->ne[2], impl_->state.n_slots);
+            if (!geometry.grouped_eligible || geometry.n_rows != impl_->split_route_certificate.n_rows) {
+                return false;
+            }
+            consumer_index = i;
+            break;
+        }
+    }
+    if (consumer_index < 0 || !moe_candidate_discover_route(source, consumer_index, proof)) {
+        return false;
+    }
+    std::shared_ptr<ggml_cuda_moe_split_route_origin> origin;
+    try {
+        origin = std::make_shared<ggml_cuda_moe_split_route_origin>();
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+    moe_grouped_device_scope scope(impl_->device);
+    cudaStreamCaptureStatus capture;
+    cudaEvent_t ready = nullptr;
+    if (!moe_grouped_cuda_success(cudaStreamIsCapturing((cudaStream_t) stream, &capture)) ||
+            capture != cudaStreamCaptureStatusNone ||
+            !moe_grouped_cuda_success(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming))) {
+        return false;
+    }
+    if (!moe_grouped_cuda_success(cudaEventRecord(ready, (cudaStream_t) stream))) {
+        (void) cudaEventDestroy(ready);
+        return false;
+    }
+    origin->owner_ = this;
+    origin->candidate_ = candidate;
+    origin->ids_ = proof.ids;
+    origin->root_ = proof.root;
+    origin->source_ = proof.source;
+    origin->indices_ = proof.indices;
+    origin->epoch_ = impl_->split_route_epoch;
+    origin->producer_uid_ = producer->uid;
+    origin->source_root_index_ = proof.root_node_index;
+    origin->source_ids_index_ = proof.ids_node_index;
+    origin->device_ = impl_->device;
+    origin->stream_ = stream;
+    origin->ready_ = ready;
+    lease->origin_ = origin;
+    impl_->split_route_origins[candidate.group_index] = std::move(origin);
+    impl_->split_route_stream = stream;
+    impl_->split_routes_published[candidate.group_index] = true;
+    return true;
+}
+
+bool ggml_cuda_moe_grouped_context::matches_split_route(
+        const ggml_cuda_moe_split_route_lease & lease, const ggml_cgraph * source,
+        const ggml_cgraph * consumer, const ggml_cuda_moe_candidate_group_key & candidate,
+        const ggml_tensor * ids, uint64_t submission_id, ggml_cuda_moe_stream_t stream) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (lease.origin_ == nullptr || source != impl_->split_route_source_graph ||
+            submission_id != impl_->split_route_submission || stream != lease.origin_->stream_) {
+        return false;
+    }
+    return split_route_origin_matches_locked(*lease.origin_, consumer, candidate, ids);
+}
+
+bool ggml_cuda_moe_grouped_context::split_route_origin_matches_locked(
+        const ggml_cuda_moe_split_route_origin & origin, const ggml_cgraph * consumer,
+        const ggml_cuda_moe_candidate_group_key & candidate, const ggml_tensor * ids) const {
+    const auto * source = impl_->split_route_source_graph;
+    if (source == nullptr || consumer == nullptr || ids == nullptr || !impl_->split_routes_active ||
+            impl_->draining || impl_->replacement_pending || origin.owner_ != this ||
+            origin.ready_ == nullptr || origin.epoch_ != impl_->split_route_epoch ||
+            source->uid != impl_->split_route_source_uid || source->nodes != impl_->split_route_source_nodes ||
+            source->n_nodes != impl_->split_route_source_n_nodes ||
+            candidate.generation != impl_->state.generation || candidate.generation != origin.candidate_.generation ||
+            candidate.group_index != origin.candidate_.group_index || candidate.group_index >= impl_->table.groups.size() ||
+            origin.stream_ != impl_->split_route_stream || consumer->uid == origin.producer_uid_ ||
+            !moe_split_route_certificate_matches(consumer, impl_->split_route_certificate, source->uid) ||
+            origin.source_root_index_ >= (uint32_t) source->n_nodes || origin.source_ids_index_ >= (uint32_t) source->n_nodes ||
+            source->nodes[origin.source_root_index_] != origin.root_.tensor || source->nodes[origin.source_ids_index_] != ids ||
+            !moe_candidate_signature_matches(origin.ids_, ids) ||
+            !moe_candidate_signature_matches(origin.root_, origin.root_.tensor) ||
+            !moe_candidate_signature_matches(origin.source_, origin.source_.tensor)) {
+        return false;
+    }
+    moe_candidate_route_proof proof;
+    const auto & group = impl_->table.groups[candidate.group_index];
+    if (group.down == nullptr || !moe_candidate_validate_route(ids, group.down->ne[2], proof) ||
+            !moe_candidate_ids_equal(proof.root, origin.root_) || !moe_candidate_ids_equal(proof.source, origin.source_) ||
+            !moe_candidate_ids_equal(proof.indices, origin.indices_)) {
+        return false;
+    }
+    bool has_down = false;
+    for (int i = 0; i < consumer->n_nodes; ++i) {
+        const auto * node = consumer->nodes[i];
+        const auto * bank = node->op == GGML_OP_MUL_MAT_ID ? moe_candidate_active_reverse(impl_->table, node->src[0]) : nullptr;
+        if (bank == nullptr || bank->group_index != candidate.group_index) {
+            continue;
+        }
+        if (node->src[2] != ids || !moe_candidate_execution_geometry_for(
+                consumer, node, group.down->ne[2], impl_->state.n_slots).grouped_eligible) {
+            return false;
+        }
+        bool present = false;
+        for (int j = origin.source_ids_index_ + 1; j < source->n_nodes; ++j) {
+            present = present || source->nodes[j] == node;
+        }
+        if (!present) {
+            return false;
+        }
+        has_down = has_down || node->src[0] == group.down;
+    }
+    return has_down;
+}
+
+bool ggml_cuda_moe_grouped_context::split_route_down_boundary_matches_locked(
+        const ggml_cuda_moe_split_route_origin & origin, const ggml_cgraph * consumer,
+        const ggml_cuda_moe_graph_plan::reader_witness & reader) const {
+    if (reader.role != GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT ||
+            !split_route_origin_matches_locked(origin, consumer, origin.candidate_, reader.ids.tensor)) {
+        return false;
+    }
+    const auto * source = impl_->split_route_source_graph;
+    const auto * down = reader.output.tensor;
+    int down_index = -1;
+    for (int i = origin.source_ids_index_ + 1; i < source->n_nodes; ++i) {
+        if (source->nodes[i] == down) {
+            down_index = i;
+            break;
+        }
+    }
+    if (down_index < 0) {
+        return false;
+    }
+    int total = 0, local = 0;
+    for (int i = 0; i < source->n_nodes; ++i) {
+        const auto * node = source->nodes[i];
+        for (const auto * input : node->src) {
+            if (input != down) {
+                continue;
+            }
+            if (i <= down_index) {
+                return false;
+            }
+            ++total;
+            for (int j = 0; j < consumer->n_nodes; ++j) {
+                if (consumer->nodes[j] == node) {
+                    ++local;
+                    break;
+                }
+            }
+        }
+    }
+    return total == reader.use_count && local == (int) reader.n_consumers;
 }
 
 bool ggml_cuda_moe_grouped_context::get_bank(
@@ -11328,10 +11638,14 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
                 observation.route_source = route.source;
                 observation.route_indices = route.indices;
                 if (!moe_candidate_discover_route(cgraph, node_index, route)) {
-                    observation.route_invalid = true;
-                    if (route.root_node_index >= static_cast<uint32_t>(n_nodes) || route.ids_node_index >= static_cast<uint32_t>(n_nodes) ||
-                            ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), route.root_node_index) != route.root.tensor ||
-                            ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), route.ids_node_index) != route.ids.tensor) {
+                    const auto & origin = impl_->split_route_origins[entry.group_index];
+                    const ggml_cuda_moe_candidate_group_key candidate{impl_->state.generation, entry.group_index};
+                    if (origin != nullptr && split_route_origin_matches_locked(*origin, cgraph, candidate, ids)) {
+                        observation.route_origin = origin;
+                        observation.has_ids = true;
+                        route.root_node_index = route.ids_node_index = UINT32_MAX;
+                    } else {
+                        observation.route_invalid = true;
                         observation.unproven = true;
                     }
                 } else {
@@ -11340,7 +11654,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
                 observation.route_root_node_index = route.root_node_index;
                 observation.route_ids_node_index = route.ids_node_index;
             }
-        } else if (static_cast<uint32_t>(node_index) <= observation.route_ids_node_index) {
+        } else if (observation.route_origin == nullptr && static_cast<uint32_t>(node_index) <= observation.route_ids_node_index) {
             observation.route_invalid = true;
         }
     }
@@ -11417,7 +11731,9 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             if (!moe_candidate_graph_use(cgraph, reader.output.tensor, present, reader.use_count) || !present ||
                     reader.use_count < static_cast<int32_t>(reader.n_consumers)) {
                 observation.unproven = true;
-            } else if (reader.use_count > static_cast<int32_t>(reader.n_consumers)) {
+            } else if (reader.use_count > static_cast<int32_t>(reader.n_consumers) &&
+                    (observation.route_origin == nullptr ||
+                     !split_route_down_boundary_matches_locked(*observation.route_origin, cgraph, reader))) {
                 observation.external_consumer = true;
             }
             for (uint32_t consumer_index = 0; !observation.geometry_invalid && !observation.prefill &&
@@ -11553,6 +11869,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             record.ids_indices = observation.route_indices;
             record.ids_root_node_index = observation.route_root_node_index;
             record.ids_node_index = observation.route_ids_node_index;
+            record.route_origin = observation.route_origin;
         }
         for (uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
                 role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT; ++role) {
@@ -11823,7 +12140,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
             const auto current_ids = moe_candidate_ids_signature(ids);
             if (has_ids) {
                 mixed_ids = mixed_ids || !moe_candidate_ids_equal(ids_signature, current_ids);
-                route_invalid = route_invalid || reader.node_index <= record.ids_node_index;
+                route_invalid = route_invalid || (record.route_origin == nullptr && reader.node_index <= record.ids_node_index);
             } else {
                 moe_candidate_route_proof current_route;
                 const bool route_valid = moe_candidate_validate_route(ids, bank.ne[2], current_route);
@@ -11832,11 +12149,13 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
                         !moe_candidate_ids_equal(current_route.root, record.ids_root) ||
                         !moe_candidate_ids_equal(current_route.source, record.ids_source) ||
                         !moe_candidate_ids_equal(current_route.indices, record.ids_indices) ||
-                        record.ids_root_node_index >= static_cast<uint32_t>(cgraph->n_nodes) ||
-                        record.ids_node_index >= static_cast<uint32_t>(cgraph->n_nodes) ||
-                        ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_root_node_index) != record.ids_root.tensor ||
-                        ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_node_index) != record.ids.tensor ||
-                        record.ids_root_node_index > record.ids_node_index || record.ids_node_index >= reader.node_index) {
+                        (record.route_origin != nullptr ?
+                            !split_route_origin_matches_locked(*record.route_origin, cgraph, record.candidate, ids) :
+                            (record.ids_root_node_index >= static_cast<uint32_t>(cgraph->n_nodes) ||
+                             record.ids_node_index >= static_cast<uint32_t>(cgraph->n_nodes) ||
+                             ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_root_node_index) != record.ids_root.tensor ||
+                             ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_node_index) != record.ids.tensor ||
+                             record.ids_root_node_index > record.ids_node_index || record.ids_node_index >= reader.node_index))) {
                     route_invalid = true;
                 }
                 ids_signature = current_ids;
@@ -11849,7 +12168,9 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         if (!moe_candidate_graph_use(cgraph, node, reader_present, reader_use_count) || !reader_present ||
                 reader_use_count != reader.use_count || reader_use_count < static_cast<int32_t>(reader.n_consumers)) {
             unproven = true;
-        } else if (reader_use_count > static_cast<int32_t>(reader.n_consumers)) {
+        } else if (reader_use_count > static_cast<int32_t>(reader.n_consumers) &&
+                (record.route_origin == nullptr ||
+                 !split_route_down_boundary_matches_locked(*record.route_origin, cgraph, reader))) {
             external_consumer = true;
         }
         for (uint32_t consumer_index = 0; consumer_index < reader.n_consumers; ++consumer_index) {
@@ -12044,6 +12365,10 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         }
         const bool minimal_prefill = plan.outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY &&
             record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL && record.n_readers == 0 && record.witness_reusable == 0;
+        if (plan.outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && impl_->split_routes_active &&
+                impl_->split_route_origins[record.candidate.group_index] != nullptr) {
+            return false;
+        }
         if (property_hint == GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN && !minimal_prefill &&
                 !graph_group_witness_matches(cgraph, record)) {
             return false;
@@ -12089,16 +12414,27 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         }
         moe_candidate_route_proof current_route;
         const auto * route_bank = moe_candidate_base_slot_bank(group, 0);
-        if (route_bank == nullptr || record.ids_root_node_index >= static_cast<uint32_t>(n_nodes) ||
-                record.ids_node_index >= static_cast<uint32_t>(n_nodes) || record.ids_root_node_index > record.ids_node_index ||
-                record.ids_node_index >= first_node_index ||
-                ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_root_node_index) != record.ids_root.tensor ||
-                ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_node_index) != record.ids.tensor ||
+        const bool origin_valid = record.route_origin != nullptr ?
+            split_route_origin_matches_locked(*record.route_origin, cgraph, record.candidate, record.ids.tensor) :
+            (record.ids_root_node_index < static_cast<uint32_t>(n_nodes) && record.ids_node_index < static_cast<uint32_t>(n_nodes) &&
+             record.ids_root_node_index <= record.ids_node_index && record.ids_node_index < first_node_index &&
+             ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_root_node_index) == record.ids_root.tensor &&
+             ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_node_index) == record.ids.tensor);
+        if (route_bank == nullptr || !origin_valid ||
                 !moe_candidate_validate_route(record.ids.tensor, route_bank->ne[2], current_route) ||
                 !moe_candidate_ids_equal(current_route.ids, record.ids) || !moe_candidate_ids_equal(current_route.root, record.ids_root) ||
                 !moe_candidate_ids_equal(current_route.source, record.ids_source) ||
                 !moe_candidate_ids_equal(current_route.indices, record.ids_indices)) {
             return false;
+        }
+        if (record.route_origin != nullptr) {
+            for (uint32_t i = 0; i < record.n_readers; ++i) {
+                const auto & reader = record.readers[i];
+                if (reader.use_count > (int) reader.n_consumers &&
+                        !split_route_down_boundary_matches_locked(*record.route_origin, cgraph, reader)) {
+                    return false;
+                }
+            }
         }
         ggml_cuda_moe_ids_signature ids_signature;
         bool has_ids = false;
@@ -12652,6 +12988,31 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
                 execution->plan_->owner_ != impl_.get() || impl_->draining || impl_->replacement_pending ||
                 !impl_->state.accepted || generation != impl_->state.generation || n_groups > impl_->table.groups.size()) {
             return false;
+        }
+        if (n_groups > execution->plan_->groups_.size()) {
+            return false;
+        }
+        for (uint32_t i = 0; i < n_groups; ++i) {
+            const auto & record = execution->plan_->groups_[i];
+            if (record.route_origin == nullptr) {
+                continue;
+            }
+            ggml_tensor * down = const_cast<ggml_tensor *>(record.nodes[
+                GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT - GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT]);
+            ggml_cgraph witness = {};
+            witness.uid = execution->plan_->graph_uid_;
+            witness.execution_certificate = execution->plan_->execution_certificate_;
+            witness.nodes = &down;
+            witness.n_nodes = 1;
+            if (down == nullptr || mode == GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY ||
+                    execution->groups_[i].stream != record.route_origin->stream_ ||
+                    !split_route_origin_matches_locked(*record.route_origin, &witness, record.candidate, record.ids.tensor)) {
+                return false;
+            }
+            moe_grouped_device_scope scope(impl_->device);
+            if (!moe_grouped_cuda_success(cudaStreamWaitEvent(record.route_origin->stream_, record.route_origin->ready_, 0))) {
+                return false;
+            }
         }
         const auto outcome = execution->plan_->outcome_;
         const bool grouped_enabled = mode != GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY;
@@ -13901,6 +14262,7 @@ void ggml_cuda_moe_grouped_context::shutdown() {
     bool terminal_owner = false;
     uint32_t registered_groups = 0;
     std::unique_lock<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
+    impl_->drain_split_routes();
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (!impl_->draining) {

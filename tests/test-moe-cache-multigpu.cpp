@@ -203,6 +203,11 @@ struct split_probe {
     int                                                         imported_splits[2] = {};
     int                                                         fail_layer         = -1;
     bool                                                        failed             = false;
+    const ggml_graph_execution_certificate *                     expected_certificate = nullptr;
+    uint64_t                                                    expected_source_uid = 0;
+    int                                                         certificate_calls = 0;
+    std::function<void(ggml_backend_t, ggml_cgraph *)>              before_dispatch;
+    std::function<void(ggml_backend_t, ggml_cgraph *)>              after_success;
 };
 
 split_probe * active_probe = nullptr;
@@ -211,6 +216,18 @@ ggml_status probe_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     CHECK(active_probe != nullptr);
     auto & probe = *active_probe;
     CHECK(!probe.failed);
+    if (probe.expected_certificate != nullptr) {
+        const auto & expected = *probe.expected_certificate;
+        const auto & actual = graph->execution_certificate;
+        CHECK(actual.magic == expected.magic && actual.abi_version == expected.abi_version);
+        CHECK(actual.struct_size == expected.struct_size && actual.flags == expected.flags);
+        CHECK(actual.domain == expected.domain && actual.row_semantics == expected.row_semantics);
+        CHECK(actual.owner_namespace == expected.owner_namespace && actual.owner_generation == expected.owner_generation);
+        CHECK(actual.n_rows == expected.n_rows && actual.n_sequences == expected.n_sequences);
+        CHECK(actual.source_graph_uid == probe.expected_source_uid);
+        CHECK(actual.split_graph_uid == graph->uid && actual.split_graph_uid != actual.source_graph_uid);
+        ++probe.certificate_calls;
+    }
     const auto found = std::find(probe.backends.begin(), probe.backends.end(), backend);
     CHECK(found != probe.backends.end());
     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
@@ -235,7 +252,14 @@ ggml_status probe_compute(ggml_backend_t backend, ggml_cgraph * graph) {
             }
         }
     }
-    return probe.delegates[found - probe.backends.begin()](backend, graph);
+    if (probe.before_dispatch) {
+        probe.before_dispatch(backend, graph);
+    }
+    const auto status = probe.delegates[found - probe.backends.begin()](backend, graph);
+    if (status == GGML_STATUS_SUCCESS && probe.after_success) {
+        probe.after_success(backend, graph);
+    }
+    return status;
 }
 
 void test_boundary_copy(ggml_backend_t source, ggml_backend_t destination, int source_device, int destination_device) {
@@ -1002,9 +1026,9 @@ void test_hybrid_ffn_insertion() {
     fprintf(stderr, "test-moe-cache: CUDA/CPU hybrid FFN insertion and unchanged reduction OK\n");
 }
 
-void test_sched_compute_range() {
+void test_sched_compute_range(bool cpu_output = false, bool semantic_cuts = false, int n_rows = 1) {
     layer_fixture fixture(0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_0, false, {0, 0}, 0);
-    fixture.build_graph(LLM_FFN_SILU, 0.0f, false, false, 1);
+    fixture.build_graph(LLM_FFN_SILU, 0.0f, false, false, n_rows);
     std::vector<ggml_backend_ptr> owners;
     std::vector<ggml_backend_t> backends;
     owners.emplace_back(ggml_backend_cuda_init(0));
@@ -1021,7 +1045,52 @@ void test_sched_compute_range() {
     for (auto & region : fixture.result.get_moe_regions()) {
         CHECK(region.place(sched.get(), backends[0]));
     }
+    if (cpu_output) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), fixture.output[1], backends[1]);
+    }
+    std::vector<int> cuts;
+    if (semantic_cuts) {
+        for (const auto & region : fixture.result.get_moe_regions()) {
+            const auto span = llm_graph_moe_hybrid_find_span(graph, region);
+            CHECK(span.valid());
+            for (int boundary : {span.routing_end, span.expert_end, span.region_end}) {
+                if (boundary > 0 && boundary < graph->n_nodes) {
+                    cuts.push_back(boundary);
+                }
+            }
+        }
+        for (int i = 1; i < graph->n_nodes; ++i) {
+            if (ggml_graph_node(graph, i)->op == GGML_OP_VIEW) {
+                cuts.push_back(i);
+                break;
+            }
+        }
+        std::sort(cuts.begin(), cuts.end());
+        cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+        CHECK(!cuts.empty());
+        auto requested = cuts;
+        CHECK(ggml_backend_sched_set_split_boundaries(sched.get(), graph, requested.data(), requested.size()));
+        std::fill(requested.begin(), requested.end(), -1);
+        const int invalid[] = {0, graph->n_nodes};
+        CHECK(!ggml_backend_sched_set_split_boundaries(sched.get(), graph, invalid, 2));
+        const int duplicate[] = {cuts.front(), cuts.front()};
+        CHECK(!ggml_backend_sched_set_split_boundaries(sched.get(), graph, duplicate, 2));
+        CHECK(!ggml_backend_sched_set_split_boundaries(sched.get(), graph, nullptr, 1));
+        CHECK(!ggml_backend_sched_set_split_boundaries(sched.get(), graph, nullptr, -1));
+        const int descending[] = {cuts.back(), cuts.front()};
+        CHECK(!ggml_backend_sched_set_split_boundaries(sched.get(), graph, descending, 2));
+        ggml_cgraph foreign = *graph;
+        CHECK(!ggml_backend_sched_alloc_graph(sched.get(), &foreign));
+        const auto uid = graph->uid;
+        ++graph->uid;
+        CHECK(!ggml_backend_sched_alloc_graph(sched.get(), graph));
+        graph->uid = uid;
+        --graph->n_nodes;
+        CHECK(!ggml_backend_sched_alloc_graph(sched.get(), graph));
+        ++graph->n_nodes;
+    }
     CHECK(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    CHECK(!ggml_backend_sched_set_split_boundaries(sched.get(), graph, nullptr, 0));
     const auto run_whole = [&]() {
         fixture.set_inputs(2);
         CHECK(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
@@ -1033,7 +1102,7 @@ void test_sched_compute_range() {
     {
         // Use a fresh graph because scheduler splitting rewrites source pointers.
         layer_fixture reference_fixture(0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_0, false, {0, 0}, 0);
-        reference_fixture.build_graph(LLM_FFN_SILU, 0.0f, false, false, 1);
+        reference_fixture.build_graph(LLM_FFN_SILU, 0.0f, false, false, n_rows);
         auto * reference_graph = reference_fixture.result.get_gf();
         ggml_set_output(reference_fixture.output[1]);
         ggml_gallocr_ptr allocator(ggml_gallocr_new(ggml_backend_cuda_buffer_type(0)));
@@ -1059,11 +1128,16 @@ void test_sched_compute_range() {
     fixture.set_inputs(2);
     std::vector<std::pair<int, int>> ranges;
     const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
-    CHECK(n_splits >= 1);
+    CHECK(n_splits >= (cpu_output ? 2 : 1));
     for (int i = 0; i < n_splits; ++i) {
         int begin = 0, end = 0;
         CHECK(ggml_backend_sched_get_split_range(sched.get(), i, &begin, &end));
         ranges.emplace_back(begin, end);
+    }
+    for (int cut : cuts) {
+        CHECK(std::any_of(ranges.begin(), ranges.end(), [cut](const std::pair<int, int> & range) {
+            return range.second == cut;
+        }));
     }
     for (const auto & range : ranges) {
         CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, nullptr, range.first, range.second) ==
@@ -1086,9 +1160,375 @@ void test_sched_compute_range() {
     ggml_backend_tensor_get(fixture.output[1], ranged.data(), 0, ranged.size() * sizeof(float));
     CHECK(ranged == expected);
 
+    if (semantic_cuts) {
+        split_probe probe{ &fixture, backends, {} };
+        probe.expected_source_uid = graph->uid;
+        for (auto * backend : backends) {
+            probe.delegates.push_back(backend->iface.graph_compute);
+            backend->iface.graph_compute = probe_compute;
+        }
+        active_probe = &probe;
+        for (uint32_t domain : {GGML_GRAPH_EXECUTION_DOMAIN_MAIN, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT,
+                                GGML_GRAPH_EXECUTION_DOMAIN_MTP}) {
+            for (uint32_t semantics : {GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT,
+                                       GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL}) {
+                auto certificate = layer_certificate(true);
+                certificate.domain = domain;
+                certificate.n_rows = n_rows;
+                certificate.n_sequences = semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ? n_rows : 1;
+                certificate.row_semantics = semantics;
+                if (domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN) {
+                    if (semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT || n_rows == 1) {
+                        continue;
+                    }
+                    certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+                }
+                probe.expected_certificate = &certificate;
+                probe.certificate_calls = 0;
+                fixture.set_inputs(2);
+                for (const auto & range : ranges) {
+                    CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &certificate,
+                        range.first, range.second) == GGML_STATUS_SUCCESS);
+                }
+                ggml_backend_sched_synchronize(sched.get());
+                CHECK(probe.certificate_calls == n_splits);
+                ggml_backend_tensor_get(fixture.output[1], ranged.data(), 0, ranged.size() * sizeof(float));
+                CHECK(ranged == expected);
+                auto invalid = certificate;
+                invalid.owner_generation = 0;
+                CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &invalid,
+                    ranges.front().first, ranges.front().second) == GGML_STATUS_FAILED);
+                CHECK(probe.certificate_calls == n_splits);
+                probe.expected_certificate = nullptr;
+            }
+        }
+        for (size_t i = 0; i < backends.size(); ++i) {
+            backends[i]->iface.graph_compute = probe.delegates[i];
+        }
+        active_probe = nullptr;
+    }
+
     // Whole-graph execution still works after ranged execution.
     CHECK(run_whole() == expected);
+    ggml_backend_sched_synchronize(sched.get());
+    ggml_backend_sched_reset(sched.get());
+    fixture.build_graph(LLM_FFN_SILU, 0.0f, false, false, n_rows);
+    graph = fixture.result.get_gf();
+    for (auto & region : fixture.result.get_moe_regions()) {
+        CHECK(region.place(sched.get(), backends[0]));
+    }
+    CHECK(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    CHECK(ggml_backend_sched_get_n_splits(sched.get()) == 1);
     fprintf(stderr, "test-moe-cache: scheduler ranged execution matches whole-graph execution OK\n");
+}
+
+void test_sched_cached_boundaries(llm_ffn_op_type activation = LLM_FFN_SILU) {
+    const bool debug = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    for (int n_rows : {1, 4}) {
+        layer_fixture fixture(0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_0,
+                              false, {0, 0}, all_cached_layers, n_experts);
+        ggml_backend_ptr cuda(ggml_backend_cuda_init(0));
+        ggml_backend_ptr cpu(ggml_backend_cpu_init());
+        ggml_backend_ptr other_cuda(ggml_backend_cuda_init(0));
+        CHECK(cuda && cpu && other_cuda);
+        ggml_backend_t backends[] = {cuda.get(), cpu.get()};
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 2, 512, false, true));
+        CHECK(sched != nullptr);
+        const auto manifest = fixture.manifest();
+        CHECK(ggml_backend_cuda_moe_candidate_replace_v2(cuda.get(), &manifest) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        auto * context = ggml_cuda_moe_grouped_context_for_test(cuda.get());
+        CHECK(context != nullptr);
+        CHECK(ggml_backend_cuda_moe_candidate_replace_v2(other_cuda.get(), &manifest) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        auto * other_context = ggml_cuda_moe_grouped_context_for_test(other_cuda.get());
+        CHECK(other_context != nullptr);
+        uint64_t next_submission = 1;
+        const auto allocate = [&](int cut) {
+            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_sched_reset(sched.get());
+            fixture.build_graph(activation, 0.0f, false, false, n_rows);
+            auto * graph = fixture.result.get_gf();
+            for (auto & region : fixture.result.get_moe_regions()) {
+                CHECK(region.place(sched.get(), cuda.get()));
+            }
+            if (cut != 0) {
+                const auto span = llm_graph_moe_hybrid_find_span(graph, fixture.result.get_moe_regions()[0]);
+                CHECK(span.valid());
+                if (cut == 1) {
+                    const int boundary = span.region_end;
+                    CHECK(ggml_backend_sched_set_split_boundaries(sched.get(), graph, &boundary, 1));
+                } else {
+                    const int boundaries[] = {span.routing_end, span.expert_end};
+                    CHECK(ggml_backend_sched_set_split_boundaries(sched.get(), graph, boundaries, 2));
+                }
+            }
+            CHECK(ggml_backend_sched_alloc_graph(sched.get(), graph));
+            fixture.set_inputs(0);
+            return graph;
+        };
+        for (uint32_t domain : {GGML_GRAPH_EXECUTION_DOMAIN_MAIN, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT,
+                                GGML_GRAPH_EXECUTION_DOMAIN_MTP}) {
+            for (uint32_t semantics : {GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT,
+                                       GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL}) {
+                auto certificate = layer_certificate(true);
+                certificate.domain = domain;
+                certificate.n_rows = n_rows;
+                certificate.n_sequences = semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ? n_rows : 1;
+                certificate.row_semantics = semantics;
+                if (domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN) {
+                    if (n_rows == 1 || semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT) {
+                        continue;
+                    }
+                    certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+                }
+                auto * graph = allocate(0);
+                std::vector<std::vector<float>> expected_runs;
+                for (int iteration = 0; iteration < 3; ++iteration) {
+                    fixture.set_inputs(iteration);
+                    CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), graph, &certificate) == GGML_STATUS_SUCCESS);
+                    expected_runs.push_back(active_grouped_tensor_values(fixture.output[1]));
+                }
+                const auto & expected = expected_runs[0];
+                graph = allocate(1);
+                CHECK(ggml_backend_sched_get_n_splits(sched.get()) == 2);
+                ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    fixture.set_inputs(repeat);
+                    for (int split = 0; split < 2; ++split) {
+                        int begin = 0, end = 0;
+                        CHECK(ggml_backend_sched_get_split_range(sched.get(), split, &begin, &end));
+                        CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &certificate,
+                            begin, end) == GGML_STATUS_SUCCESS);
+                    }
+                    ggml_backend_sched_synchronize(sched.get());
+                    CHECK(active_grouped_tensor_values(fixture.output[1]) == expected_runs[repeat]);
+                }
+                const auto complete = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+                CHECK(complete.submitted >= 2 && complete.completed == complete.submitted);
+                CHECK(complete.host_staged_ops == 0 && complete.required_unsupported == 0);
+                graph = allocate(2);
+                ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+                CHECK(ggml_backend_sched_get_n_splits(sched.get()) >= 3);
+                int route_begin = 0, route_end = 0, expert_begin = 0, expert_end = 0;
+                CHECK(ggml_backend_sched_get_split_range(sched.get(), 0, &route_begin, &route_end));
+                CHECK(ggml_backend_sched_get_split_range(sched.get(), 1, &expert_begin, &expert_end));
+                CHECK(route_begin == 0 && route_end == expert_begin);
+                CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &certificate,
+                    route_begin, route_end) == GGML_STATUS_SUCCESS);
+                CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &certificate,
+                    expert_begin, expert_end) == GGML_STATUS_FAILED);
+                const auto refused = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+                CHECK(refused.required_unsupported > 0 && refused.h2d_banks == 0);
+                CHECK(refused.host_staged_ops == 0 && refused.fallback == 0 && refused.submitted == 0);
+                fixture.set_inputs(0);
+                ggml_cuda_moe_split_route_lease lease;
+                const ggml_cuda_moe_candidate_group_key candidate{context->state().generation, 0};
+                uint64_t submission = next_submission++;
+                CHECK(context->begin_split_routes(graph, certificate, submission));
+                CHECK(!context->begin_split_routes(graph, certificate, next_submission));
+                const auto stream = ggml_cuda_moe_owner_stream_for_test(cuda.get());
+                CHECK(stream != nullptr);
+                const auto other_stream = ggml_cuda_moe_owner_stream_for_test(other_cuda.get());
+                CHECK(other_stream != nullptr && other_stream != stream);
+                split_probe probe{ &fixture, {cuda.get()}, {cuda->iface.graph_compute} };
+                ggml_cgraph consumer_witness = {};
+                int publications = 0, validations = 0;
+                probe.after_success = [&](ggml_backend_t, ggml_cgraph * producer) {
+                    if (publications != 0) {
+                        return;
+                    }
+                    ggml_cuda_moe_split_route_lease refused;
+                    auto missing_route = *producer;
+                    missing_route.n_nodes = 1;
+                    CHECK(!context->publish_split_route(graph, &missing_route, candidate, fixture.ids[0], stream, &refused));
+                    auto foreign_producer = *producer;
+                    ++foreign_producer.execution_certificate.owner_namespace;
+                    CHECK(!context->publish_split_route(graph, &foreign_producer, candidate, fixture.ids[0], stream, &refused));
+                    CHECK(!context->publish_split_route(graph, producer, candidate, fixture.ids[1], stream, &refused));
+                    CHECK(context->publish_split_route(graph, producer, candidate, fixture.ids[0], stream, &lease));
+                    ggml_cuda_moe_split_route_lease duplicate;
+                    CHECK(!context->publish_split_route(graph, producer, candidate, fixture.ids[0], stream, &duplicate));
+                    ++publications;
+                };
+                probe.before_dispatch = [&](ggml_backend_t, ggml_cgraph * consumer) {
+                    if (publications == 0) {
+                        return;
+                    }
+                    bool has_down = false;
+                    for (int i = 0; i < consumer->n_nodes; ++i) {
+                        const auto * node = consumer->nodes[i];
+                        has_down = has_down || (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == fixture.down[0]);
+                    }
+                    if (!has_down) {
+                        return;
+                    }
+                    consumer_witness = *consumer;
+                    const auto matches = [&](const ggml_cgraph * witness, const ggml_cuda_moe_candidate_group_key & key,
+                                              uint64_t id, ggml_cuda_moe_stream_t owner_stream) {
+                        return context->matches_split_route(lease, graph, witness, key, fixture.ids[0], id, owner_stream);
+                    };
+                    CHECK(matches(consumer, candidate, submission, stream));
+                    CHECK(!matches(consumer, candidate, submission + 1, stream));
+                    CHECK(!matches(consumer, candidate, submission, nullptr));
+                    CHECK(!matches(consumer, candidate, submission, other_stream));
+                    CHECK(other_context->begin_split_routes(graph, certificate, submission));
+                    CHECK(!other_context->matches_split_route(lease, graph, consumer, candidate,
+                        fixture.ids[0], submission, stream));
+                    other_context->end_split_routes();
+                    auto wrong_group = candidate;
+                    ++wrong_group.group_index;
+                    CHECK(!matches(consumer, wrong_group, submission, stream));
+                    auto wrong_generation = candidate;
+                    ++wrong_generation.generation;
+                    CHECK(!matches(consumer, wrong_generation, submission, stream));
+                    auto changed = *consumer;
+                    ++changed.execution_certificate.owner_namespace;
+                    CHECK(!matches(&changed, candidate, submission, stream));
+                    changed = *consumer;
+                    ++changed.execution_certificate.owner_generation;
+                    CHECK(!matches(&changed, candidate, submission, stream));
+                    changed = *consumer;
+                    ++changed.execution_certificate.source_graph_uid;
+                    CHECK(!matches(&changed, candidate, submission, stream));
+                    changed = *consumer;
+                    ++changed.execution_certificate.n_rows;
+                    CHECK(!matches(&changed, candidate, submission, stream));
+                    changed = *consumer;
+                    ++changed.execution_certificate.n_sequences;
+                    CHECK(!matches(&changed, candidate, submission, stream));
+                    changed = *consumer;
+                    changed.execution_certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
+                    CHECK(!matches(&changed, candidate, submission, stream));
+                    changed = *consumer;
+                    changed.execution_certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
+                    CHECK(!matches(&changed, candidate, submission, stream));
+                    auto foreign_source = *graph;
+                    CHECK(!context->matches_split_route(lease, &foreign_source, consumer, candidate,
+                        fixture.ids[0], submission, stream));
+                    ++graph->n_nodes;
+                    CHECK(!matches(consumer, candidate, submission, stream));
+                    --graph->n_nodes;
+                    const auto source_uid = graph->uid;
+                    ++graph->uid;
+                    CHECK(!matches(consumer, candidate, submission, stream));
+                    graph->uid = source_uid;
+                    const auto route_root = fixture.ids[0]->src[0];
+                    fixture.ids[0]->src[0] = fixture.input;
+                    CHECK(!matches(consumer, candidate, submission, stream));
+                    fixture.ids[0]->src[0] = route_root;
+                    const auto stride = fixture.ids[0]->nb[1];
+                    fixture.ids[0]->nb[1] += sizeof(int32_t);
+                    CHECK(!matches(consumer, candidate, submission, stream));
+                    fixture.ids[0]->nb[1] = stride;
+                    const auto data = fixture.ids[0]->data;
+                    fixture.ids[0]->data = nullptr;
+                    CHECK(!matches(consumer, candidate, submission, stream));
+                    fixture.ids[0]->data = data;
+                    CHECK(matches(consumer, candidate, submission, stream));
+                    ++validations;
+                };
+                active_probe = &probe;
+                cuda->iface.graph_compute = probe_compute;
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    if (repeat != 0) {
+                        context->end_split_routes();
+                        CHECK(!context->matches_split_route(lease, graph, &consumer_witness, candidate,
+                            fixture.ids[0], submission, stream));
+                        lease.reset();
+                        submission = next_submission++;
+                        CHECK(context->begin_split_routes(graph, certificate, submission));
+                        publications = validations = 0;
+                        fixture.set_inputs(repeat);
+                    }
+                    for (int split = 0; split < ggml_backend_sched_get_n_splits(sched.get()); ++split) {
+                        int begin = 0, end = 0;
+                        CHECK(ggml_backend_sched_get_split_range(sched.get(), split, &begin, &end));
+                        CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &certificate,
+                            begin, end) == GGML_STATUS_SUCCESS);
+                    }
+                    ggml_backend_sched_synchronize(sched.get());
+                    CHECK(active_grouped_tensor_values(fixture.output[1]) == expected_runs[repeat]);
+                    CHECK(publications == 1 && validations == 1);
+                }
+                fprintf(stderr, "test-moe-cache: certified cached semantic cuts activation=%d domain=%u semantics=%u rows=%d exact OK\n",
+                    activation, domain, certificate.row_semantics, n_rows);
+                const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+                CHECK(telemetry.required_unsupported == 0 && telemetry.h2d_banks == 0);
+                CHECK(telemetry.host_staged_ops == 0 && telemetry.fallback == 0);
+                CHECK(telemetry.submitted >= 2 && telemetry.completed == telemetry.submitted);
+                cuda->iface.graph_compute = probe.delegates[0];
+                active_probe = nullptr;
+                if (n_rows == 4 && domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN) {
+                    CHECK(ggml_backend_cuda_moe_candidate_replace_v2(cuda.get(), &manifest) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+                    CHECK(context->state().generation > candidate.generation);
+                } else {
+                    context->end_split_routes();
+                }
+                CHECK(!context->matches_split_route(lease, graph, &consumer_witness, candidate,
+                    fixture.ids[0], submission, stream));
+                CHECK(!context->begin_split_routes(graph, certificate, submission));
+                auto foreign_owner = certificate;
+                ++foreign_owner.owner_namespace;
+                CHECK(!context->begin_split_routes(graph, foreign_owner, next_submission));
+                const auto fresh_submission = next_submission++;
+                CHECK(context->begin_split_routes(graph, certificate, fresh_submission));
+                CHECK(!context->matches_split_route(lease, graph, &consumer_witness, candidate,
+                    fixture.ids[0], fresh_submission, stream));
+                CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &certificate,
+                    expert_begin, expert_end) == GGML_STATUS_FAILED);
+                context->end_split_routes();
+                lease.reset();
+                graph = allocate(0);
+                CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), graph, &certificate) == GGML_STATUS_SUCCESS);
+                CHECK(active_grouped_tensor_values(fixture.output[1]) == expected);
+            }
+        }
+        auto advanced = layer_certificate(true);
+        advanced.owner_generation = 2;
+        CHECK(context->begin_split_routes(fixture.result.get_gf(), advanced, 1));
+        context->end_split_routes();
+        advanced.owner_generation = 1;
+        CHECK(!context->begin_split_routes(fixture.result.get_gf(), advanced, next_submission));
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    ggml_backend_cuda_moe_set_debug_mm(debug);
+}
+
+void test_sched_boundaries_auto_alloc() {
+    for (bool ranged : {false, true}) {
+        ggml_context_ptr ctx(ggml_init({8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true}));
+        CHECK(ctx != nullptr);
+        ggml_backend_ptr cpu(ggml_backend_cpu_init());
+        CHECK(cpu != nullptr);
+        auto * input = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
+        ggml_backend_buffer_ptr input_buffer(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), 64));
+        CHECK(input_buffer != nullptr);
+        CHECK(ggml_backend_tensor_alloc(input_buffer.get(), input, ggml_backend_buffer_get_base(input_buffer.get())) == GGML_STATUS_SUCCESS);
+        const float value = 1.0f;
+        ggml_backend_tensor_set(input, &value, 0, sizeof(value));
+        auto * first = ggml_scale(ctx.get(), input, 2.0f);
+        auto * output = ggml_scale(ctx.get(), first, 3.0f);
+        ggml_set_output(output);
+        auto * graph = ggml_new_graph_custom(ctx.get(), 8, false);
+        ggml_build_forward_expand(graph, output);
+        ggml_backend_t backends[] = {cpu.get()};
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 1, 8, false, false));
+        CHECK(sched != nullptr);
+        ggml_backend_sched_set_tensor_backend(sched.get(), first, cpu.get());
+        const int cut = 1;
+        CHECK(ggml_backend_sched_set_split_boundaries(sched.get(), graph, &cut, 1));
+        if (ranged) {
+            CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, nullptr, 0, 1) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, nullptr, 1, 2) == GGML_STATUS_SUCCESS);
+        } else {
+            CHECK(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+        }
+        CHECK(ggml_backend_sched_get_n_splits(sched.get()) == 2);
+        ggml_backend_sched_synchronize(sched.get());
+        float result = 0.0f;
+        ggml_backend_tensor_get(output, &result, 0, sizeof(result));
+        CHECK(result == 6.0f);
+    }
 }
 
 void test_hybrid_span() {
@@ -1519,7 +1959,15 @@ void test_hybrid_cpu_experts() {
 }  // namespace
 
 void test_moe_sched_compute_range() {
+    test_sched_boundaries_auto_alloc();
+    test_sched_cached_boundaries();
+    test_sched_cached_boundaries(LLM_FFN_GELU);
     test_sched_compute_range();
+    test_sched_compute_range(true);
+    test_sched_compute_range(false, true);
+    test_sched_compute_range(true, true);
+    test_sched_compute_range(false, true, 4);
+    test_sched_compute_range(true, true, 4);
 }
 
 void test_moe_hybrid_ffn_insertion() {
@@ -1534,7 +1982,7 @@ void test_grouped_layer_placement() {
     test_hybrid_route_packet();
     test_hybrid_admission();
     test_hybrid_span();
-    test_sched_compute_range();
+    test_moe_sched_compute_range();
     test_hybrid_cpu_experts();
     {
         layer_fixture fixture(0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_0);

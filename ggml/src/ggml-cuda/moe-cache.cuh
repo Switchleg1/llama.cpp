@@ -267,6 +267,22 @@ struct ggml_cuda_moe_ids_signature {
     uint32_t type = GGML_TYPE_COUNT;
 };
 
+struct ggml_cuda_moe_split_route_origin;
+
+// Holds producer completion only. Caller must end the submission before graph reset or buffer reuse.
+class ggml_cuda_moe_split_route_lease {
+public:
+    ggml_cuda_moe_split_route_lease() = default;
+    ~ggml_cuda_moe_split_route_lease();
+    ggml_cuda_moe_split_route_lease(const ggml_cuda_moe_split_route_lease &) = delete;
+    ggml_cuda_moe_split_route_lease & operator=(const ggml_cuda_moe_split_route_lease &) = delete;
+    void reset() noexcept;
+
+private:
+    friend class ggml_cuda_moe_grouped_context;
+    std::shared_ptr<const ggml_cuda_moe_split_route_origin> origin_;
+};
+
 struct ggml_cuda_moe_complete_group_key {
     ggml_cuda_moe_candidate_group_key candidate;
     ggml_cuda_moe_ids_signature ids;
@@ -658,6 +674,7 @@ private:
         ggml_cuda_moe_graph_capability_witness capabilities[4];
         uint32_t route_root_node_index;
         uint32_t route_ids_node_index;
+        std::shared_ptr<const ggml_cuda_moe_split_route_origin> route_origin;
         uint32_t required_roles;
         uint32_t seen_roles;
         uint32_t n_banks;
@@ -698,6 +715,7 @@ private:
         uint32_t n_banks;
         uint32_t ids_root_node_index;
         uint32_t ids_node_index;
+        std::shared_ptr<const ggml_cuda_moe_split_route_origin> route_origin;
         uint32_t prefill;
         uint64_t execution_semantic_key;
         uint32_t top_k;
@@ -894,6 +912,16 @@ public:
             bool ids_cache_hit);
     void record_host_staged_op(bool split_staged);
     void record_required_grouped_failure();
+    // One owner namespace per context. Fresh submission ids are required within each owner generation.
+    bool begin_split_routes(const ggml_cgraph * source, const ggml_graph_execution_certificate & certificate, uint64_t submission_id);
+    void end_split_routes();
+    // Call only after successful producer dispatch. This does not admit an imported expert graph.
+    bool publish_split_route(const ggml_cgraph * source, const ggml_cgraph * producer,
+            const ggml_cuda_moe_candidate_group_key & candidate, const ggml_tensor * ids,
+            ggml_cuda_moe_stream_t stream, ggml_cuda_moe_split_route_lease * lease);
+    bool matches_split_route(const ggml_cuda_moe_split_route_lease & lease, const ggml_cgraph * source,
+            const ggml_cgraph * consumer, const ggml_cuda_moe_candidate_group_key & candidate,
+            const ggml_tensor * ids, uint64_t submission_id, ggml_cuda_moe_stream_t stream) const;
     static ggml_cuda_moe_grouped_debug_telemetry log_and_reset_legacy_stats();
     uint64_t certify_graph_coverage(
             const ggml_cgraph * cgraph,
@@ -1058,6 +1086,11 @@ private:
     ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_for_test();
     bool graph_mmid_inventory_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan & plan) const;
     bool graph_group_witness_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan::group_record & record) const;
+    bool split_route_origin_matches_locked(const ggml_cuda_moe_split_route_origin & origin,
+            const ggml_cgraph * consumer, const ggml_cuda_moe_candidate_group_key & candidate,
+            const ggml_tensor * ids) const;
+    bool split_route_down_boundary_matches_locked(const ggml_cuda_moe_split_route_origin & origin,
+            const ggml_cgraph * consumer, const ggml_cuda_moe_graph_plan::reader_witness & reader) const;
     bool graph_resource_fingerprint_locked(
             const ggml_cuda_moe_graph_execution & execution,
             ggml_cuda_moe_stream_t stream,
@@ -1074,6 +1107,7 @@ private:
 
 ggml_cuda_moe_grouped_context * ggml_cuda_moe_grouped_context_for_test(ggml_backend_t backend);
 size_t ggml_cuda_moe_ids_cache_count_for_test(ggml_backend_t backend);
+ggml_cuda_moe_stream_t ggml_cuda_moe_owner_stream_for_test(ggml_backend_t backend);
 
 struct ggml_cuda_graph_capture_state_for_test {
     uintptr_t graph = 0;
