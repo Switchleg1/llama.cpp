@@ -2432,12 +2432,14 @@ void test_moe_cache_proc_api() {
         (early_rows - 1) * (uint64_t(device_query_v2.early_width) * 3 * sizeof(float) +
                             uint64_t(device_query_v2.early_experts) * sizeof(float) +
                             uint64_t(device_query_v2.early_hc_rank) * sizeof(float));
-    CHECK(device_sizing_v2.context_fixed_bytes ==
-          device_sizing.context_fixed_bytes +
-              2 * device_query_v2.early_route_capacity * device_query_v2.early_expert_bytes +
-              2 * sizeof(uint32_t) + uint64_t(device_query_v2.early_experts) * sizeof(int32_t) +
-              uint64_t(device_query_v2.early_width) * early_rows * sizeof(float) +
-              extra_workspace);
+    uint64_t expected_context_bytes = device_sizing.context_fixed_bytes + extra_workspace;
+#if !defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    expected_context_bytes +=
+        2 * device_query_v2.early_route_capacity * device_query_v2.early_expert_bytes +
+        2 * sizeof(uint32_t) + uint64_t(device_query_v2.early_experts) * sizeof(int32_t) +
+        uint64_t(device_query_v2.early_width) * early_rows * sizeof(float);
+#endif
+    CHECK(device_sizing_v2.context_fixed_bytes == expected_context_bytes);
     CHECK(device_sizing_v2.host_fixed_bytes > 0);
     device_query_v2.early_route_capacity = 4;
     device_query_v2.early_row_capacity = 1;

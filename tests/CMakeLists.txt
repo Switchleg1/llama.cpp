@@ -440,6 +440,10 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda AND (NOT WIN32 OR NOT
         test-moe-cache-multigpu.cpp
     )
     target_compile_features(test-moe-cache PRIVATE cxx_std_17)
+    if (MSVC)
+        # Graph policy fixtures exceed the default 1 MiB stack.
+        target_link_options(test-moe-cache PRIVATE /STACK:8388608)
+    endif()
     target_link_libraries(test-moe-cache PRIVATE llama ggml-cuda ggml-base CUDA::cudart)
     target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     add_test(NAME test-moe-cache COMMAND test-moe-cache)

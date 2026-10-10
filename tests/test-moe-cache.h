@@ -507,6 +507,7 @@ void test_grouped_graph_mixed_phase();
 std::vector<uint8_t> cached_fusion_test_data(const ggml_tensor * tensor, size_t salt);
 
 ggml_backend_buffer_type_t pageable_cached_buffer_type();
+bool host_registration_identity_alias();
 void test_active_grouped_materialization();
 void test_pageable_separate_draft_lifecycle();
 void test_pageable_auxiliaries();

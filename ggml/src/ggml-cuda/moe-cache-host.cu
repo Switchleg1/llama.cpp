@@ -539,7 +539,10 @@ void ggml_backend_cuda_moe_cached_free_buffer_type(ggml_backend_buffer_type_t bu
     }
 }
 
-bool moe_host_register(moe_host_budget & owner, const std::vector<moe_host_source *> & sources, bool require_identity, uint32_t group) {
+bool moe_host_register(moe_host_budget & owner, const std::vector<moe_host_source *> & sources, bool require_identity, uint32_t group, bool * alias_not_identity) {
+    if (alias_not_identity != nullptr) {
+        *alias_not_identity = false;
+    }
     if (sources.empty()) {
         return true;
     }
@@ -660,6 +663,9 @@ bool moe_host_register(moe_host_budget & owner, const std::vector<moe_host_sourc
             failure = "device_alias_unavailable";
         } else if (require_identity && aliases[i] != sources[i]->data) {
             failure = "auxiliary_alias_not_identity";
+            if (alias_not_identity != nullptr) {
+                *alias_not_identity = true;
+            }
         }
     }
     if (failure != nullptr) {

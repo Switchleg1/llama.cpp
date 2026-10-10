@@ -1832,6 +1832,29 @@ static int test_moe_cache_selector_precedence(const size_t seed, const float std
         }
     }
 
+    {
+        auto params = make_params(both_layers, 1, nullptr);
+        params.no_alloc = true;
+        params.moe_expert_cache_host_pinned_size = 64 * 1024 * 1024;
+        auto model = expect_load("bounded no-alloc", moe_metadata.get(), params, true);
+        if (model) {
+            if (!layer_cached(*model, 0) || !layer_cached(*model, 1)) {
+                fprintf(stderr, "test-moe-cache-selector: no-alloc cache buffer type mismatch\n");
+                ok = false;
+            }
+            auto cparams = llama_context_default_params();
+            cparams.n_ctx = 32;
+            cparams.n_batch = 8;
+            cparams.n_ubatch = 8;
+            cparams.n_seq_max = 1;
+            llama_context_ptr context(llama_init_from_model(model.get(), cparams));
+            if (!context) {
+                fprintf(stderr, "test-moe-cache-selector: no-alloc context failed\n");
+                ok = false;
+            }
+        }
+    }
+
     llama_model_tensor_buft_override cpu_override[] = {
         { layer_zero_experts, ggml_backend_cpu_buffer_type() },
         { nullptr,            nullptr                        }

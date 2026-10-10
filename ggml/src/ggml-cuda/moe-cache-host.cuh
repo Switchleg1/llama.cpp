@@ -107,7 +107,7 @@ struct GGML_CUDA_MOE_HOST_HIDDEN moe_host_allocation {
 GGML_CUDA_MOE_HOST_HIDDEN size_t moe_host_page_size();
 GGML_CUDA_MOE_HOST_HIDDEN bool moe_host_round_size(size_t size, size_t & rounded);
 GGML_CUDA_MOE_HOST_HIDDEN moe_host_budget * moe_host_budget_for(ggml_backend_buffer_type_t buft);
-GGML_CUDA_MOE_HOST_HIDDEN bool moe_host_register(moe_host_budget & owner, const std::vector<moe_host_source *> & sources, bool require_identity, uint32_t group);
+GGML_CUDA_MOE_HOST_HIDDEN bool moe_host_register(moe_host_budget & owner, const std::vector<moe_host_source *> & sources, bool require_identity, uint32_t group, bool * alias_not_identity = nullptr);
 GGML_CUDA_MOE_HOST_HIDDEN bool moe_host_buffer_is_read_only(ggml_backend_buffer_t buffer);
 GGML_CUDA_MOE_HOST_HIDDEN bool moe_host_buffer_auto_pin(ggml_backend_buffer_t buffer);
 

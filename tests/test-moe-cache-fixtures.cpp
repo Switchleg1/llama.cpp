@@ -249,6 +249,28 @@ ggml_backend_buffer_type_t pageable_cached_buffer_type() {
     return &buft;
 }
 
+bool host_registration_identity_alias() {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return false;
+#else
+    constexpr size_t page = 4096;
+    void * scratch = ggml_aligned_malloc(page);
+    if (scratch == nullptr) {
+        return false;
+    }
+    bool identity = false;
+    if (cudaHostRegister(scratch, page, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
+        void * alias = nullptr;
+        identity = cudaHostGetDevicePointer(&alias, scratch, 0) == cudaSuccess && alias == scratch;
+        (void) cudaHostUnregister(scratch);
+    } else {
+        (void) cudaGetLastError();
+    }
+    ggml_aligned_free(scratch, page);
+    return identity;
+#endif
+}
+
 #ifdef __linux__
 static void file_mmap_cached_buffer_free(ggml_backend_buffer_t buffer) {
     CHECK(munmap(buffer->context, buffer->size) == 0);

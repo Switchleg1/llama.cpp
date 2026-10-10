@@ -16293,9 +16293,16 @@ bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t b
             groups[i].size() == moe_candidate_required_base_bank_count(snapshot->groups[i].layout);
     }
     owner->staging_reserved = staging;
-    if (!moe_host_register(*owner, auxiliaries, true, UINT32_MAX)) {
-        GGML_LOG_ERROR("moe-cache-host: budget cannot pin mandatory auxiliary sources\n");
-        return false;
+    bool auxiliary_alias_not_identity = false;
+    if (!moe_host_register(*owner, auxiliaries, true, UINT32_MAX, &auxiliary_alias_not_identity)) {
+        if (auxiliary_alias_not_identity) {
+            // Windows gives registered host memory a non-identity device alias.
+            // Consumers use owner-local GPU shadows for these auxiliary sources.
+            GGML_LOG_WARN("moe-cache-host: auxiliary sources have no identity device alias\n");
+        } else {
+            GGML_LOG_ERROR("moe-cache-host: budget cannot pin mandatory auxiliary sources\n");
+            return false;
+        }
     }
     size_t direct = 0;
     bool staged = false;

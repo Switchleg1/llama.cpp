@@ -370,7 +370,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 throw std::runtime_error("--moe-expert-cache-size requires a backend with MoE cache support");
             }
             ggml_backend_buffer_type_t buft = buffer_type_fn();
-            if (params.moe_expert_cache_host_pinned_size > 0) {
+            // Zero-sized placeholder buffers do not retain a bounded buffer type.
+            if (params.moe_expert_cache_host_pinned_size > 0 && !params.no_alloc) {
                 auto create = (ggml_backend_moe_cache_bounded_buffer_type_t) ggml_backend_reg_get_proc_address(
                     cache_reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME);
                 moe_buffer_type.release = (ggml_backend_moe_cache_free_buffer_type_t) ggml_backend_reg_get_proc_address(

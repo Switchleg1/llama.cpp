@@ -566,13 +566,16 @@ static void test_grouped_decode_type(
             CUDA_OK(cudaDeviceGetAttribute(&read_only_supported, cudaDevAttrHostRegisterReadOnlySupported, device));
         }
 #endif
+        // The auxiliary only declines its group when the registration alias is identity,
+        // which makes a bank span a registration boundary. Windows aliases are non-identity.
+        const bool boundary_declined = registration_prefix != nullptr && host_registration_identity_alias();
         for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
             const bool budget_admits = mixed ? group_index == 0 : host_budget >= 49152;
-            const bool direct = budget_admits && (pinned || read_only_supported) && registration_prefix == nullptr;
+            const bool direct = budget_admits && (pinned || read_only_supported) && !boundary_declined;
             for (uint32_t bank = 0; bank < n_banks; ++bank) {
                 cudaPointerAttributes attributes = {};
                 CUDA_OK(cudaPointerGetAttributes(&attributes, groups[group_index].banks[bank].tensor->data));
-                const bool prefix_registered = registration_prefix != nullptr && group_index == 0 && bank == 0;
+                const bool prefix_registered = boundary_declined && group_index == 0 && bank == 0;
                 CHECK(attributes.type == (direct || prefix_registered ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered));
             }
         }
