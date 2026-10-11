@@ -4,6 +4,7 @@
 #include "moe-cache-host.cuh"
 #include "common.cuh"
 #include "mmid.cuh"
+#include "quantize.cuh"
 
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
@@ -3928,6 +3929,8 @@ struct moe_grouped_admit_publication {
     int32_t  routes[MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY];
     int32_t  experts[MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY];
     float    activation[MOE_GROUPED_ADMIT_WIDTH];
+    // The same Q8_1 blocks the GPU's own kernels consume, written by the same quantize kernel.
+    uint8_t  activation_q8_1[MOE_GROUPED_ADMIT_WIDTH / QK8_1 * sizeof(block_q8_1)];
     float    results[MOE_GROUPED_ADMIT_RESULT_ROUTES * MOE_GROUPED_ADMIT_WIDTH];
 };
 
@@ -4070,6 +4073,71 @@ static void moe_grouped_admit_project(
     }
 }
 
+
+// Decomposition of the hit/miss disagreement. Diagnostic only.
+struct moe_grouped_admit_decompose_stats {
+    std::mutex mutex;
+    std::map<int, std::array<double, 4>> by_type;   // type -> {routes, sum nmse, max nmse, unused}
+    double act_q8_1 = 0.0, act_q8_k = 0.0, act_between = 0.0;
+    uint64_t act_samples = 0;
+};
+
+static moe_grouped_admit_decompose_stats & moe_grouped_admit_decompose() {
+    static moe_grouped_admit_decompose_stats stats;
+    return stats;
+}
+
+static int moe_grouped_admit_decompose_mode() {
+    static const int mode = []() {
+        const char * value = getenv("LLAMA_MOE_ADMIT_DECOMPOSE");
+        return value == nullptr ? 0 : (strcmp(value, "gpu") == 0 ? 2 : 1);
+    }();
+    return mode;
+}
+
+// CUDA's activation rule: 32-wide blocks, d = amax/127 stored as fp16, roundf.
+static void moe_grouped_admit_q8_1_cuda(const float * x, float * y, int64_t n) {
+    for (int64_t b = 0; b < n; b += 32) {
+        float amax = 0.0f;
+        for (int64_t i = b; i < b + 32 && i < n; ++i) amax = std::max(amax, fabsf(x[i]));
+        const float d = amax / 127.0f;
+        const float d16 = __half2float(__float2half(d));
+        for (int64_t i = b; i < b + 32 && i < n; ++i) {
+            const float q = amax == 0.0f ? 0.0f : roundf(x[i] / d);
+            y[i] = q * d16;
+        }
+    }
+}
+
+// CPU Q8_K reference rule: 256-wide blocks, signed max, iscale = -127/max, fp32 d.
+static void moe_grouped_admit_q8_k_cpu(const float * x, float * y, int64_t n) {
+    for (int64_t b = 0; b < n; b += 256) {
+        float amax = 0.0f, max = 0.0f;
+        for (int64_t i = b; i < b + 256 && i < n; ++i) {
+            if (fabsf(x[i]) > amax) { amax = fabsf(x[i]); max = x[i]; }
+        }
+        if (amax == 0.0f) {
+            for (int64_t i = b; i < b + 256 && i < n; ++i) y[i] = 0.0f;
+            continue;
+        }
+        const float iscale = -127.0f / max;
+        for (int64_t i = b; i < b + 256 && i < n; ++i) {
+            const int v = std::min(127, (int) lrintf(iscale * x[i]));
+            y[i] = (float) v / iscale;
+        }
+    }
+}
+
+static double moe_grouped_admit_rel(const float * a, const float * b, int64_t n) {
+    double error = 0.0, norm = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        const double d = (double) a[i] - b[i];
+        error += d * d;
+        norm += (double) b[i] * b[i];
+    }
+    return norm > 0.0 ? error / norm : error;
+}
+
 struct moe_grouped_admit_worker {
     std::vector<moe_grouped_admit_group> groups;
     std::vector<moe_grouped_admit_publication *> packets;
@@ -4081,6 +4149,14 @@ struct moe_grouped_admit_worker {
     std::atomic<uint64_t> handled_routes{0};
     ggml_backend_moe_hybrid_cold_handler_t handler = nullptr;
     void * handler_user = nullptr;
+
+    // Stops watching a packet before its memory is freed. Takes the lock, so a compute in progress finishes first.
+    void remove(const moe_grouped_admit_publication * packet) {
+        std::lock_guard<std::mutex> lock(mutex);
+        groups.erase(std::remove_if(groups.begin(), groups.end(),
+            [&](const moe_grouped_admit_group & group) { return group.packet == packet; }), groups.end());
+        packets.erase(std::remove(packets.begin(), packets.end(), packet), packets.end());
+    }
 
     void set_handler(ggml_backend_moe_hybrid_cold_handler_t fn, void * user) {
         std::lock_guard<std::mutex> lock(mutex);   // waits for a call in progress
@@ -4095,6 +4171,36 @@ struct moe_grouped_admit_worker {
         packets.push_back(group.packet);
         if (!thread.joinable()) {
             thread = std::thread([this]() { run(); });
+        }
+    }
+
+    // Measures the owner's CPU result and the activation quantizations against an exact float evaluation.
+    // In gpu mode the float result is left in the packet, so the device comparison measures GPU vs float.
+    void decompose(const moe_grouped_admit_group & group, uint32_t count) {
+        auto * packet = group.packet;
+        const int64_t n_embd = packet->n_embd;
+        std::vector<float> owner((size_t) count * MOE_GROUPED_ADMIT_WIDTH);
+        memcpy(owner.data(), packet->results, owner.size() * sizeof(float));
+        compute(group);
+        auto & stats = moe_grouped_admit_decompose();
+        std::lock_guard<std::mutex> lock(stats.mutex);
+        for (uint32_t i = 0; i < count && i < packet->computed; ++i) {
+            const double nmse = moe_grouped_admit_rel(owner.data() + (size_t) i * MOE_GROUPED_ADMIT_WIDTH,
+                packet->results + (size_t) i * MOE_GROUPED_ADMIT_WIDTH, n_embd);
+            auto & entry = stats.by_type[(int) group.gate.type];
+            entry[0] += 1.0;
+            entry[1] += nmse;
+            entry[2] = std::max(entry[2], nmse);
+        }
+        std::vector<float> a((size_t) n_embd), b((size_t) n_embd);
+        moe_grouped_admit_q8_1_cuda(packet->activation, a.data(), n_embd);
+        moe_grouped_admit_q8_k_cpu(packet->activation, b.data(), n_embd);
+        stats.act_q8_1 += moe_grouped_admit_rel(a.data(), packet->activation, n_embd);
+        stats.act_q8_k += moe_grouped_admit_rel(b.data(), packet->activation, n_embd);
+        stats.act_between += moe_grouped_admit_rel(a.data(), b.data(), n_embd);
+        ++stats.act_samples;
+        if (moe_grouped_admit_decompose_mode() == 1) {
+            memcpy(packet->results, owner.data(), owner.size() * sizeof(float));
         }
     }
 
@@ -4136,10 +4242,15 @@ struct moe_grouped_admit_worker {
                         const auto started = std::chrono::steady_clock::now();
                         const uint32_t count = std::min<uint32_t>(packet->count, MOE_GROUPED_ADMIT_RESULT_ROUTES);
                         if (handler != nullptr && count != 0 && packet->n_embd != 0 &&
-                                handler(handler_user, group.down_tensor, packet->activation, packet->experts, count,
-                                    packet->results, MOE_GROUPED_ADMIT_WIDTH)) {
+                                handler(handler_user, group.down_tensor, packet->activation, packet->activation_q8_1,
+                                    packet->experts, count, packet->results, MOE_GROUPED_ADMIT_WIDTH)) {
                             packet->computed = count;
                             handled_routes.fetch_add(count, std::memory_order_relaxed);
+                            if (moe_grouped_admit_decompose_mode() != 0) {
+                                decompose(group, count);
+                            }
+                        } else if (getenv("LLAMA_MOE_ADMIT_OWNER_ONLY") != nullptr) {
+                            packet->computed = 0;   // measure only what the owner computed
                         } else {
                             compute(group);
                         }
@@ -5885,6 +5996,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 (void) cudaFree(admit_slot_for_expert);
             }
             if (admit_publication_host != nullptr) {
+                moe_grouped_admit_worker_instance().remove(admit_publication_host);
                 (void) cudaFreeHost(admit_publication_host);
             }
             if (expert_for_slot != nullptr) {
@@ -9372,6 +9484,10 @@ bool ggml_cuda_moe_grouped_context::publish_admit_activation(
     }
     if (packet == nullptr) {
         return false;
+    }
+    if (n_embd <= MOE_GROUPED_ADMIT_WIDTH && n_embd % MATRIX_ROW_PADDING == 0) {
+        quantize_row_q8_1_cuda(activation, nullptr, packet->activation_q8_1, GGML_TYPE_COUNT, n_embd, n_embd,
+            n_embd, n_embd, n_embd, 1, 1, 1, stream);
     }
     moe_grouped_admit_publish_activation<<<1, 256, 0, stream>>>(packet, activation, (uint32_t) n_embd);
     return moe_grouped_cuda_success(cudaGetLastError());
@@ -17657,6 +17773,20 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
             (unsigned long long) timeouts);
         const uint64_t worker_us = moe_grouped_admit_worker_instance().compute_us.load(std::memory_order_relaxed);
         const uint64_t worker_routes = moe_grouped_admit_worker_instance().computed_routes.load(std::memory_order_relaxed);
+        if (moe_grouped_admit_decompose_mode() != 0) {
+            auto & stats = moe_grouped_admit_decompose();
+            std::lock_guard<std::mutex> lock(stats.mutex);
+            for (const auto & entry : stats.by_type) {
+                GGML_LOG_INFO("moe-admit-decompose: type=%s routes=%.0f owner_vs_float mean_nmse=%g worst_nmse=%g\n",
+                    ggml_type_name((ggml_type) entry.first), entry.second[0],
+                    entry.second[0] > 0.0 ? entry.second[1] / entry.second[0] : 0.0, entry.second[2]);
+            }
+            if (stats.act_samples != 0) {
+                GGML_LOG_INFO("moe-admit-decompose: activation samples=%llu q8_1_cuda_vs_x=%g q8_k_cpu_vs_x=%g q8_1_vs_q8_k=%g\n",
+                    (unsigned long long) stats.act_samples, stats.act_q8_1 / stats.act_samples,
+                    stats.act_q8_k / stats.act_samples, stats.act_between / stats.act_samples);
+            }
+        }
         if (worker_routes != 0) {
             GGML_LOG_INFO("moe-admit-worker: handled_by_owner=%llu routes=%llu total_ms=%.1f per_route_us=%.1f\n",
                 (unsigned long long) moe_grouped_admit_worker_instance().handled_routes.load(std::memory_order_relaxed),

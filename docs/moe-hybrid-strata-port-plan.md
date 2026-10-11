@@ -1407,7 +1407,115 @@ Cleanup found two faults of my own. Removals of temporary role logs had silently
 
 Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed; both the 8 and 48 token substituted runs matched their references. Artifacts: `build/hybrid-cpuexec-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-cpuexec-smoke.{py,json,log}`, `build/run-qwen-cpuexec48-smoke.{py,json,log}`.
 
-Next: decide the activation quantization question for the two halves, then let admission decide so cold routes are genuinely absent from the resident half, and replace the device waiting on the doorbell after every layer with genuine overlap.
+### Decomposing the disagreement
+
+Under `LLAMA_MOE_ADMIT_DECOMPOSE` the worker also evaluates each cold route exactly, float weights and double accumulation, and measures both halves against that reference, per expert weight type, plus the two activation quantization rules applied to the real published activations. In `gpu` mode the exact result is left in the packet so the device comparison measures the GPU against it.
+
+| quantity | mean NMSE | worst NMSE |
+| --- | --- | --- |
+| GPU vs exact | 1.13e-04 | 2.29e-04 |
+| ggml CPU vs exact, iq3_xxs (476 routes) | 1.57e-04 | 4.64e-04 |
+| ggml CPU vs exact, iq3_s (280) | 1.65e-04 | 3.94e-04 |
+| ggml CPU vs exact, iq2_s (560) | 1.44e-04 | 2.23e-04 |
+| ggml CPU vs exact, iq4_xs (28) | 2.47e-04 | 5.22e-04 |
+| CPU vs GPU, this run | 2.00e-04 | 5.80e-04 |
+
+Activation alone, 336 samples: CUDA's Q8_1 rule 3.25e-05 against the float input, the CPU's Q8_K rule 6.40e-05, and 8.08e-05 between them. Q8_K is about twice as coarse because it uses one scale per 256 values instead of per 32.
+
+Reading. Neither half is the wrong one: both are quantized approximations of similar size, and their errors are largely independent, so the disagreement is roughly their sum, 1.1 plus 1.5 giving about 2.0e-04. The input quantization difference is real but smaller than the total, so a second quantization point carries much of it: the intermediate activation after the gated product is quantized again before the down projection, independently on each side. Strata's fix works because it makes the two halves quantize identically, which turns two independent errors into one shared error; the disagreement then collapses to float accumulation order, which they measured at 1.461e-06.
+
+Direction. Shared quantization is required, and it must cover both points, the expert input and the intermediate. Strata moved the GPU onto the CPU's rule because its CPU kernels were its reference. Here the better choice looks like the reverse: CUDA's Q8_1 rule is the more accurate of the two, the GPU carries the majority of routes at the residencies measured, and keeping it untouched keeps the fast path fast. That means new CPU kernels for each expert weight type consuming 32 wide Q8_1 blocks with the CUDA rounding, fed by quantized blocks the GPU publishes instead of floats, which also cuts the mapped transfer by about four. The expert types in this model's routes are iq3_xxs, iq3_s, iq2_s and iq4_xs. Performance should not suffer, since the CPU half is memory bound and these formats already work in 32 wide sub blocks internally.
+
+Validation: Release build; both decomposition runs completed. Artifacts: `build/run-qwen-decompose-{cpu,gpu}-smoke.{py,json,log}`.
+
+### Shared Q8_1 quantization, first kernels
+
+Direction chosen with the owner: keep the GPU's rule and rewrite the CPU side, because both options move the same bytes, about 2.9 KB of quantized activation per layer either way, while only this one leaves the hot path's tuned kernels untouched and uses the more accurate 32 wide blocks.
+
+The model's expert types: gate and up are iq2_s on 20 layers, iq3_xxs on 17, iq3_s on 10 and iq4_xs on 1; down is iq4_nl on 39 and q2_0 on 9. New CPU dot products in `src/llama-moe-hybrid-kernels.cpp` cover iq2_s, iq3_xxs and iq4_nl against 32 wide Q8_1 activations, adapted from ggml's generic implementations so the integer arithmetic and lookup tables are the same. The intermediate activation is quantized with the CUDA rule on the CPU.
+
+The input activation is not re-quantized on the CPU. The CUDA build uses `-use_fast_math`, so the GPU's `x / d` is an approximate division and the CPU cannot reproduce its rounding exactly. Instead the publication now runs `quantize_row_q8_1_cuda`, the kernel MMVQ itself uses, on the same activation into the mapped packet, so the CPU consumes the GPU's own bytes. The cold handler gains a pointer to them, and `llama_context` uses the Q8_1 path under `LLAMA_MOE_HYBRID_Q8_1` whenever all three bank types are covered, otherwise the ggml helper.
+
+The first run selected no layers: the support check required down rows to be a multiple of 256, but down rows are 640 wide and iq4_nl uses 32 blocks. With per type block sizes, 29 layers qualify, iq2_s or iq3_xxs gate and up with iq4_nl down.
+
+Result, covered layers only, other layers excluded from the comparison:
+
+| CPU vs GPU | mean NMSE | worst NMSE |
+| --- | --- | --- |
+| ggml CPU path, Q8_K | 2.0e-04 | 5.8e-04 |
+| shared Q8_1, 812 routes | 3.81e-07 | 1.40e-05 |
+
+About five hundred times lower on average, comparable to Strata's 1.461e-06. The remaining disagreement is float summation order plus occasional intermediate rounding flips, since the GPU's approximate division can round a near tie the other way; the worst route shows that, and it is small. Per type CPU accuracy against the exact float reference also improved, iq2_s worst from 2.2e-04 to 2.0e-04 and iq3_xxs from 4.6e-04 to 2.0e-04, as expected from the finer blocks.
+
+Cost: these are scalar reference kernels on the worker's single thread, 2309 us per route, against 72 us for ggml's threaded SIMD path. Correctness first; speed is next.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, full MoE suite, 3/3 MoE CTests and diff check passed, and a run with every gate off printed no hybrid lines. Artifacts: `build/hybrid-q81-{build,probe,layer,range,full}.log`, `build/run-qwen-q81-smoke.{py,json,log}`, `build/run-qwen-q81only-smoke.{py,json,log}`.
+
+### Coverage plan, and the first speed work
+
+The kernels are keyed on ggml weight type, not on a model, so any MoE model whose experts use a covered type shares quantization, and uncovered layers fall back to the ggml helper. ggml's types split three ways: 32 wide types that already pair with Q8_1 or Q8_0 on the CPU need no new kernel at all, 256 wide K and IQ types need one new dot product each, and float types have nothing to share. One generic caveat: the CPU must read whatever layout the consuming CUDA kernel quantized into, plain Q8_1 for MMVQ in decode and `block_q8_1_mmq` for MMQ in prefill.
+
+Done in this step:
+
+- 32 wide types now go through ggml's own SIMD `vec_dot`, chosen from `ggml_get_type_traits_cpu`: Q8_1 consumers take the GPU's blocks directly, Q8_0 consumers take them with the 2 byte sum dropped. iq4_nl, the down type on 39 layers, uses this, and the scalar iq4_nl kernel was removed.
+- AVX2 versions of iq2_s and iq3_xxs, adapted from ggml's own so the integer work is the same, scaling each 32 block by its own Q8_1 scale. Selected by a CPUID check, so the build needs no `/arch` change; `LLAMA_MOE_HYBRID_SCALAR` forces the scalar reference.
+- A persistent row pool, and all routes of a packet run as one gate and up job and one down job.
+
+| step | us per route, 8 threads |
+| --- | --- |
+| scalar, one thread | 2309 |
+| + pool, ggml SIMD for 32 wide types | 289 |
+| + AVX2 iq2_s and iq3_xxs | 117.5 |
+| + one job per packet | 93.1 |
+| 16 threads | 77.9 |
+| 4 threads | 155.2 |
+| ggml helper, 8 threads, unshared quantization | 72 |
+
+Parity did not move through any of this: `mean_nmse=3.82e-07 worst_nmse=1.40e-05` on the 812 covered routes, the last digit changing only with summation order. Scaling flattens above eight threads, so synchronization and memory, not arithmetic, now bound it. The remaining gap to ggml is the condition variable wake per job against ggml's spinning barrier, and VNNI `dpbusd` is unused.
+
+With substitution of the CPU result on all handled routes, Q8_1 on 29 layers and the ggml helper on the rest, 48 greedy tokens matched the baseline exactly.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, full MoE suite, 3/3 MoE CTests and diff check passed; a run with every gate off printed no hybrid lines. Artifacts: `build/hybrid-q81simd-{probe,layer,range,full}.log`, `build/hybrid-q81{simd,avx,batch}-build.log`, `build/run-qwen-q81only-smoke.{py,json,log}`, `build/run-qwen-q81t{4,16}-smoke.{py,json,log}`, `build/run-qwen-q81sub48-smoke.{py,json,log}`.
+
+### All 48 layers share quantization, and greedy identity stops being the test
+
+q2_0 needed no kernel: its 64 wide blocks pair with two Q8_0 blocks, each with its own scale, so the repack path covers it once the block size condition allows multiples of 32. Scalar and AVX2 kernels were added for iq3_s and iq4_xs, again adapted from ggml's own. All 48 layers now take the shared Q8_1 path. The row pool spins briefly before sleeping, so the two jobs of a packet do not each pay a wake.
+
+| state | us per route | CPU vs GPU mean NMSE | worst |
+| --- | --- | --- | --- |
+| 29 layers covered, 8 threads | 93.1 | 3.82e-07 | 1.40e-05 |
+| 48 layers, iq3_s and iq4_xs scalar | 133.3 | 2.81e-07 | 1.40e-05 |
+| 48 layers, AVX2 | 100.6 | 2.81e-07 | 1.40e-05 |
+| + spinning pool, 8 threads | 95.4 | 2.81e-07 | 1.40e-05 |
+| + spinning pool, 16 threads | 73.4 | | |
+
+At about one cold route per layer, which the replay predicts at 64 slots, that is roughly 4 to 5 ms per token of CPU work against a decode budget near 75 ms. The CPU half is no longer the limiting factor; admission and overlap are.
+
+The 48 token substitution check then failed, reproducibly, while the baseline reproduced byte for byte across two runs. The divergence is at character 165, after the model has finished answering and is emitting a repetitive tail of end tokens, where the leading candidates are nearly tied. The earlier ggml path, whose parity was about seven hundred times worse, happened not to flip that tie. Any nonzero difference can flip a near tie, and the two devices can never be bit exact because they sum floats in different orders, so greedy token identity is not a meaningful acceptance criterion for this design and the earlier matches were partly luck. Strata judges hits against misses with logit KL divergence, and that is the measurement this port should adopt: KL of the hybrid's logits against the GPU only run over real text, reported in confident and uncertain positions separately.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, full MoE suite, 3/3 MoE CTests and diff check passed; a run with every gate off printed no hybrid lines; the baseline reproduced exactly; the substituted run diverged at the stated position, reproducibly. Artifacts: `build/hybrid-q81all-{probe,layer,range,full}.log`, `build/hybrid-q81{more,spin}-build.log`, `build/run-qwen-q81only-smoke.{py,json,log}`, `build/run-qwen-q81sub48-smoke.{py,json,log}`, `build/run-qwen-base48b-smoke.{py,json,log}`.
+
+### Logit KL against the GPU only run
+
+`build/run-qwen-kld.py` drives the existing `llama-perplexity --kl-divergence` over `tools/server/README.md`, 6 chunks of 128 tokens, 32 slots, with `-ub 1` so every token is a single row decode, the path the hybrid chain runs on. The base run saves GPU only logits; the hybrid run enables shadow admission, the doorbell, the owner CPU half with shared Q8_1, and substitution of the CPU values on cold routes, about 144,000 routes over the run.
+
+| run | mean KLD | max KLD | same top token |
+| --- | --- | --- | --- |
+| hybrid pipeline, no substitution (control, twice) | 0.000000 | 0.000045 | 100.000% |
+| substitution, run 1 | 0.005699 ± 0.001016 | | 98.94% |
+| substitution, run 2 | 0.008661 ± 0.001417 | | 97.35% |
+| substitution, run 3 | 0.007785 ± 0.001427 | | 98.41% |
+| substitution, first run before the exit fix | 0.007323 ± 0.001369 | 0.3316 | 98.68% |
+
+The control isolates the effect: with every part of the pipeline running but the GPU's values kept, the output is unchanged, so the divergence comes from the substituted CPU values. The median per token KLD in the first run was 8.6e-05, so the mean is driven by a minority of uncertain positions, consistent with the near tie seen in the greedy check.
+
+The repeats do not agree with each other beyond what the reported error suggests is safe to ignore, and the number of routes handled differs slightly between them, while the baseline and the control are exactly reproducible and the handshake counts, 36,575 acknowledgements and no timeouts, are identical in every run. So something in the substituted path is not deterministic. Until it is found these KLD values are a range, roughly 0.006 to 0.009, not a measurement, and admission must not be switched to deciding on top of an unexplained race.
+
+The first hybrid run also crashed at exit with an access violation. The worker kept polling a packet after its resource freed the mapped memory; server smokes never shut down normally, so they could not show it. The resource now removes its packet from the worker, under the worker's lock, before freeing it, and every later run exited cleanly.
+
+Validation: Release build/relink, insertion probe, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/run-qwen-kld.py`, `build/qwen-kld-*.log`.
+
+Next: find the nondeterminism in the substituted path, then repeat the KL measurement to a stable value; only then let admission decide and move the doorbell wait to the combine.
 
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 

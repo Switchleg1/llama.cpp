@@ -66,7 +66,7 @@ typedef bool (*ggml_backend_moe_hybrid_shadow_t)(
 #define GGML_BACKEND_MOE_HYBRID_SET_COLD_HANDLER_PROC_NAME "ggml_backend_moe_hybrid_set_cold_handler"
 
 typedef bool (*ggml_backend_moe_hybrid_cold_handler_t)(
-        void * user, const struct ggml_tensor * down, const float * activation,
+        void * user, const struct ggml_tensor * down, const float * activation, const void * activation_q8_1,
         const int32_t * experts, uint32_t count, float * results, size_t result_stride);
 typedef void (*ggml_backend_moe_hybrid_set_cold_handler_t)(ggml_backend_moe_hybrid_cold_handler_t handler, void * user);
 

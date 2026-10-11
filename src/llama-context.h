@@ -365,7 +365,15 @@ private:
     // CPU half of the hybrid split, one helper per layer, on a pool the inference graph never uses.
     void moe_hybrid_register_cpu(llm_graph_result * res);
     static bool moe_hybrid_cold_handler(void * user, const ggml_tensor * down, const float * activation,
-            const int32_t * experts, uint32_t count, float * results, size_t result_stride);
+            const void * activation_q8_1, const int32_t * experts, uint32_t count, float * results,
+            size_t result_stride);
+    struct moe_hybrid_q8_1_layer {
+        const ggml_tensor * gate = nullptr;
+        const ggml_tensor * up   = nullptr;
+        bool gelu = false;
+    };
+    std::unordered_map<const ggml_tensor *, moe_hybrid_q8_1_layer> moe_hybrid_q8_1_layers;
+    uint64_t moe_hybrid_q8_1_routes = 0;
     std::mutex moe_hybrid_cpu_mutex;
     std::unordered_map<const ggml_tensor *, std::unique_ptr<llm_graph_moe_hybrid_cpu>> moe_hybrid_cpu;
     std::vector<float> moe_hybrid_cpu_output;

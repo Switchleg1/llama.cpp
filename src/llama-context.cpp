@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-moe-hybrid-kernels.h"
 #include "llama-staged-input.h"
 
 #include "ggml-backend.h"
@@ -1967,9 +1968,24 @@ void llama_context::moe_hybrid_shadow_regions(int node_end) {
 }
 
 bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * down, const float * activation,
-        const int32_t * experts, uint32_t count, float * results, size_t result_stride) {
+        const void * activation_q8_1, const int32_t * experts, uint32_t count, float * results, size_t result_stride) {
     auto * ctx = static_cast<llama_context *>(user);
     std::lock_guard<std::mutex> lock(ctx->moe_hybrid_cpu_mutex);
+    // Shared quantization: consume the GPU's own Q8_1 activation when every bank type is covered.
+    static const bool use_q8_1 = getenv("LLAMA_MOE_HYBRID_Q8_1") != nullptr;
+    const auto layer = ctx->moe_hybrid_q8_1_layers.find(down);
+    if (use_q8_1 && activation_q8_1 != nullptr && layer != ctx->moe_hybrid_q8_1_layers.end() && down != nullptr &&
+            (size_t) down->ne[1] <= result_stride) {
+        if (llama_moe_hybrid_q8_1_experts(layer->second.gate, layer->second.up, down, experts, count,
+                activation_q8_1, results, result_stride, layer->second.gelu)) {
+            ctx->moe_hybrid_q8_1_routes += count;
+            return true;
+        }
+    }
+    static const bool q8_1_only = getenv("LLAMA_MOE_HYBRID_Q8_1_ONLY") != nullptr;
+    if (q8_1_only) {
+        return false;
+    }
     const auto it = ctx->moe_hybrid_cpu.find(down);
     if (it == ctx->moe_hybrid_cpu.end() || down == nullptr) {
         return false;
@@ -2027,14 +2043,18 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
             continue;
         }
         moe_hybrid_cpu.emplace(ffn.down, std::move(helper));
+        if (ffn.gate != nullptr && ffn.up != nullptr && ffn.gate_up == nullptr &&
+                llama_moe_hybrid_q8_1_supported(ffn.gate, ffn.up, ffn.down)) {
+            moe_hybrid_q8_1_layers[ffn.down] = { ffn.gate, ffn.up, ffn.type_op == LLM_FFN_GELU };
+        }
         ++added;
     }
     if (added != 0) {
         moe_hybrid_set_cold_handler(moe_hybrid_cold_handler, this);
     }
     if (added != 0 || refused != 0) {
-        LLAMA_LOG_WARN("moe-hybrid-cpu: helpers=%zu added=%zu refused=%zu threads=%d\n",
-                       moe_hybrid_cpu.size(), added, refused, n_threads);
+        LLAMA_LOG_WARN("moe-hybrid-cpu: helpers=%zu added=%zu refused=%zu threads=%d q8_1_layers=%zu\n",
+                       moe_hybrid_cpu.size(), added, refused, n_threads, moe_hybrid_q8_1_layers.size());
     }
 }
 
