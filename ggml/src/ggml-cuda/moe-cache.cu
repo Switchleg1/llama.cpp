@@ -10308,7 +10308,7 @@ static __global__ void moe_hybrid_scatter_add(
         int64_t capacity, int64_t n_embd) {
     const int64_t job = blockIdx.x;
     const int32_t n_hot = *count;
-    if (n_hot < 0 || job >= n_hot) {
+    if (n_hot < 0 || n_hot > capacity || job >= n_hot) {
         return;
     }
     const int32_t column = columns[job];
@@ -10324,7 +10324,8 @@ bool ggml_cuda_moe_hybrid_scatter_add(
         float * parts, const float * hot_out, const int32_t * columns, const int32_t * count,
         int64_t capacity, int64_t n_embd, ggml_cuda_moe_stream_t stream) {
     if (parts == nullptr || hot_out == nullptr || columns == nullptr || count == nullptr || stream == nullptr ||
-            capacity <= 0 || n_embd <= 0 || capacity > INT32_MAX) {
+            capacity <= 0 || n_embd <= 0 || capacity > INT32_MAX ||
+            (uint64_t) n_embd > SIZE_MAX / sizeof(float) / (uint64_t) capacity) {
         return false;
     }
     moe_hybrid_scatter_add<<<(unsigned) capacity, 256, 0, (cudaStream_t) stream>>>(

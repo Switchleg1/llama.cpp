@@ -2,6 +2,7 @@
 #include "../src/llama-graph.h"
 #include "ggml-cuda/moe-cache-host.cuh"
 #include "test-moe-cache.h"
+#include "ggml-quants.h"
 
 namespace {
 
@@ -1325,6 +1326,54 @@ void test_hybrid_frozen_partition() {
                 ggml_backend_tensor_set(batch, input.data(), 0, input.size() * sizeof(float));
                 CUDA_OK(cudaStreamSynchronize(stream));
                 CHECK(ggml_backend_graph_compute(cuda.get(), hot_graph) == GGML_STATUS_SUCCESS);
+                {
+                    std::vector<float> activations(n_hits * n_dim);
+                    ggml_backend_tensor_get(hot_input, activations.data(), 0, activations.size() * sizeof(float));
+                    const std::vector<float> original = activations;
+                    for (int sample = 0; sample < 3; ++sample) {
+                        if (sample == 1) {
+                            std::fill(activations.begin(), activations.end(), 0.0f);
+                        } else if (sample == 2) {
+                            for (size_t i = 0; i < activations.size(); ++i) {
+                                const int lane = i % QK8_0;
+                                activations[i] = lane == 0 ? 127.0f : (lane % 2 ? -1.0f : 1.0f) * (lane + 0.5f);
+                            }
+                        }
+                        ggml_backend_tensor_set(hot_input, activations.data(), 0, activations.size() * sizeof(float));
+                        const size_t blocks = activations.size() / QK8_0;
+                        std::vector<block_q8_0> cpu_blocks(blocks);
+                        ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float(
+                            activations.data(), cpu_blocks.data(), activations.size());
+                        ggml_backend_buffer_ptr quant_buffer(ggml_backend_buft_alloc_buffer(
+                            ggml_backend_cuda_buffer_type(0), blocks * sizeof(block_q8_1)));
+                        CHECK(quant_buffer != nullptr);
+                        CHECK(ggml_cuda_moe_quantize_q8_1_for_test(static_cast<const float *>(hot_input->data),
+                            ggml_backend_buffer_get_base(quant_buffer.get()), n_dim, n_hits, stream));
+                        CUDA_OK(cudaStreamSynchronize(stream));
+                        std::vector<block_q8_1> gpu_blocks(blocks);
+                        CUDA_OK(cudaMemcpy(gpu_blocks.data(), ggml_backend_buffer_get_base(quant_buffer.get()),
+                            blocks * sizeof(block_q8_1), cudaMemcpyDeviceToHost));
+                        size_t different_scales = 0, different_codes = 0;
+                        double max_dequant_difference = 0.0;
+                        for (size_t b = 0; b < blocks; ++b) {
+                            different_scales += cpu_blocks[b].d != gpu_blocks[b].d;
+                            const float cpu_scale = ggml_fp16_to_fp32(cpu_blocks[b].d);
+                            const float gpu_scale = ggml_fp16_to_fp32(gpu_blocks[b].d);
+                            for (int q = 0; q < QK8_0; ++q) {
+                                different_codes += cpu_blocks[b].qs[q] != gpu_blocks[b].qs[q];
+                                max_dequant_difference = std::max(max_dequant_difference,
+                                    std::abs((double) cpu_scale * cpu_blocks[b].qs[q] -
+                                             (double) gpu_scale * gpu_blocks[b].qs[q]));
+                            }
+                        }
+                        fprintf(stderr, "test-moe-cache: activation quantization sample=%d blocks=%zu scale_differences=%zu code_differences=%zu max_dequant_difference=%g\n",
+                            sample, blocks, different_scales, different_codes, max_dequant_difference);
+                        if (sample == 1) {
+                            CHECK(different_scales == 0 && different_codes == 0 && max_dequant_difference == 0.0);
+                        }
+                    }
+                    ggml_backend_tensor_set(hot_input, original.data(), 0, original.size() * sizeof(float));
+                }
                 std::vector<float> hot_values(n_hits * n_dim);
                 ggml_backend_tensor_get(hot_out, hot_values.data(), 0, hot_values.size() * sizeof(float));
 
@@ -1369,8 +1418,7 @@ void test_hybrid_frozen_partition() {
                         const double difference = (double) hot_values[job * n_dim + i] - reference;
                         error += difference * difference;
                         norm += reference * reference;
-                        // Strata measured 4.761e-04 here and it changed generated tokens, so it is recorded.
-                        // Scaled by the signal, because near-zero elements make a raw ratio meaningless.
+                        // Measure full-FFN disagreement against signal RMS, not near-zero elements.
                         half_difference = std::max(half_difference, std::abs(difference));
                         half_square += reference * reference;
                         ++half_count;
@@ -1400,11 +1448,58 @@ void test_hybrid_frozen_partition() {
                 // Every column must now be covered: the scatter filled exactly the rows the CPU left at zero.
                 std::vector<float> merged(parts.size());
                 ggml_backend_tensor_get(routed.hybrid_ffn.down_output, merged.data(), 0, merged.size() * sizeof(float));
-                CHECK(std::none_of(merged.begin(), merged.end(), [](float value) { return value == 0.0f; }));
+                std::vector<unsigned char> owners(packet.gpu_ids().size(), 0);
                 for (size_t job = 0; job < n_hits; ++job) {
                     const auto column = packet.hot_columns()[job];
+                    CHECK(owners[column]++ == 0);
                     CHECK(memcmp(merged.data() + column * n_dim, hot_values.data() + job * n_dim,
                         n_dim * sizeof(float)) == 0);
+                }
+                for (size_t job = 0; job < packet.cold_columns().size(); ++job) {
+                    const auto column = packet.cold_columns()[job];
+                    CHECK(owners[column]++ == 0);
+                    CHECK(memcmp(merged.data() + column * n_dim, cold.data() + job * n_dim,
+                        n_dim * sizeof(float)) == 0);
+                }
+                CHECK(std::all_of(owners.begin(), owners.end(), [](unsigned char value) { return value == 1; }));
+
+                const auto scatter = [&]() {
+                    CHECK(ggml_cuda_moe_hybrid_scatter_add(
+                        static_cast<float *>(routed.hybrid_ffn.down_output->data),
+                        static_cast<const float *>(hot_out->data), device_hot_columns, device_counts,
+                        packet.gpu_ids().size(), n_dim, stream));
+                    CUDA_OK(cudaStreamSynchronize(stream));
+                };
+                // Zero and refused counts must leave every destination unchanged, including poison.
+                std::vector<float> poison(parts.size(), std::numeric_limits<float>::quiet_NaN());
+                for (int32_t count : {0, -1, (int32_t) packet.gpu_ids().size() + 1}) {
+                    ggml_backend_tensor_set(routed.hybrid_ffn.down_output, poison.data(), 0, poison.size() * sizeof(float));
+                    CUDA_OK(cudaMemcpy(device_counts, &count, sizeof(count), cudaMemcpyHostToDevice));
+                    scatter();
+                    ggml_backend_tensor_get(routed.hybrid_ffn.down_output, merged.data(), 0, merged.size() * sizeof(float));
+                    CHECK(memcmp(merged.data(), poison.data(), poison.size() * sizeof(float)) == 0);
+                }
+                const int32_t count = (int32_t) n_hits;
+                CUDA_OK(cudaMemcpy(device_counts, &count, sizeof(count), cudaMemcpyHostToDevice));
+                // A legitimate zero hot output must still cover its columns and preserve the cold half.
+                std::vector<float> zeros(hot_values.size(), 0.0f);
+                ggml_backend_tensor_set(hot_out, zeros.data(), 0, zeros.size() * sizeof(float));
+                ggml_backend_tensor_set(routed.hybrid_ffn.down_output, parts.data(), 0, parts.size() * sizeof(float));
+                scatter();
+                ggml_backend_tensor_get(routed.hybrid_ffn.down_output, merged.data(), 0, merged.size() * sizeof(float));
+                CHECK(memcmp(merged.data(), parts.data(), parts.size() * sizeof(float)) == 0);
+                // Reinitialize before each merge so reused storage cannot accumulate the previous layer.
+                ggml_backend_tensor_set(hot_out, hot_values.data(), 0, hot_values.size() * sizeof(float));
+                std::vector<float> expected = parts;
+                for (size_t job = 0; job < n_hits; ++job) {
+                    memcpy(expected.data() + packet.hot_columns()[job] * n_dim, hot_values.data() + job * n_dim,
+                        n_dim * sizeof(float));
+                }
+                for (int repeat = 0; repeat < 2; ++repeat) {
+                    ggml_backend_tensor_set(routed.hybrid_ffn.down_output, parts.data(), 0, parts.size() * sizeof(float));
+                    scatter();
+                    ggml_backend_tensor_get(routed.hybrid_ffn.down_output, merged.data(), 0, merged.size() * sizeof(float));
+                    CHECK(memcmp(merged.data(), expected.data(), expected.size() * sizeof(float)) == 0);
                 }
                 CHECK(ggml_backend_sched_graph_compute_range(sched.get(), graph, &certificate, span.expert_end,
                     span.region_end) == GGML_STATUS_SUCCESS);

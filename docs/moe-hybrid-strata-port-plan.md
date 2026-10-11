@@ -1034,7 +1034,7 @@ Validation: Release build/relink, insertion probe, grouped-layer run, ranged run
 
 Added `ggml_backend_cuda_moe_hybrid_execute_hot()` and `ggml_backend_cuda_moe_hybrid_hot_scratch_bytes()`. Like Strata's hit path, the entry point takes raw device pointers and the slot arena is read in place: bank views are taken from the held transaction's descriptors, the weight's own descriptor is kept and only `data` and the slot extent are replaced, exactly as the grouped path does. Each descriptor's `expert_stride` must equal the stride the view assumes, so a layout disagreement is refused rather than indexed blindly.
 
-It runs up, gate, the gated activation and down over the compact routes, with ids being the hot slots. Scratch is caller-owned and sized by the helper, so nothing allocates on the execution path, which also keeps it capture-legal. Missing arguments, a stale or inactive transaction, geometry disagreement and undersized scratch are all refused before any launch.
+It runs up, gate, the gated activation and down over the compact routes, with ids being the hot slots. FFN intermediate storage is caller-owned and sized by the helper. The reused CUDA matmul paths still acquire backend-pool workspace; this helper does not prove allocation-free execution or capture legality. Missing arguments, a stale or inactive transaction, geometry disagreement and undersized scratch are all refused before any launch.
 
 The frozen test now runs the same half both ways and requires the in-place result to be bit-identical to the test-built graph (`NMSE == 0.0`), not merely close. Undersized scratch is checked as a refusal.
 
@@ -1046,15 +1046,33 @@ Deliberate deviations from Strata at this stage: the hit count is a host argumen
 
 ### The two halves disagree, measured
 
-Strata's `x_scales` exists because a hit and a miss must produce the same number; they measured max relative `4.761e-04` from fp16 against fp32 activation scales and it changed generated tokens. The same quantity is now measured here rather than assumed: the frozen test compares the GPU resident output against the CPU output for the same routes and reports it.
+Strata's `x_scales` exists because a hit and a miss must produce the same number; they measured max relative `4.761e-04` from fp16 against fp32 activation scales and it changed generated tokens. A different quantity is measured here: the frozen test compares full GPU resident FFN outputs against CPU outputs for the same routes. This does not isolate activation-scale error or identify its cause.
 
-A first version reported `max_relative=0.131`, which is meaningless because near-zero reference elements dominate a raw ratio. Scaled by the signal instead, the result is `max_abs=9.98e-04` against an RMS of `3.29e-02`, a worst-element ratio of about `3.0e-02`, with the aggregate NMSE unchanged at `1.57814e-04`.
+A first version reported `max_relative=0.131`, which is meaningless because near-zero reference elements dominate a raw ratio. Scaled by the signal instead, the result is `max_abs=9.98e-04` against an RMS of `3.29e-02`, a worst-element ratio of about `3.0e-02`, The earlier `1.57814e-04` value belongs to the separate insertion probe, not this full-FFN disagreement measurement.
 
 This is not directly comparable to Strata's number: theirs isolates activation quantization, this covers a whole Q4_0 expert chain evaluated by two different implementations. What it does establish is that the halves disagree at quantization scale rather than at machine precision, so a hybrid layer cannot be assumed to reproduce full-GPU tokens. Greedy-token identity has to be measured on a real model, and if it fails, the shared-activation-quantization path is the structural fix Strata already took.
 
 Validation: Release build, insertion probe with the measurement, grouped-layer run, ranged runner, full MoE suite and `git diff --check` passed. Artifact: `build/hybrid-parity-{focused,layer,range,full}.log`.
 
-Next: shared activation quantization so both halves consume identical inputs, a device-count form of the hot execution, and the mapped-memory handoff with a copy kernel. Speculative parity, greedy-token identity and overlap all remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
+### Merge ownership and poisoned reuse
+
+Replaced the fixture's nonzero-element coverage rule with exact ownership checks: every routed column has one hot or cold owner, hot columns match compact GPU results, and cold columns remain bit-identical to CPU results. Valid zero hot outputs are tested. Repeated merges reinitialize parts and must reproduce the expected result exactly. Zero, negative and over-capacity device counts must leave a NaN-poisoned destination untouched; over-capacity counts now cause the kernel to write nothing. Host extent multiplication overflow is refused. Lists remain selector-produced, unique-column inputs; the scatter helper is not a general device-list validator.
+
+Validation: Release build, focused insertion/frozen runner, full MoE suite and diff check passed (`build/hybrid-merge-ownership-{build,focused,full}.log`).
+
+Corrected earlier claims: the hot helper's caller scratch only covers FFN intermediates, not CUDA matmul pool workspace. Allocation-free execution and capture legality have not been established. Transaction descriptors are checked, but callers must preserve the held transaction through stream completion; automatic lifecycle protection and explicit stream-owner validation remain outstanding.
+
+### Isolated activation quantization
+
+Added a test-only wrapper for the existing CUDA Q8_1 quantizer. The frozen hot fixture compares it directly with the active CPU Q8_0 `from_float` implementation on identical inputs, ignoring the Q8_1 sum field that Q8_0 does not store. It reports scale-bit differences, code differences and maximum dequantized difference. Original activations are restored before in-place FFN parity and merge checks.
+
+On this x86/CUDA build, the fixture's eight input blocks and an all-zero control have identical scales and codes. A signed half-integer control with scale one has identical scales but 120 differing codes and maximum dequantized difference one. The x86 implementation uses nearest-even SIMD rounding; the CUDA Q8_1 kernel uses `roundf`, which rounds ties away from zero. This is not a justification to change ordinary CPU/CUDA quantization globally.
+
+The fixture's input quantizer therefore does not explain its full-FFN discrepancy. Intermediate activation quantization, reductions and nonlinear arithmetic have not yet been isolated. A shared quantized-input design must choose its rounding policy explicitly and account for CPU Q8_0 versus CUDA Q8_1 layout and correction data; copying Strata's fp32 scale alone is not a proven fix here.
+
+Validation: Release build, focused insertion/frozen runner, full MoE suite and diff check passed (`build/hybrid-quant-isolate-{build,focused,full}.log`). No real-model hybrid or performance claim follows from these controls.
+
+Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
 ### Stream-ordered insertion without an intermediate drain
 

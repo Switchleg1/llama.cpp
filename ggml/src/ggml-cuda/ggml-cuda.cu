@@ -2520,6 +2520,17 @@ bool ggml_backend_cuda_moe_hybrid_execute_hot(
     return ggml_cuda_mul_mat_id_impl(*cuda_ctx, &result, ggml_cuda_moe_use_mmq(&down_view, n_hits));
 }
 
+bool ggml_cuda_moe_quantize_q8_1_for_test(const float * input, void * output, int64_t width,
+        int64_t rows, ggml_cuda_moe_stream_t stream) {
+    if (input == nullptr || output == nullptr || stream == nullptr || width <= 0 || rows <= 0 ||
+            width % CUDA_QUANTIZE_BLOCK_SIZE != 0 || width > INT32_MAX || rows > 65535) {
+        return false;
+    }
+    quantize_row_q8_1_cuda(input, nullptr, output, GGML_TYPE_Q4_0, width, width, width * rows,
+        width * rows, width, rows, 1, 1, (cudaStream_t) stream);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 ggml_cuda_moe_stream_t ggml_cuda_moe_owner_stream_for_test(ggml_backend_t backend) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return nullptr;

@@ -1117,12 +1117,12 @@ bool ggml_cuda_moe_hybrid_select(
         int32_t * hot_slots, int32_t * hot_rows, int32_t * hot_columns, int32_t * cold_ids, int32_t * cold_columns,
         int32_t * counts, ggml_cuda_moe_stream_t stream);
 
-// Scratch bytes ggml_backend_cuda_moe_hybrid_execute_hot needs for n_hits compact routes.
+// FFN intermediate bytes only; existing CUDA matmul paths also use their backend pool.
 size_t ggml_backend_cuda_moe_hybrid_hot_scratch_bytes(int64_t n_hits, int64_t n_ff);
 
 // Runs the resident half in place against the transaction's slot arena: for each compact route h, the expert in
 // slot hot_slots[h] is evaluated on activation row h and written to hot_out row h. Caller owns every buffer.
-// Transaction and stream bound, no allocation here, and no decode is planned so nothing is filled.
+// Caller must hold the transaction until the backend stream completes. This does not plan demand fills.
 bool ggml_backend_cuda_moe_hybrid_execute_hot(
         ggml_backend_t backend,
         const ggml_cuda_moe_grouped_transaction & transaction,
@@ -1131,10 +1131,13 @@ bool ggml_backend_cuda_moe_hybrid_execute_hot(
         void * scratch, size_t scratch_bytes, float * hot_out);
 
 // Adds each compact row of hot_out into parts at its routed column, reading the count from device memory.
-// parts holds the other half already; rows it owns must be left at zero by the producer.
+// parts holds the cold half; hot columns must start at zero. Columns must be unique and selector-produced.
+// Invalid counts write nothing. A true return reports launch acceptance, not device-list validation.
 bool ggml_cuda_moe_hybrid_scatter_add(
         float * parts, const float * hot_out, const int32_t * columns, const int32_t * count,
         int64_t capacity, int64_t n_embd, ggml_cuda_moe_stream_t stream);
+bool ggml_cuda_moe_quantize_q8_1_for_test(const float * input, void * output, int64_t width,
+        int64_t rows, ggml_cuda_moe_stream_t stream);
 ggml_cuda_moe_stream_t ggml_cuda_moe_owner_stream_for_test(ggml_backend_t backend);
 
 struct ggml_cuda_graph_capture_state_for_test {
