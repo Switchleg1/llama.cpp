@@ -3923,6 +3923,10 @@ struct moe_grouped_admit_publication {
     uint32_t timeouts;      // the device gave up waiting, so the handshake is not reliable
     uint32_t n_embd;
     uint32_t computed;      // routes the worker actually evaluated, bounded by the result storage
+    uint32_t planned_for;    // the sequence these routes belong to; another value means they are stale
+    uint32_t plans;          // planner runs, to compare against publications
+    uint32_t last_compared;  // sequence the device last compared; equal to sequence means nothing new
+    uint32_t stale;          // comparisons refused because no fresh packet was published this token
     uint32_t parity_count;
     float    parity_sum;
     float    parity_max;
@@ -3944,6 +3948,13 @@ static __global__ void moe_grouped_admit_compare(
     }
     volatile uint32_t * acknowledged = &publication->acknowledged;
     const uint32_t want = publication->sequence;
+    if (want == publication->last_compared) {
+        // No activation was published for this token, so the results belong to an earlier one.
+        ++publication->stale;
+        __threadfence_system();
+        return;
+    }
+    publication->last_compared = want;
     uint64_t spin = 0;
     while (*acknowledged != want && spin < spin_limit) {
         ++spin;
@@ -3952,12 +3963,15 @@ static __global__ void moe_grouped_admit_compare(
         return;
     }
     __threadfence_system();
-    for (uint32_t index = 0; index < publication->computed; ++index) {
-        const int32_t route = publication->routes[index];
+    // The host writes these, and the GPU's caches do not see host writes, so every read is volatile.
+    const volatile moe_grouped_admit_publication * host = publication;
+    const uint32_t computed = host->computed;
+    for (uint32_t index = 0; index < computed; ++index) {
+        const int32_t route = host->routes[index];
         if (route < 0 || route >= n_routes || route >= routes_per_row) {
             continue;
         }
-        const float * reference = publication->results + (size_t) index * MOE_GROUPED_ADMIT_WIDTH;
+        const volatile float * reference = host->results + (size_t) index * MOE_GROUPED_ADMIT_WIDTH;
         float * produced = down_output + (size_t) route * n_embd;
         double error = 0.0, norm = 0.0;
         for (int64_t i = 0; i < n_embd; ++i) {
@@ -3982,13 +3996,19 @@ static __global__ void moe_grouped_admit_compare(
 // Publishes the layer activation the cold routes need, then announces the whole packet. The sequence is
 // raised here and not in the planner, so a reader never sees routes without their activation.
 static __global__ void moe_grouped_admit_publish_activation(
-        moe_grouped_admit_publication * publication, const float * activation, uint32_t n_embd) {
+        moe_grouped_admit_publication * publication, const float * activation, uint32_t n_embd,
+        const uint8_t * quantized, uint32_t quantized_bytes) {
     if (publication == nullptr || activation == nullptr) {
         return;
     }
     for (uint32_t i = threadIdx.x; i < n_embd && i < MOE_GROUPED_ADMIT_WIDTH; i += blockDim.x) {
         publication->activation[i] = activation[i];
     }
+    for (uint32_t i = threadIdx.x; quantized != nullptr && i < quantized_bytes; i += blockDim.x) {
+        publication->activation_q8_1[i] = quantized[i];
+    }
+    // Every writer fences at system scope, so the host never sees the sequence ahead of any byte.
+    __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
         publication->n_embd = n_embd < MOE_GROUPED_ADMIT_WIDTH ? n_embd : MOE_GROUPED_ADMIT_WIDTH;
@@ -4047,6 +4067,7 @@ struct moe_grouped_admit_bank {
 
 struct moe_grouped_admit_group {
     moe_grouped_admit_publication * packet = nullptr;
+    uint32_t last_sequence = 0;
     const ggml_tensor * down_tensor = nullptr;
     moe_grouped_admit_bank gate;
     moe_grouped_admit_bank up;
@@ -4147,12 +4168,21 @@ struct moe_grouped_admit_worker {
     std::atomic<uint64_t> acknowledged{0};
     std::atomic<uint64_t> compute_us{0};
     std::atomic<uint64_t> handled_routes{0};
+    std::atomic<uint64_t> skipped{0};   // sequence advanced by more than one between computes
+    std::atomic<uint64_t> torn{0};      // sequence changed while computing
+    std::atomic<uint64_t> stale_total{0};
+    std::atomic<uint64_t> unplanned{0};   // publications whose routes were planned for another token
+    std::atomic<uint64_t> plans_total{0};
+    std::atomic<uint64_t> sequences_total{0};
     ggml_backend_moe_hybrid_cold_handler_t handler = nullptr;
     void * handler_user = nullptr;
 
     // Stops watching a packet before its memory is freed. Takes the lock, so a compute in progress finishes first.
     void remove(const moe_grouped_admit_publication * packet) {
         std::lock_guard<std::mutex> lock(mutex);
+        stale_total.fetch_add(packet->stale, std::memory_order_relaxed);
+        plans_total.fetch_add(packet->plans, std::memory_order_relaxed);
+        sequences_total.fetch_add(packet->sequence, std::memory_order_relaxed);
         groups.erase(std::remove_if(groups.begin(), groups.end(),
             [&](const moe_grouped_admit_group & group) { return group.packet == packet; }), groups.end());
         packets.erase(std::remove(packets.begin(), packets.end(), packet), packets.end());
@@ -4239,6 +4269,20 @@ struct moe_grouped_admit_worker {
                     auto * packet = group.packet;
                     const uint32_t sequence = packet->sequence;
                     if (packet->acknowledged != sequence) {
+                        if (group.last_sequence != 0 && sequence - group.last_sequence > 1) {
+                            skipped.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        group.last_sequence = sequence;
+                        if (packet->planned_for != sequence) {
+                            // The activation was published without a plan for it: the routes are an earlier
+                            // token's. Computing them would put the wrong experts into this token's output.
+                            packet->computed = 0;
+                            unplanned.fetch_add(1, std::memory_order_relaxed);
+                            packet->acknowledged = sequence;
+                            acknowledged.fetch_add(1, std::memory_order_relaxed);
+                            progressed = true;
+                            continue;
+                        }
                         const auto started = std::chrono::steady_clock::now();
                         const uint32_t count = std::min<uint32_t>(packet->count, MOE_GROUPED_ADMIT_RESULT_ROUTES);
                         if (handler != nullptr && count != 0 && packet->n_embd != 0 &&
@@ -4254,9 +4298,35 @@ struct moe_grouped_admit_worker {
                         } else {
                             compute(group);
                         }
+                        static FILE * trace = []() -> FILE * {
+                            const char * path = getenv("LLAMA_MOE_ADMIT_TRACE");
+                            return path != nullptr ? fopen(path, "w") : nullptr;
+                        }();
+                        if (trace != nullptr) {
+                            const auto hash = [](const void * data, size_t bytes) {
+                                uint64_t h = 1469598103934665603ull;
+                                for (size_t i = 0; i < bytes; ++i) {
+                                    h = (h ^ static_cast<const uint8_t *>(data)[i]) * 1099511628211ull;
+                                }
+                                return (unsigned long long) h;
+                            };
+                            const uint32_t n = std::min<uint32_t>(packet->count, MOE_GROUPED_ADMIT_RESULT_ROUTES);
+                            fprintf(trace, "%s seq=%u count=%u computed=%u experts=", group.down_tensor ? group.down_tensor->name : "?",
+                                sequence, packet->count, packet->computed);
+                            for (uint32_t k = 0; k < n; ++k) {
+                                fprintf(trace, "%d,", packet->experts[k]);
+                            }
+                            fprintf(trace, " act=%016llx q8=%016llx res=%016llx\n",
+                                hash(packet->activation, packet->n_embd * sizeof(float)),
+                                hash(packet->activation_q8_1, packet->n_embd / 32 * 36),
+                                hash(packet->results, (size_t) packet->computed * MOE_GROUPED_ADMIT_WIDTH * sizeof(float)));
+                        }
                         compute_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - started).count(), std::memory_order_relaxed);
                         computed_routes.fetch_add(packet->computed, std::memory_order_relaxed);
+                        if (packet->sequence != sequence) {
+                            torn.fetch_add(1, std::memory_order_relaxed);
+                        }
                         packet->acknowledged = sequence;
                         acknowledged.fetch_add(1, std::memory_order_relaxed);
                         progressed = true;
@@ -4317,6 +4387,9 @@ static __device__ void moe_grouped_admit_shadow(
     }
     if (publication != nullptr) {
         publication->count = published;
+        // The next publication of the activation is the one these routes belong to.
+        publication->planned_for = publication->sequence + 1;
+        ++publication->plans;
         // Visible before the activation kernel raises the sequence that announces the packet.
         __threadfence_system();
     }
@@ -5995,6 +6068,9 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (admit_slot_for_expert != nullptr) {
                 (void) cudaFree(admit_slot_for_expert);
             }
+            if (admit_quantized != nullptr) {
+                (void) cudaFree(admit_quantized);
+            }
             if (admit_publication_host != nullptr) {
                 moe_grouped_admit_worker_instance().remove(admit_publication_host);
                 (void) cudaFreeHost(admit_publication_host);
@@ -6061,6 +6137,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         int32_t * admit_slot_for_expert = nullptr;
         moe_grouped_admit_publication * admit_publication_host = nullptr;
         moe_grouped_admit_publication * admit_publication_device = nullptr;
+        uint8_t * admit_quantized = nullptr;
         uint32_t admit_publication_seen = 0;
         uint8_t * invalidated_slot = nullptr;
         uint8_t * occupied_slot = nullptr;
@@ -7745,11 +7822,13 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         if (moe_grouped_admit_shadow_enabled()) {
             if (!moe_grouped_cuda_success(cudaMalloc(&result->admit_slot_for_expert, n_experts * sizeof(int32_t))) ||
-                    !moe_grouped_cuda_success(cudaMemset(result->admit_slot_for_expert, 0xff, n_experts * sizeof(int32_t))) ||
+
                     !moe_grouped_cuda_success(cudaHostAlloc(&result->admit_publication_host,
                         sizeof(moe_grouped_admit_publication), cudaHostAllocMapped)) ||
                     !moe_grouped_cuda_success(cudaHostGetDevicePointer(&result->admit_publication_device,
-                        result->admit_publication_host, 0))) {
+                        result->admit_publication_host, 0)) ||
+                    !moe_grouped_cuda_success(cudaMalloc(&result->admit_quantized,
+                        sizeof(((moe_grouped_admit_publication *) nullptr)->activation_q8_1)))) {
                 return nullptr;
             }
             memset(result->admit_publication_host, 0, sizeof(moe_grouped_admit_publication));
@@ -7843,6 +7922,10 @@ struct ggml_cuda_moe_grouped_context::impl {
                 !moe_grouped_cuda_success(cudaMemsetAsync(result->device_step, 0, sizeof(uint64_t), compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemsetAsync(result->device_clock, 0, sizeof(uint64_t), compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemsetAsync(result->plan, 0, result->plan_bytes, compute_stream)) ||
+                // In stream order with the planner: a plain cudaMemset on the default stream could land after
+                // the first planner launch, and fresh memory reads as slot 0, so experts looked resident at random.
+                (result->admit_slot_for_expert != nullptr && !moe_grouped_cuda_success(cudaMemsetAsync(
+                    result->admit_slot_for_expert, 0xff, n_experts * sizeof(int32_t), compute_stream))) ||
                 !moe_grouped_cuda_success(cudaMemcpyAsync(
                     result->device_banks, device_banks.data(), snapshot.banks.size() * sizeof(moe_grouped_device_bank),
                     cudaMemcpyHostToDevice, compute_stream)) ||
@@ -9471,6 +9554,7 @@ bool ggml_cuda_moe_grouped_context::publish_admit_activation(
         return false;
     }
     moe_grouped_admit_publication * packet = nullptr;
+    uint8_t * quantized = nullptr;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (key.generation != impl_->state.generation || key.group_index >= impl_->resources.size()) {
@@ -9481,15 +9565,19 @@ bool ggml_cuda_moe_grouped_context::publish_admit_activation(
             return false;
         }
         packet = resource->device->admit_publication_device;
+        quantized = resource->device->admit_quantized;
     }
     if (packet == nullptr) {
         return false;
     }
-    if (n_embd <= MOE_GROUPED_ADMIT_WIDTH && n_embd % MATRIX_ROW_PADDING == 0) {
-        quantize_row_q8_1_cuda(activation, nullptr, packet->activation_q8_1, GGML_TYPE_COUNT, n_embd, n_embd,
+    uint32_t quantized_bytes = 0;
+    if (quantized != nullptr && n_embd <= MOE_GROUPED_ADMIT_WIDTH && n_embd % MATRIX_ROW_PADDING == 0) {
+        quantize_row_q8_1_cuda(activation, nullptr, quantized, GGML_TYPE_COUNT, n_embd, n_embd,
             n_embd, n_embd, n_embd, 1, 1, 1, stream);
+        quantized_bytes = (uint32_t) (n_embd / QK8_1 * sizeof(block_q8_1));
     }
-    moe_grouped_admit_publish_activation<<<1, 256, 0, stream>>>(packet, activation, (uint32_t) n_embd);
+    moe_grouped_admit_publish_activation<<<1, 256, 0, stream>>>(packet, activation, (uint32_t) n_embd,
+        quantized_bytes != 0 ? quantized : nullptr, quantized_bytes);
     return moe_grouped_cuda_success(cudaGetLastError());
 }
 
@@ -11739,6 +11827,11 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         }
 
         const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
+        // The worker must be done with the previous packet before the planner rewrites its routes.
+        if (moe_grouped_admit_doorbell_enabled() && device.admit_publication_device != nullptr) {
+            moe_grouped_admit_doorbell<<<1, 1, 0, compute_stream>>>(device.admit_publication_device, 200000000ull);
+            CUDA_CHECK(cudaGetLastError());
+        }
         moe_grouped_plan_decode<<<1, plan_threads, 0, compute_stream>>>(
             static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
             device.n_experts, resource->snapshot.n_slots, resource->snapshot.n_slots,
@@ -11750,10 +11843,6 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.admit_slot_for_expert, n_rows == 1, device.admit_publication_device,
             moe_grouped_admit_quota(resource->snapshot.n_slots));
         CUDA_CHECK(cudaGetLastError());
-        if (moe_grouped_admit_doorbell_enabled() && device.admit_publication_device != nullptr) {
-            moe_grouped_admit_doorbell<<<1, 1, 0, compute_stream>>>(device.admit_publication_device, 200000000ull);
-            CUDA_CHECK(cudaGetLastError());
-        }
         auto * debug = impl_->debug_stats();
         uint64_t * transfer_counters = debug != nullptr && device.occupied_slot != nullptr ?
             debug->device_transfers.load(std::memory_order_acquire) : nullptr;
@@ -17733,7 +17822,7 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
         ggml_cuda_moe_add_phase_stats(aggregate.phase_stats[phase], moe_cache_take_op_stats(g_moe_cache_op_stats[phase], true));
     }
     if (moe_grouped_admit_shadow_enabled()) {
-        uint64_t hot = 0, cold = 0, fills = 0, publications = 0, timeouts = 0, parity_routes = 0;
+        uint64_t hot = 0, cold = 0, fills = 0, publications = 0, timeouts = 0, parity_routes = 0, stale = 0;
         double parity_sum = 0.0, parity_max = 0.0;
         uint32_t last_published = 0;
         std::lock_guard<std::mutex> owner_registry_lock(owners.mutex);
@@ -17758,6 +17847,7 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
                     publications += published->sequence;
                     last_published = published->count;
                     timeouts += published->timeouts;
+                    stale += published->stale;
                     parity_routes += published->parity_count;
                     parity_sum += published->parity_sum;
                     parity_max = std::max<double>(parity_max, published->parity_max);
@@ -17787,6 +17877,14 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
                     stats.act_q8_k / stats.act_samples, stats.act_between / stats.act_samples);
             }
         }
+        GGML_LOG_INFO("moe-admit-race: skipped=%llu torn=%llu stale_removed=%llu stale_live=%llu unplanned=%llu plans=%llu publications=%llu\n",
+            (unsigned long long) moe_grouped_admit_worker_instance().skipped.load(),
+            (unsigned long long) moe_grouped_admit_worker_instance().torn.load(),
+            (unsigned long long) moe_grouped_admit_worker_instance().stale_total.load(),
+            (unsigned long long) stale,
+            (unsigned long long) moe_grouped_admit_worker_instance().unplanned.load(),
+            (unsigned long long) moe_grouped_admit_worker_instance().plans_total.load(),
+            (unsigned long long) moe_grouped_admit_worker_instance().sequences_total.load());
         if (worker_routes != 0) {
             GGML_LOG_INFO("moe-admit-worker: handled_by_owner=%llu routes=%llu total_ms=%.1f per_route_us=%.1f\n",
                 (unsigned long long) moe_grouped_admit_worker_instance().handled_routes.load(std::memory_order_relaxed),

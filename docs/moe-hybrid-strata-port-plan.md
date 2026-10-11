@@ -1515,7 +1515,50 @@ The first hybrid run also crashed at exit with an access violation. The worker k
 
 Validation: Release build/relink, insertion probe, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/run-qwen-kld.py`, `build/qwen-kld-*.log`.
 
-Next: find the nondeterminism in the substituted path, then repeat the KL measurement to a stable value; only then let admission decide and move the doorbell wait to the combine.
+### The nondeterminism, found
+
+Bisection first ruled things out: one CPU thread still varied, so not the row pool; the ggml helper instead of the Q8_1 kernels still varied, so not the kernels. Worker counters showed no skipped sequences, no torn reads, no stale comparisons, no publications without a plan, and planner runs equal to publications, 36,575 in every run. Each of those hypotheses was tested and was wrong, and each fix made on the way closes a genuine ordering hazard, so they stay:
+
+- the doorbell wait now runs before the planner rewrites a packet, not after;
+- the comparison refuses a packet it has already compared;
+- the worker refuses routes planned for a different publication;
+- the comparison reads host written results through volatile loads, since the GPU's caches do not observe host writes;
+- the Q8_1 bytes are quantized into device scratch and copied by the publishing kernel, where every thread fences at system scope before the sequence is raised.
+
+The answer came from tracing. Under `LLAMA_MOE_ADMIT_TRACE` the worker writes, per packet, the cold experts and hashes of the activation, the Q8_1 bytes and the results. Two runs that differed first disagreed at `blk.1 seq=5` with an identical activation but a different cold set: experts 298 and 324 were resident in one run and cold in the other, although the fill phase, tokens one to four, had identical routes. So the admission state started differently. `admit_slot_for_expert` was initialized to -1 with a plain `cudaMemset` on the default stream, unordered against the non blocking compute stream; fresh device memory often reads as zero, which means resident in slot 0; whenever the first planner launch overtook the memset, some experts counted as resident without consuming a fill, and how many depended on timing. The array is now cleared with `cudaMemsetAsync` on the compute stream, next to the plan's own clear.
+
+Result, four repeats identical to every digit:
+
+| run | mean KLD | median | 99% | max | same top token |
+| --- | --- | --- | --- | --- | --- |
+| control, no substitution | 0.000000 | | | | 100.000% |
+| substitution, all four runs | 0.008628 \u00b1 0.001936 | 0.000091 | 0.1454 | 0.5865 | 98.942% |
+
+This is a real measurement now, under the conditions stated: all 48 layers on shared Q8_1, 32 slots, decode-only no evict admission, every cold route's CPU value substituted, 768 tokens of one technical text. The median is tiny and the mean comes from a few uncertain positions. Whether 0.0086 is acceptable needs a reference point, for example the KLD between this IQ3_S model and a higher precision quantization of the same weights, which no run here has measured.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, full MoE suite, 3/3 MoE CTests and diff check passed; a run with every gate off printed no hybrid lines. Artifacts: `build/qwen-kld-hybrid-initr{1,2,3,4}.log`, `build/qwen-kld-hybrid-control3.log`, `build/qwen-trace-{1..5}.txt`, `build/hybrid-determinism-{probe,layer,range,full}.log`, `build/patch_*.py`.
+
+### The hybrid's divergence, to scale
+
+Two references, same text, 6 chunks of 128 tokens.
+
+First, what llama.cpp already ships: the IQ3_S model with every expert on the CPU, `--cpu-moe` without the cache, against the same GPU only base. Mean KLD 0.007403 \u00b1 0.001194, median 8.0e-05, 99% 0.129, same top token 98.942%. The hybrid against the same base was 0.008628 \u00b1 0.001936 with an identical same top rate. So the hybrid departs from GPU only about as far as the existing CPU expert path does, within the stated error.
+
+Second, distance from better weights. `build/run-qwen-kld-ref.py` saves base logits from the unsloth UD Q4_K_XL quantization of the same model, 103.7 GiB, same architecture and 248,320 token vocabulary, using batched evaluation so it reads each expert once per chunk; then it measures three IQ3_S variants against it with `-ub 1`:
+
+| IQ3_S variant vs Q4_K_XL | mean KLD | median | 99% | same top token | PPL (ref 1.512) |
+| --- | --- | --- | --- | --- | --- |
+| GPU only, 32 slots | 0.1241 \u00b1 0.0171 | 0.00119 | 1.505 | 92.86% | 1.573 \u00b1 0.111 |
+| hybrid, shared Q8_1, all cold routes substituted | 0.1264 \u00b1 0.0173 | 0.00116 | 1.574 | 93.12% | 1.591 \u00b1 0.114 |
+| all experts on CPU | 0.1178 \u00b1 0.0162 | 0.00110 | 1.315 | 92.59% | 1.572 \u00b1 0.108 |
+
+The step from IQ3_S to Q4_K_XL is about 0.12 KLD, roughly fifteen times the hybrid's own divergence from GPU only, and the three IQ3_S variants are indistinguishable from each other within the error at this sample size. In plain terms, the hybrid's numerical effect is small next to the quantization the user already chose, and comparable to llama.cpp's existing CPU expert path.
+
+Limits: one technical text, 768 tokens; the reference used batched evaluation while the IQ3_S runs decoded token by token, which affects all three rows equally; the substitution covers cold routes at 32 slots and a hybrid run with fewer slots would substitute more; sampling and speculation acceptance remain untested.
+
+Artifacts: `build/run-qwen-kld-ref.py`, `build/qwen-kld-ref-q4kxl-{base,gpu,hybrid,cpumoe}.log`, `build/qwen-kld-cpumoe.log`.
+
+Next: let admission decide so cold routes are skipped on the GPU, and move the doorbell wait to the combine for real overlap.
 
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
