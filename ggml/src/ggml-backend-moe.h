@@ -60,6 +60,16 @@ typedef bool (*ggml_backend_moe_hybrid_shadow_t)(
         bool gelu,
         struct ggml_backend_moe_hybrid_shadow_result * result);
 
+// Lets the owner compute cold routes with its own CPU path. Results are n_embd floats per route, written
+// result_stride floats apart. Return false to let the backend fall back. Clear with a null handler before
+// the user data is destroyed; clearing waits for a call in progress.
+#define GGML_BACKEND_MOE_HYBRID_SET_COLD_HANDLER_PROC_NAME "ggml_backend_moe_hybrid_set_cold_handler"
+
+typedef bool (*ggml_backend_moe_hybrid_cold_handler_t)(
+        void * user, const struct ggml_tensor * down, const float * activation,
+        const int32_t * experts, uint32_t count, float * results, size_t result_stride);
+typedef void (*ggml_backend_moe_hybrid_set_cold_handler_t)(ggml_backend_moe_hybrid_cold_handler_t handler, void * user);
+
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC 0x4d4f4532u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION 2u
 

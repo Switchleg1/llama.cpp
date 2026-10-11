@@ -1285,6 +1285,13 @@ void test_hybrid_frozen_partition() {
                 ggml_context_ptr hot_ctx(ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false),
                     nullptr, true}));
                 CHECK(hot_ctx != nullptr);
+                {
+                    // source_data must be the device slot arena, not the host backing of the cached tensor.
+                    cudaPointerAttributes attributes = {};
+                    CUDA_OK(cudaPointerGetAttributes(&attributes, gate_bank.source_data));
+                    fprintf(stderr, "test-moe-cache: bank source_data type=%d device=%d host_ptr=%d\n",
+                        (int) attributes.type, attributes.device, attributes.hostPointer != nullptr);
+                }
                 const auto bank_tensor = [&](const ggml_cuda_moe_grouped_bank_descriptor & bank) {
                     auto * tensor = ggml_new_tensor_3d(hot_ctx.get(), bank.tensor->type, n_dim, n_dim, frozen_slots);
                     CHECK(bank.expert_stride == ggml_nbytes(tensor) / frozen_slots);
@@ -1311,10 +1318,13 @@ void test_hybrid_frozen_partition() {
                 ggml_build_forward_expand(hot_graph, hot_out);
                 ggml_gallocr_ptr hot_allocator(ggml_gallocr_new(ggml_backend_cuda_buffer_type(0)));
                 CHECK(ggml_gallocr_alloc_graph(hot_allocator.get(), hot_graph));
-                // The slot arena is copied so this test owns the storage; the layout and indexing are the bank's.
+                // Copy the device slot arena, not the cached tensor's host backing: only the arena is
+                // indexed by slot, and the two hold different experts once residency is not the identity.
                 for (const auto & pair : {std::make_pair(gate_slots, &gate_bank), std::make_pair(up_slots, &up_bank),
                                           std::make_pair(down_slots, &down_bank)}) {
-                    CUDA_OK(cudaMemcpyAsync(pair.first->data, pair.second->source_data, ggml_nbytes(pair.first),
+                    const void * arena = context->get_group_bank_device_data(held, pair.second->tensor);
+                    CHECK(arena != nullptr);
+                    CUDA_OK(cudaMemcpyAsync(pair.first->data, arena, ggml_nbytes(pair.first),
                         cudaMemcpyDeviceToDevice, stream));
                 }
                 // Ids and rows stay on the device: the selector's output is consumed where it was produced.

@@ -3913,14 +3913,87 @@ static __device__ bool moe_device_prefetch_ready(uint32_t * completion) {
 // Mapped host memory the planner publishes cold routes into, with Strata's fence then sequence order.
 // The CPU half reads it without a device copy, which is what keeps the publication capture-legal.
 #define MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY 256
+#define MOE_GROUPED_ADMIT_RESULT_ROUTES 4
+#define MOE_GROUPED_ADMIT_WIDTH 4096
 struct moe_grouped_admit_publication {
     uint32_t sequence;
     uint32_t count;
     uint32_t acknowledged;  // written by the CPU worker once it has consumed the packet
     uint32_t timeouts;      // the device gave up waiting, so the handshake is not reliable
+    uint32_t n_embd;
+    uint32_t computed;      // routes the worker actually evaluated, bounded by the result storage
+    uint32_t parity_count;
+    float    parity_sum;
+    float    parity_max;
     int32_t  routes[MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY];
     int32_t  experts[MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY];
+    float    activation[MOE_GROUPED_ADMIT_WIDTH];
+    float    results[MOE_GROUPED_ADMIT_RESULT_ROUTES * MOE_GROUPED_ADMIT_WIDTH];
 };
+
+// Compares the CPU half's results with the GPU's own output for the same routes, on the device, so it
+// stays legal under graph capture. Waits for the acknowledgement of the packet it reads.
+static __global__ void moe_grouped_admit_compare(
+        moe_grouped_admit_publication * publication, float * down_output, int64_t n_embd,
+        int64_t n_routes, int64_t routes_per_row, uint64_t spin_limit, bool substitute) {
+    if (publication == nullptr || down_output == nullptr || threadIdx.x != 0) {
+        return;
+    }
+    volatile uint32_t * acknowledged = &publication->acknowledged;
+    const uint32_t want = publication->sequence;
+    uint64_t spin = 0;
+    while (*acknowledged != want && spin < spin_limit) {
+        ++spin;
+    }
+    if (*acknowledged != want || publication->n_embd != (uint32_t) n_embd) {
+        return;
+    }
+    __threadfence_system();
+    for (uint32_t index = 0; index < publication->computed; ++index) {
+        const int32_t route = publication->routes[index];
+        if (route < 0 || route >= n_routes || route >= routes_per_row) {
+            continue;
+        }
+        const float * reference = publication->results + (size_t) index * MOE_GROUPED_ADMIT_WIDTH;
+        float * produced = down_output + (size_t) route * n_embd;
+        double error = 0.0, norm = 0.0;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            const double difference = (double) reference[i] - produced[i];
+            error += difference * difference;
+            norm  += (double) produced[i] * produced[i];
+        }
+        const float nmse = (float) (norm > 0.0 ? error / norm : error);
+        publication->parity_sum += nmse;
+        publication->parity_max = nmse > publication->parity_max ? nmse : publication->parity_max;
+        ++publication->parity_count;
+        if (substitute) {
+            // Take the CPU half's value for this route, which is what a real split would produce.
+            for (int64_t i = 0; i < n_embd; ++i) {
+                produced[i] = reference[i];
+            }
+        }
+    }
+    __threadfence_system();
+}
+
+// Publishes the layer activation the cold routes need, then announces the whole packet. The sequence is
+// raised here and not in the planner, so a reader never sees routes without their activation.
+static __global__ void moe_grouped_admit_publish_activation(
+        moe_grouped_admit_publication * publication, const float * activation, uint32_t n_embd) {
+    if (publication == nullptr || activation == nullptr) {
+        return;
+    }
+    for (uint32_t i = threadIdx.x; i < n_embd && i < MOE_GROUPED_ADMIT_WIDTH; i += blockDim.x) {
+        publication->activation[i] = activation[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        publication->n_embd = n_embd < MOE_GROUPED_ADMIT_WIDTH ? n_embd : MOE_GROUPED_ADMIT_WIDTH;
+        __threadfence_system();
+        publication->sequence = publication->sequence + 1;
+        __threadfence_system();
+    }
+}
 
 // Strata's doorbell: spin until the CPU acknowledges this packet. Bounded here, because a lost worker
 // would otherwise hang the device, and this path carries no results yet.
@@ -3945,13 +4018,166 @@ static bool moe_grouped_admit_shadow_enabled() {
     return enabled;
 }
 
+// Caps the shadow policy's per-layer quota, so cold routes can be observed before graph capture begins.
+static uint32_t moe_grouped_admit_quota(uint32_t n_slots) {
+    static const uint32_t quota = []() -> uint32_t {
+        const char * value = getenv("LLAMA_MOE_ADMIT_QUOTA");
+        return value != nullptr ? (uint32_t) atoi(value) : 0;
+    }();
+    return quota != 0 && quota < n_slots ? quota : n_slots;
+}
+
+static bool moe_grouped_admit_doorbell_enabled() {
+    static const bool enabled = getenv("LLAMA_MOE_ADMIT_DOORBELL") != nullptr;
+    return enabled && moe_grouped_admit_shadow_enabled();
+}
+
+// The CPU half of the split: computes the published cold routes from the host-side expert weights.
+struct moe_grouped_admit_bank {
+    const void * data = nullptr;   // host backing of the cached tensor, indexed by expert
+    size_t expert_stride = 0;
+    int64_t ne0 = 0;
+    int64_t ne1 = 0;
+    size_t row_stride = 0;
+    ggml_type type = GGML_TYPE_COUNT;
+};
+
+struct moe_grouped_admit_group {
+    moe_grouped_admit_publication * packet = nullptr;
+    const ggml_tensor * down_tensor = nullptr;
+    moe_grouped_admit_bank gate;
+    moe_grouped_admit_bank up;
+    moe_grouped_admit_bank down;
+};
+
+// One quantized matrix times one dense vector, dequantizing a row at a time.
+static void moe_grouped_admit_project(
+        const moe_grouped_admit_bank & bank, int32_t expert, const float * input, float * output,
+        std::vector<float> & scratch) {
+    const auto * traits = ggml_get_type_traits(bank.type);
+    if (traits == nullptr || traits->to_float == nullptr) {
+        return;
+    }
+    scratch.resize((size_t) bank.ne0);
+    const auto * base = static_cast<const char *>(bank.data) + (size_t) expert * bank.expert_stride;
+    for (int64_t row = 0; row < bank.ne1; ++row) {
+        traits->to_float(base + (size_t) row * bank.row_stride, scratch.data(), bank.ne0);
+        double sum = 0.0;
+        for (int64_t i = 0; i < bank.ne0; ++i) {
+            sum += (double) scratch[i] * input[i];
+        }
+        output[row] = (float) sum;
+    }
+}
+
+struct moe_grouped_admit_worker {
+    std::vector<moe_grouped_admit_group> groups;
+    std::vector<moe_grouped_admit_publication *> packets;
+    std::mutex mutex;
+    std::thread thread;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> acknowledged{0};
+    std::atomic<uint64_t> compute_us{0};
+    std::atomic<uint64_t> handled_routes{0};
+    ggml_backend_moe_hybrid_cold_handler_t handler = nullptr;
+    void * handler_user = nullptr;
+
+    void set_handler(ggml_backend_moe_hybrid_cold_handler_t fn, void * user) {
+        std::lock_guard<std::mutex> lock(mutex);   // waits for a call in progress
+        handler = fn;
+        handler_user = user;
+    }
+    std::atomic<uint64_t> computed_routes{0};
+
+    void add(const moe_grouped_admit_group & group) {
+        std::lock_guard<std::mutex> lock(mutex);
+        groups.push_back(group);
+        packets.push_back(group.packet);
+        if (!thread.joinable()) {
+            thread = std::thread([this]() { run(); });
+        }
+    }
+
+    void compute(const moe_grouped_admit_group & group) {
+        auto * packet = group.packet;
+        const uint32_t n_embd = packet->n_embd;
+        if (n_embd == 0 || group.gate.data == nullptr || group.gate.ne0 != (int64_t) n_embd ||
+                group.down.ne1 != (int64_t) n_embd || group.gate.ne1 > MOE_GROUPED_ADMIT_WIDTH) {
+            packet->computed = 0;
+            return;
+        }
+        const uint32_t count = std::min<uint32_t>(packet->count, MOE_GROUPED_ADMIT_RESULT_ROUTES);
+        std::vector<float> gate(group.gate.ne1), up(group.up.ne1), scratch;
+        for (uint32_t index = 0; index < count; ++index) {
+            const int32_t expert = packet->experts[index];
+            if (expert < 0) {
+                continue;
+            }
+            moe_grouped_admit_project(group.gate, expert, packet->activation, gate.data(), scratch);
+            moe_grouped_admit_project(group.up, expert, packet->activation, up.data(), scratch);
+            for (size_t i = 0; i < gate.size(); ++i) {
+                gate[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];   // SiLU gate times up
+            }
+            moe_grouped_admit_project(group.down, expert, gate.data(),
+                packet->results + (size_t) index * MOE_GROUPED_ADMIT_WIDTH, scratch);
+        }
+        packet->computed = count;
+    }
+
+    void run() {
+        while (!stop.load(std::memory_order_relaxed)) {
+            bool progressed = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (auto & group : groups) {
+                    auto * packet = group.packet;
+                    const uint32_t sequence = packet->sequence;
+                    if (packet->acknowledged != sequence) {
+                        const auto started = std::chrono::steady_clock::now();
+                        const uint32_t count = std::min<uint32_t>(packet->count, MOE_GROUPED_ADMIT_RESULT_ROUTES);
+                        if (handler != nullptr && count != 0 && packet->n_embd != 0 &&
+                                handler(handler_user, group.down_tensor, packet->activation, packet->experts, count,
+                                    packet->results, MOE_GROUPED_ADMIT_WIDTH)) {
+                            packet->computed = count;
+                            handled_routes.fetch_add(count, std::memory_order_relaxed);
+                        } else {
+                            compute(group);
+                        }
+                        compute_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - started).count(), std::memory_order_relaxed);
+                        computed_routes.fetch_add(packet->computed, std::memory_order_relaxed);
+                        packet->acknowledged = sequence;
+                        acknowledged.fetch_add(1, std::memory_order_relaxed);
+                        progressed = true;
+                    }
+                }
+            }
+            if (!progressed) {
+                std::this_thread::yield();
+            }
+        }
+    }
+
+    ~moe_grouped_admit_worker() {
+        stop.store(true, std::memory_order_relaxed);
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
+
+static moe_grouped_admit_worker & moe_grouped_admit_worker_instance() {
+    static moe_grouped_admit_worker worker;
+    return worker;
+}
+
 // Replays Strata's admission beside the real one: a miss takes a free slot, never evicts, and only
 // decode may fill. Counts only, the assignment below is unchanged.
 static __device__ void moe_grouped_admit_shadow(
         const int32_t * ids, uint32_t n_routes, uint32_t top_k, uint32_t row_stride,
         uint32_t n_experts, uint32_t n_slots, bool is_decode,
         int32_t * admit_slots, moe_grouped_decode_plan * plan,
-        moe_grouped_admit_publication * publication) {
+        moe_grouped_admit_publication * publication, uint32_t quota) {
     if (admit_slots == nullptr || threadIdx.x != 0) {
         return;
     }
@@ -3965,7 +4191,7 @@ static __device__ void moe_grouped_admit_shadow(
         }
         if (admit_slots[expert] >= 0) {
             ++plan->admit_hot;
-        } else if (is_decode && plan->admit_fills < n_slots) {
+        } else if (is_decode && plan->admit_fills < quota) {
             admit_slots[expert] = (int32_t) plan->admit_fills;
             ++plan->admit_fills;
             ++plan->admit_hot;
@@ -3980,9 +4206,7 @@ static __device__ void moe_grouped_admit_shadow(
     }
     if (publication != nullptr) {
         publication->count = published;
-        // The payload must be visible to the host before the sequence that announces it.
-        __threadfence_system();
-        publication->sequence = publication->sequence + 1;
+        // Visible before the activation kernel raises the sequence that announces the packet.
         __threadfence_system();
     }
 }
@@ -4010,12 +4234,13 @@ static __global__ void moe_grouped_plan_decode(
         uint32_t * prefetch_completion = nullptr,
         int32_t * admit_slots = nullptr,
         bool admit_is_decode = false,
-        moe_grouped_admit_publication * admit_publication = nullptr) {
+        moe_grouped_admit_publication * admit_publication = nullptr,
+        uint32_t admit_quota = 0) {
     if (blockIdx.x != 0) {
         return;
     }
     moe_grouped_admit_shadow(ids, n_routes, top_k, row_stride, n_experts, n_slots, admit_is_decode,
-        admit_slots, plan, admit_publication);
+        admit_slots, plan, admit_publication, admit_quota);
 
     __shared__ int32_t warp_route_experts[WARP_SIZE];
     __shared__ uint32_t warp_frequencies[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
@@ -7416,6 +7641,29 @@ struct ggml_cuda_moe_grouped_context::impl {
                 return nullptr;
             }
             memset(result->admit_publication_host, 0, sizeof(moe_grouped_admit_publication));
+            if (moe_grouped_admit_doorbell_enabled()) {
+                moe_grouped_admit_group group;
+                group.packet = result->admit_publication_host;
+                for (const auto & descriptor : snapshot.banks) {
+                    moe_grouped_admit_bank described;
+                    described.data = descriptor.source_data;
+                    described.expert_stride = descriptor.expert_stride;
+                    described.ne0 = descriptor.ne[0];
+                    described.ne1 = descriptor.ne[1];
+                    described.row_stride = descriptor.nb[1];
+                    described.type = static_cast<ggml_type>(descriptor.type);
+                    switch (descriptor.role) {
+                        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT: group.gate = described; break;
+                        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT:   group.up   = described; break;
+                        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT:
+                            group.down = described;
+                            group.down_tensor = descriptor.tensor;
+                            break;
+                        default: break;
+                    }
+                }
+                moe_grouped_admit_worker_instance().add(group);
+            }
         }
         if (!moe_grouped_cuda_success(cudaMalloc(&result->slot_for_expert, n_experts * sizeof(int32_t))) ||
                 !moe_grouped_cuda_success(cudaMalloc(&result->expert_for_slot, snapshot.n_slots * sizeof(int32_t))) ||
@@ -9100,6 +9348,84 @@ bool ggml_cuda_moe_grouped_context::device_slot_for_expert_for_test(
     moe_grouped_device_scope device_scope(impl_->device);
     return moe_grouped_cuda_success(cudaMemcpy(
         slot, resource->device->slot_for_expert + expert, sizeof(*slot), cudaMemcpyDeviceToHost));
+}
+
+bool ggml_cuda_moe_grouped_context::publish_admit_activation(
+        const ggml_cuda_moe_candidate_group_key & key,
+        const float * activation,
+        int64_t n_embd,
+        cudaStream_t stream) {
+    if (!moe_grouped_admit_doorbell_enabled() || activation == nullptr || stream == nullptr || n_embd <= 0) {
+        return false;
+    }
+    moe_grouped_admit_publication * packet = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (key.generation != impl_->state.generation || key.group_index >= impl_->resources.size()) {
+            return false;
+        }
+        const auto * resource = impl_->resources[key.group_index].get();
+        if (resource == nullptr || resource->device == nullptr) {
+            return false;
+        }
+        packet = resource->device->admit_publication_device;
+    }
+    if (packet == nullptr) {
+        return false;
+    }
+    moe_grouped_admit_publish_activation<<<1, 256, 0, stream>>>(packet, activation, (uint32_t) n_embd);
+    return moe_grouped_cuda_success(cudaGetLastError());
+}
+
+
+void ggml_cuda_moe_grouped_context::compare_admit_results(
+        const ggml_cuda_moe_candidate_group_key & key,
+        const ggml_tensor * down_output,
+        cudaStream_t stream) {
+    if (!moe_grouped_admit_doorbell_enabled() || down_output == nullptr || stream == nullptr ||
+            down_output->type != GGML_TYPE_F32 || !ggml_is_contiguous(down_output)) {
+        return;
+    }
+    moe_grouped_admit_publication * packet = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (key.generation != impl_->state.generation || key.group_index >= impl_->resources.size()) {
+            return;
+        }
+        const auto * resource = impl_->resources[key.group_index].get();
+        if (resource == nullptr || resource->device == nullptr) {
+            return;
+        }
+        packet = resource->device->admit_publication_device;
+    }
+    const int64_t n_embd = down_output->ne[0];
+    const int64_t n_routes = down_output->ne[1] * down_output->ne[2];
+    if (packet == nullptr || n_embd <= 0 || n_routes <= 0) {
+        return;
+    }
+    // Only the first row's activation is published, so only its routes can be compared.
+    const int64_t routes_per_row = down_output->ne[2] > 1 ? down_output->ne[1] : n_routes;
+    static const bool substitute = getenv("LLAMA_MOE_ADMIT_SUBSTITUTE") != nullptr;
+    moe_grouped_admit_compare<<<1, 1, 0, stream>>>(packet, static_cast<float *>(down_output->data),
+        n_embd, n_routes, routes_per_row, 200000000ull, substitute);
+    (void) moe_grouped_cuda_success(cudaGetLastError());
+}
+
+void * ggml_cuda_moe_grouped_context::get_group_bank_device_data(
+        const ggml_cuda_moe_grouped_transaction & transaction,
+        const ggml_tensor * tensor) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto * resource = impl_->find_resource(transaction);
+    if (resource == nullptr || resource->device == nullptr || tensor == nullptr) {
+        return nullptr;
+    }
+    for (uint32_t bank_index = 0; bank_index < resource->snapshot.banks.size(); ++bank_index) {
+        if (resource->snapshot.banks[bank_index].tensor == tensor &&
+                bank_index < resource->device->bank_data.size()) {
+            return resource->device->bank_data[bank_index];
+        }
+    }
+    return nullptr;
 }
 
 void * ggml_cuda_moe_grouped_context::device_bank_data_for_test(
@@ -11305,8 +11631,13 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
             device_prefetch_job != nullptr ? impl_->early[0]->positions[device_prefetch_job->lane] : nullptr,
             device_prefetch_job != nullptr ? impl_->device_prefetch->copy_done + device_prefetch_job->lane : nullptr,
-            device.admit_slot_for_expert, n_rows == 1, device.admit_publication_device);
+            device.admit_slot_for_expert, n_rows == 1, device.admit_publication_device,
+            moe_grouped_admit_quota(resource->snapshot.n_slots));
         CUDA_CHECK(cudaGetLastError());
+        if (moe_grouped_admit_doorbell_enabled() && device.admit_publication_device != nullptr) {
+            moe_grouped_admit_doorbell<<<1, 1, 0, compute_stream>>>(device.admit_publication_device, 200000000ull);
+            CUDA_CHECK(cudaGetLastError());
+        }
         auto * debug = impl_->debug_stats();
         uint64_t * transfer_counters = debug != nullptr && device.occupied_slot != nullptr ?
             debug->device_transfers.load(std::memory_order_acquire) : nullptr;
@@ -17256,6 +17587,10 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
     }
 }
 
+void ggml_backend_cuda_moe_hybrid_set_cold_handler(ggml_backend_moe_hybrid_cold_handler_t handler, void * user) {
+    moe_grouped_admit_worker_instance().set_handler(handler, user);
+}
+
 ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats() {
     moe_cache_telemetry aggregate;
     auto & owners = moe_cache_owner_telemetry_state();
@@ -17282,7 +17617,8 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
         ggml_cuda_moe_add_phase_stats(aggregate.phase_stats[phase], moe_cache_take_op_stats(g_moe_cache_op_stats[phase], true));
     }
     if (moe_grouped_admit_shadow_enabled()) {
-        uint64_t hot = 0, cold = 0, fills = 0, publications = 0;
+        uint64_t hot = 0, cold = 0, fills = 0, publications = 0, timeouts = 0, parity_routes = 0;
+        double parity_sum = 0.0, parity_max = 0.0;
         uint32_t last_published = 0;
         std::lock_guard<std::mutex> owner_registry_lock(owners.mutex);
         for (ggml_cuda_moe_grouped_context * owner : owners.active) {
@@ -17305,14 +17641,31 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
                 if (published != nullptr) {
                     publications += published->sequence;
                     last_published = published->count;
+                    timeouts += published->timeouts;
+                    parity_routes += published->parity_count;
+                    parity_sum += published->parity_sum;
+                    parity_max = std::max<double>(parity_max, published->parity_max);
                 }
             }
         }
         const uint64_t total = hot + cold;
-        GGML_LOG_INFO("moe-admit-shadow: no-evict decode-only hot=%llu cold=%llu fills=%llu hot-rate=%.2f%% publications=%llu last_cold_routes=%u\n",
+        GGML_LOG_INFO("moe-admit-shadow: no-evict decode-only hot=%llu cold=%llu fills=%llu hot-rate=%.2f%% publications=%llu last_cold_routes=%u acks=%llu timeouts=%llu\n",
             (unsigned long long) hot, (unsigned long long) cold, (unsigned long long) fills,
             total > 0 ? 100.0 * (double) hot / (double) total : 0.0,
-            (unsigned long long) publications, last_published);
+            (unsigned long long) publications, last_published,
+            (unsigned long long) moe_grouped_admit_worker_instance().acknowledged.load(std::memory_order_relaxed),
+            (unsigned long long) timeouts);
+        const uint64_t worker_us = moe_grouped_admit_worker_instance().compute_us.load(std::memory_order_relaxed);
+        const uint64_t worker_routes = moe_grouped_admit_worker_instance().computed_routes.load(std::memory_order_relaxed);
+        if (worker_routes != 0) {
+            GGML_LOG_INFO("moe-admit-worker: handled_by_owner=%llu routes=%llu total_ms=%.1f per_route_us=%.1f\n",
+                (unsigned long long) moe_grouped_admit_worker_instance().handled_routes.load(std::memory_order_relaxed),
+                (unsigned long long) worker_routes, worker_us / 1000.0, (double) worker_us / (double) worker_routes);
+        }
+        if (parity_routes != 0) {
+            GGML_LOG_INFO("moe-admit-parity: cpu vs gpu routes=%llu mean_nmse=%g worst_nmse=%g\n",
+                (unsigned long long) parity_routes, parity_sum / (double) parity_routes, parity_max);
+        }
     }
     const ggml_cuda_moe_grouped_debug_telemetry grouped = aggregate.grouped;
     moe_cache_log_telemetry(std::move(aggregate));

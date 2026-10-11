@@ -15,6 +15,8 @@
 #include <array>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -359,6 +361,16 @@ private:
         bool                done;
     };
     std::vector<moe_hybrid_shadow_entry> moe_hybrid_shadow_pending;
+
+    // CPU half of the hybrid split, one helper per layer, on a pool the inference graph never uses.
+    void moe_hybrid_register_cpu(llm_graph_result * res);
+    static bool moe_hybrid_cold_handler(void * user, const ggml_tensor * down, const float * activation,
+            const int32_t * experts, uint32_t count, float * results, size_t result_stride);
+    std::mutex moe_hybrid_cpu_mutex;
+    std::unordered_map<const ggml_tensor *, std::unique_ptr<llm_graph_moe_hybrid_cpu>> moe_hybrid_cpu;
+    std::vector<float> moe_hybrid_cpu_output;
+    ggml_threadpool_t moe_hybrid_cpu_pool = nullptr;
+    ggml_backend_moe_hybrid_set_cold_handler_t moe_hybrid_set_cold_handler = nullptr;
     ggml_status     graph_compute_certified(ggml_cgraph * gf, const ggml_graph_execution_certificate & certificate);
     bool            moe_graph_supports_required_grouped(ggml_cgraph * gf) const;
     void finish_compute(int64_t n_tokens, int64_t elapsed_us);

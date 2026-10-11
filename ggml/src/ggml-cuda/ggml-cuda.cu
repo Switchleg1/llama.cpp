@@ -2471,9 +2471,15 @@ bool ggml_backend_cuda_moe_hybrid_execute_hot(
                     descriptor.tensor != weight || descriptor.source_data == nullptr) {
                 continue;
             }
+            // descriptor.source_data is the cached tensor's host backing, so the device arena is asked for
+            // separately. Indexing host bytes by slot would read whichever expert shares that index.
+            void * arena = context->get_group_bank_device_data(transaction, weight);
+            if (arena == nullptr) {
+                return false;
+            }
             // Keep the weight's own descriptor, like the grouped path does, and point it at the slot arena.
             *view = *weight;
-            view->data = const_cast<void *>(descriptor.source_data);
+            view->data = arena;
             view->ne[2] = info.n_slots;
             view->nb[3] = view->nb[2] * info.n_slots;
             // The arena is read in place, so its per-slot stride must be the one this view assumes.
@@ -3620,6 +3626,23 @@ static void ggml_cuda_mul_mat_id_cached(
     const bool ids_group_pending = ids_host.group_pending;
     const size_t expert_stride = src0->nb[2];
 
+    // Gate and up run through this cached path for this model, so the cold routes' activation is published
+    // here. The planner has already written the route list for this layer.
+    if (leased_owner != nullptr && dst->src[1] != nullptr && dst->src[1]->type == GGML_TYPE_F32) {
+        ggml_cuda_moe_candidate_bank_info info;
+        if (leased_owner->find_weight(src0, &info)) {
+            ggml_cuda_moe_candidate_group_key key = {};
+            key.generation = info.generation;
+            key.group_index = info.group_index;
+            if (info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) {
+                (void) leased_owner->publish_admit_activation(key,
+                    static_cast<const float *>(dst->src[1]->data), dst->src[1]->ne[0], stream);
+            } else if (info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) {
+                leased_owner->compare_admit_results(key, dst, stream);
+            }
+        }
+    }
+
     // Diagnostic: record the routed experts so admission policies can be replayed offline.
     static FILE * route_dump = []() -> FILE * {
         const char * path = getenv("LLAMA_MOE_ROUTE_DUMP");
@@ -4211,6 +4234,7 @@ static bool ggml_cuda_mul_mat_id(
             return false;
         }
         if (binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) {
+            ctx.moe_grouped_context->compare_admit_results(group->key.candidate, dst, ctx.stream());
             ggml_cuda_moe_hybrid_compact_check(ctx, *group, bank_view, ids_view, dst, use_mmq,
                 static_cast<ggml_cuda_mmid_consumer>(capability.consumer), direct_source_view);
             if (!ctx.moe_grouped_context->finish_graph_group(group, binding, dst, ctx.stream())) {
@@ -6372,6 +6396,12 @@ static int ggml_cuda_try_fuse(
                         }
                     }
                     if (grouped_pair && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
+                        if (src1 != nullptr && src1->type == GGML_TYPE_F32) {
+                            // Gate and up are fused here, so this is where the cold routes' activation lives.
+                            (void) cuda_ctx->moe_grouped_context->publish_admit_activation(
+                                up_group->key.candidate, static_cast<const float *>(src1->data), src1->ne[0],
+                                cuda_ctx->stream());
+                        }
                         ggml_tensor up_view;
                         ggml_tensor gate_view;
                         ggml_tensor ids_view;
@@ -6494,6 +6524,10 @@ static int ggml_cuda_try_fuse(
                     }
                 }
                 if (grouped_pair && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
+                    if (src1 != nullptr && src1->type == GGML_TYPE_F32) {
+                        (void) cuda_ctx->moe_grouped_context->publish_admit_activation(up_group->key.candidate,
+                            static_cast<const float *>(src1->data), src1->ne[0], cuda_ctx->stream());
+                    }
                     ggml_tensor up_view;
                     ggml_tensor gate_view;
                     ggml_tensor ids_view;
@@ -6582,6 +6616,10 @@ static int ggml_cuda_try_fuse(
                     }
                 }
                 if (up_group != nullptr && gate_group == up_group && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
+                    if (up->src[1] != nullptr && up->src[1]->type == GGML_TYPE_F32) {
+                        (void) cuda_ctx->moe_grouped_context->publish_admit_activation(up_group->key.candidate,
+                            static_cast<const float *>(up->src[1]->data), up->src[1]->ne[0], cuda_ctx->stream());
+                    }
                     ggml_tensor up_view;
                     ggml_tensor gate_view;
                     ggml_tensor ids_view;
@@ -8888,6 +8926,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_HYBRID_SET_COLD_HANDLER_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_hybrid_set_cold_handler;
     }
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_SHADOW_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_hybrid_shadow;

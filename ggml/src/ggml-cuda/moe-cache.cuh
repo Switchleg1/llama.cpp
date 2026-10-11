@@ -883,6 +883,14 @@ public:
             size_t capacity);
     bool get_group_resources(const ggml_cuda_moe_grouped_acquisition & acquisition, ggml_cuda_moe_grouped_resource_info * info) const;
     bool get_group_resource_bank(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index, ggml_cuda_moe_grouped_bank_descriptor * descriptor) const;
+    // The device slot arena of one bank. The descriptor's source_data is the host backing instead.
+    void * get_group_bank_device_data(const ggml_cuda_moe_grouped_transaction & transaction, const ggml_tensor * tensor) const;
+    // Publishes this layer's activation to the cold-route packet and announces it. Diagnostic path.
+    bool publish_admit_activation(const ggml_cuda_moe_candidate_group_key & key, const float * activation,
+            int64_t n_embd, ggml_cuda_moe_stream_t stream);
+    // Compares the CPU half's routes with the GPU's own output for the same routes. Synchronizes.
+    void compare_admit_results(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * down_output,
+            ggml_cuda_moe_stream_t stream);
     ggml_cuda_moe_legacy_operation_lease begin_legacy_operation();
     ggml_cuda_moe_legacy_cache_lease acquire_legacy_cache(
             const ggml_tensor * tensor,
@@ -1143,6 +1151,7 @@ bool ggml_cuda_moe_hybrid_scatter_add(
         int64_t capacity, int64_t n_embd, ggml_cuda_moe_stream_t stream);
 bool ggml_cuda_moe_quantize_q8_1_for_test(const float * input, void * output, int64_t width,
         int64_t rows, ggml_cuda_moe_stream_t stream);
+void ggml_backend_cuda_moe_hybrid_set_cold_handler(ggml_backend_moe_hybrid_cold_handler_t handler, void * user);
 ggml_cuda_moe_stream_t ggml_cuda_moe_owner_stream_for_test(ggml_backend_t backend);
 
 struct ggml_cuda_graph_capture_state_for_test {

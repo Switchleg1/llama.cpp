@@ -1158,6 +1158,14 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    if (moe_hybrid_set_cold_handler != nullptr) {
+        moe_hybrid_set_cold_handler(nullptr, nullptr);   // waits for a call in progress
+    }
+    moe_hybrid_cpu.clear();
+    if (moe_hybrid_cpu_pool != nullptr) {
+        ggml_threadpool_free(moe_hybrid_cpu_pool);
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1884,11 +1892,6 @@ void llama_context::moe_hybrid_set_cuts(llm_graph_result * res, ggml_cgraph * gf
 ggml_status llama_context::graph_compute_certified(
         ggml_cgraph * gf, const ggml_graph_execution_certificate & certificate) {
     static const bool ranged = getenv("LLAMA_MOE_HYBRID_RANGES") != nullptr;
-    static bool announced = false;
-    if (!announced) {
-        LLAMA_LOG_WARN("moe-hybrid-ranges: certified dispatch reached, ranged=%d\n", (int) ranged);
-        announced = true;
-    }
     if (!ranged) {
         return ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
     }
@@ -1960,6 +1963,78 @@ void llama_context::moe_hybrid_shadow_regions(int node_end) {
                                   entry.down, entry.gelu, &result);
         LLAMA_LOG_WARN("moe-hybrid-shadow: layer=%d ok=%d routes=%d hot=%d nmse=%g\n", entry.layer, (int) ok,
                        result.n_routes, result.n_hot, result.nmse);
+    }
+}
+
+bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * down, const float * activation,
+        const int32_t * experts, uint32_t count, float * results, size_t result_stride) {
+    auto * ctx = static_cast<llama_context *>(user);
+    std::lock_guard<std::mutex> lock(ctx->moe_hybrid_cpu_mutex);
+    const auto it = ctx->moe_hybrid_cpu.find(down);
+    if (it == ctx->moe_hybrid_cpu.end() || down == nullptr) {
+        return false;
+    }
+    const int64_t n_embd = down->ne[1];
+    if (n_embd <= 0 || (size_t) n_embd > result_stride) {
+        return false;
+    }
+    ctx->moe_hybrid_cpu_output.resize((size_t) count * n_embd);
+    if (!it->second->compute(activation, experts, count, ctx->moe_hybrid_cpu_output.data())) {
+        return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        memcpy(results + (size_t) i * result_stride, ctx->moe_hybrid_cpu_output.data() + (size_t) i * n_embd,
+               (size_t) n_embd * sizeof(float));
+    }
+    return true;
+}
+
+void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
+    static const bool enabled = getenv("LLAMA_MOE_HYBRID_CPU") != nullptr;
+    if (!enabled || res == nullptr) {
+        return;
+    }
+    if (moe_hybrid_set_cold_handler == nullptr) {
+        for (size_t i = 0; i < ggml_backend_reg_count() && moe_hybrid_set_cold_handler == nullptr; ++i) {
+            moe_hybrid_set_cold_handler = (ggml_backend_moe_hybrid_set_cold_handler_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_reg_get(i), GGML_BACKEND_MOE_HYBRID_SET_COLD_HANDLER_PROC_NAME);
+        }
+        if (moe_hybrid_set_cold_handler == nullptr) {
+            return;
+        }
+    }
+    static const int n_threads = []() {
+        const char * value = getenv("LLAMA_MOE_HYBRID_CPU_THREADS");
+        return value != nullptr ? std::max(1, atoi(value)) : 8;
+    }();
+    std::lock_guard<std::mutex> lock(moe_hybrid_cpu_mutex);
+    if (moe_hybrid_cpu_pool == nullptr) {
+        auto params = ggml_threadpool_params_default(n_threads);
+        moe_hybrid_cpu_pool = ggml_threadpool_new(&params);
+        if (moe_hybrid_cpu_pool == nullptr) {
+            return;
+        }
+    }
+    size_t added = 0, refused = 0;
+    for (const auto & region : res->get_moe_regions()) {
+        const auto & ffn = region.hybrid_ffn;
+        if (ffn.down == nullptr || moe_hybrid_cpu.count(ffn.down) != 0) {
+            continue;
+        }
+        auto helper = std::make_unique<llm_graph_moe_hybrid_cpu>();
+        if (!helper->init(ffn, moe_hybrid_cpu_pool, n_threads)) {
+            ++refused;
+            continue;
+        }
+        moe_hybrid_cpu.emplace(ffn.down, std::move(helper));
+        ++added;
+    }
+    if (added != 0) {
+        moe_hybrid_set_cold_handler(moe_hybrid_cold_handler, this);
+    }
+    if (added != 0 || refused != 0) {
+        LLAMA_LOG_WARN("moe-hybrid-cpu: helpers=%zu added=%zu refused=%zu threads=%d\n",
+                       moe_hybrid_cpu.size(), added, refused, n_threads);
     }
 }
 
@@ -2916,6 +2991,7 @@ llm_graph_result * llama_context::process_ubatch(
         place_sampled_inputs(res);
         moe_hybrid_probe_spans(res, gf);
         moe_hybrid_set_cuts(res, gf);
+        moe_hybrid_register_cpu(res);
         sampled_inputs_device = use_sampled_input_async;
         const bool allocated = rebuild_async ? ggml_backend_sched_alloc_graph_async(sched.get(), gf) :
                                                ggml_backend_sched_alloc_graph(sched.get(), gf);
@@ -4372,6 +4448,7 @@ ggml_cgraph * llama_context::graph_reserve(
     place_sampled_inputs(res);
     moe_hybrid_probe_spans(res, gf);
     moe_hybrid_set_cuts(res, gf);
+    moe_hybrid_register_cpu(res);
     if (split_only) {
         if (sizes) {
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);

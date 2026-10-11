@@ -1032,11 +1032,11 @@ Validation: Release build/relink, insertion probe, grouped-layer run, ranged run
 
 ### Resident half executed in place by the backend
 
-Added `ggml_backend_cuda_moe_hybrid_execute_hot()` and `ggml_backend_cuda_moe_hybrid_hot_scratch_bytes()`. Like Strata's hit path, the entry point takes raw device pointers and the slot arena is read in place: bank views are taken from the held transaction's descriptors, the weight's own descriptor is kept and only `data` and the slot extent are replaced, exactly as the grouped path does. Each descriptor's `expert_stride` must equal the stride the view assumes, so a layout disagreement is refused rather than indexed blindly.
+Added `ggml_backend_cuda_moe_hybrid_execute_hot()` and `ggml_backend_cuda_moe_hybrid_hot_scratch_bytes()`. Like Strata's hit path, the entry point takes raw device pointers. CORRECTION, see the arena entry below: this first version pointed the bank view at `descriptor.source_data`, which is the cached tensor's host backing and not the device slot arena, so the claim of an in-place arena read was wrong until that was fixed. Each descriptor's `expert_stride` must equal the stride the view assumes, so a layout disagreement is refused rather than indexed blindly.
 
 It runs up, gate, the gated activation and down over the compact routes, with ids being the hot slots. FFN intermediate storage is caller-owned and sized by the helper. The reused CUDA matmul paths still acquire backend-pool workspace; this helper does not prove allocation-free execution or capture legality. Missing arguments, a stale or inactive transaction, geometry disagreement and undersized scratch are all refused before any launch.
 
-The frozen test now runs the same half both ways and requires the in-place result to be bit-identical to the test-built graph (`NMSE == 0.0`), not merely close. Undersized scratch is checked as a refusal.
+The frozen test runs the same half both ways and requires bit-identical results. CORRECTION: at the time, both paths read the same host backing, so the match proved consistency between two readers of the same bytes, not correctness against the grouped path.
 
 A first version synthesized bank tensors from scratch and crashed in `ggml_backend_buffer_get_usage`, because the CUDA matmul paths read the weight's buffer for padding and cached-buffer checks. Copying the weight tensor and replacing only `data`, `ne[2]` and `nb[3]`, which is what the grouped path already does, fixed it; the test was not adjusted to hide it.
 
@@ -1299,7 +1299,115 @@ Still missing from Strata's mechanism: the wait. There is no doorbell kernel mak
 
 Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed; the smoke matched its reference. Artifacts: `build/hybrid-publish-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-admit-smoke.{py,json,log}`.
 
-Next: a CPU worker that consumes these packets and computes the cold routes, then the return path, results into mapped memory and a doorbell wait before the combine, after which admission can switch from counting to deciding.
+### The doorbell round trip runs
+
+`moe_grouped_admit_doorbell()` is Strata's wait: a one-thread kernel that spins on the mapped acknowledgement until it matches the sequence this packet published, then fences. A host worker thread watches the published packets and acknowledges them, standing in for the CPU half, computing nothing yet. The spin is bounded and counts timeouts, because a lost worker would otherwise hang the device; Strata spins without a limit, which is safe only once the CPU side is guaranteed to answer.
+
+On the real model: `publications=336 acks=336 timeouts=0`, output unchanged. The handshake the hybrid path depends on therefore works in live inference, inside the normal dispatch, with the GPU waiting on host memory.
+
+Cost of the handshake alone, 8 generated tokens at 32 slots: 189.51 ms per token without it, 189.18 with publication only, 194.47 with publication and wait. So roughly 5 ms per token for 48 layers of round trip, about 0.1 ms per layer, with an idle CPU answering immediately. A real worker computing about one cold route per layer will add its own time, and only the part that exceeds the resident half's work is a loss, which is the overlap this design is for. One prompt, one run, no speed claim.
+
+What this still is not: the worker computes nothing, no results return, admission still only counts, and execution is unchanged. The next step is the first one where a wrong result is possible, so it needs the return path and the switch together.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed; both smokes matched their reference. A format string omission that silently dropped the two new counters was fixed rather than left to misreport. Artifacts: `build/hybrid-doorbell-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-doorbell-smoke.{py,json,log}`.
+
+### Correction: the hot half was not reading the slot arena
+
+Before building the return path on `ggml_backend_cuda_moe_hybrid_execute_hot()`, its source was checked rather than assumed. `ggml_cuda_moe_grouped_bank_descriptor::source_data` is `tensor->data`, and a moe-cached buffer allocates host pinned mapped memory, so that pointer is the cached tensor's host backing, not the device slot arena. `cudaPointerGetAttributes` on it reports `type=1`, host memory, which the frozen fixture now asserts on every run.
+
+So the entry point was reading host bytes over PCIe and indexing them by slot, while the host tensor is laid out by expert. The frozen test did not catch it because its reference copied the same `source_data` into slot-shaped tensors: two readers of the same wrong bytes agreed exactly. Pointing the view at the real arena changed the result immediately, `NMSE 3.33665e-04` instead of zero, which is the proof the two sources differ.
+
+Fixed by adding `get_group_bank_device_data()`, which returns the bank's device arena, and using it in both the entry point and the fixture. Both now read the arena, agree bit-exactly again, and the cold oracle comparison still holds, so the arena is the correct source.
+
+Withdrawn claims: that the hot half read the slot arena in place, and that the fixture proved the arena copy redundant. The real-weight validation that still stands is the in-dispatch one, `moe-hybrid-compact` and `moe-hybrid-subset`, because those used `ggml_cuda_moe_group_views()`, which has always pointed at `bank_data`, the true arena.
+
+This also explains why the fixture could not have caught the difference earlier on its own terms: with residency close to the identity, slot and expert indices coincide, so only a changed source exposes it.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed. Artifact: `build/hybrid-arena-{focused,probe,layer,range,staging,full}.log`.
+
+### The CPU half computes the published routes
+
+The worker now evaluates the cold routes instead of only acknowledging them. It reads the expert weights straight from `source_data`, which the correction above established is the cached tensor's host backing indexed by expert, dequantizes a row at a time through `ggml_get_type_traits()->to_float`, and runs gate, up, SiLU and down into mapped result storage. The activation it needs is published by a kernel before the sequence is raised, so a reader never sees routes without their input.
+
+Finding the activation took three attempts, and the first two were wrong rather than merely incomplete. Publishing from the grouped dispatch at the gate or up role never fired; logging the roles that actually arrive there showed only role 4, the down projection. Publishing from the fused gate and up branch never fired either. For this model gate and up run through the legacy cached path, which is also where the earlier route dump came from, so the publication belongs there. Guessing twice cost more than the one log that answered it.
+
+On the real model: `publications=143 acks=143 timeouts=0`, output unchanged. So the whole Strata-shaped chain now runs in live inference: admission decides hot and cold, the planner publishes the cold routes, a kernel publishes the activation and announces the packet, the CPU half computes those routes from host weights, and the device waits on the doorbell.
+
+What is still not connected: the computed results are never read back by the device, so they do not affect the output. Admission still only counts, the resident half still executes every route, and the worker is bounded to four routes per packet with a 4096 wide activation. The dequantize-per-row CPU path is a correctness vehicle, not a fast one.
+
+A scripted edit also damaged unrelated call sites by rewriting `bank.` to `bank.info.` across the file; they were restored from HEAD, and one in a branch excluded by this CUDA version was found by inspecting the diff rather than by the build.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed; the smoke matched its reference. Artifacts: `build/hybrid-cpuhalf-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-doorbell-smoke.{py,json,log}`.
+
+### Parity comparison built, and blocked by where the activation appears
+
+The comparison of the CPU half against the GPU's own output for the same routes is implemented, but it has not produced a number yet, and the reason is worth more than the number would have been.
+
+First attempt compared on the host. It never ran: cold routes only exist once the quota is full, which happens in decodes that are inside a CUDA graph capture, where the host cannot copy or synchronize. A `LLAMA_MOE_ADMIT_QUOTA` cap was added so cold routes appear immediately, which works, `hot-rate=9.23% cold=3050 fills=96` at a quota of two, but it did not help the host comparison because even the first decode is captured.
+
+Second attempt moved the comparison into a kernel that reads the mapped results directly and waits for the acknowledgement itself, which is capture-legal and removes the synchronization. It launches on every decode layer and still accumulated nothing.
+
+Logging each stage with its group index gave the answer. During decode the planner and the comparison run per layer, but the activation publication only happens during prefill. Gate and up take the legacy cached path only there, and that is the only place the publication was hooked, so decode packets carry cold routes with no activation, and the comparison declines correctly. The CPU half is therefore computing prefill activations and the decode comparison has nothing valid to read. That is a wiring gap, not a numerical result, and no parity figure should be quoted from this state.
+
+Two lessons recorded rather than papered over: a quota knob makes the policy observable early, which is useful on its own; and the activation has to be published from wherever the expert input exists in each phase, which for this model is not one place.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed; the smoke matched its reference and the temporary stage logs and device printfs were removed. Artifacts: `build/hybrid-parity-{probe,layer,range,staging,full}.log`, `build/run-qwen-parity-smoke.{py,json,log}`.
+
+### Hit against miss parity, measured on production weights
+
+The activation is now published from the grouped fused gate and up branches as well as the legacy cached path, because at 32 slots decode runs grouped while prefill runs cached. A fresh route dump showed only one decode-flagged call reaching the cached path, which is what identified the missing publication site.
+
+With that, the comparison produces its first real number: `routes=1344 mean_nmse=1.133e-04 worst_nmse=2.287e-04`, CPU half against the GPU's own output for the same experts and the same activations, on the IQ3_S model. Generated text was unchanged.
+
+This is the quantity Strata's `R4.2h` is about. Their activation-scale divergence measured `4.761e-04` relative and changed tokens. The disagreement here is of the same order, so it cannot be dismissed, and it is an upper bound on what a hybrid split would introduce only if the cold path is otherwise identical, which it is not yet: the CPU half dequantizes to float and accumulates in double, while the GPU quantizes the activation to Q8_1 and uses integer dot products. The measurement therefore says the two halves disagree at quantization scale, not that a particular fix is needed. Whether that changes generated tokens is still unmeasured.
+
+The run took 2710 ms per token, about thirty times slower than normal decode, because the worker dequantizes whole experts row by row on one thread and the device waits for it. That is the measurement harness, not a hybrid performance figure, and no speed conclusion follows from it.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed; the smoke matched its reference. Artifacts: `build/hybrid-parity2-{probe,layer,range,staging,full}.log`, `build/run-qwen-parity-smoke.{py,json,log}`, `build/qwen-routes-parity.txt`.
+
+### Does the disagreement move tokens
+
+Under `LLAMA_MOE_ADMIT_SUBSTITUTE` the comparison kernel also writes the CPU half's value into the routed column, replacing what the GPU produced. That is numerically what a real split produces for those routes, so it answers the token question without the rest of the machinery being finished.
+
+With a quota of two, four cold routes per layer per token were substituted. Greedy, seed fixed, 48 generated tokens against a matched baseline differing only by the substitution: output identical, 171 characters, `routes=9024 mean_nmse=1.119e-04 worst_nmse=2.763e-04`.
+
+So at this disagreement level the tokens did not move for this prompt. That is one prompt, one model, 48 greedy tokens, and only four routes per layer; it is evidence against an immediate parity crisis, not proof of token identity. Strata saw tokens change at a similar magnitude, so the honest reading is that the margin is thin rather than comfortable, and a longer or more ambiguous continuation could still diverge. Sampling with temperature, speculation acceptance and MTP are untested here and are more sensitive than greedy decoding.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/hybrid-substitute-{probe,layer,range,full}.log`, `build/run-qwen-substitute-smoke.{py,json,log}`, `build/run-qwen-substitute48-smoke.{py,json,log}`, `build/run-qwen-base48-smoke.{py,json,log}`.
+
+### What the CPU half costs, and why the current worker cannot be the answer
+
+Before spending the risk of letting admission decide, the worker was timed: `routes=1344 total_ms=16823 per_route_us=12517`. Twelve and a half milliseconds for one expert, which explains the 2710 ms per token of the measurement harness and matches it.
+
+Against the measured decode budget of about 75 ms per token in the best ordinary configuration:
+
+| cold routes per layer | routes per token | at 12517 us | at an estimated 170 us |
+| --- | --- | --- | --- |
+| 0.2 | 9.6 | 0.12 s | 1.6 ms |
+| 1.0 | 48 | 0.60 s | 8.2 ms |
+| 1.8 | 86 | 1.08 s | 14.7 ms |
+
+The 170 us estimate is the memory bound for one expert, about 2.15 MiB at the roughly 14 GB/s this machine achieves on this access pattern, and is consistent with the measured CPU `MUL_MAT_ID` rates. So the work itself fits inside the decode window at the residency levels the replay predicts, but only with a kernel that is about seventy times faster than the current one.
+
+The current worker dequantizes each row to float on one thread, which was chosen to get a correct number, not a fast one. The fast path already exists in this port: `llm_graph_moe_hybrid_executor` runs cold experts through ggml's quantized CPU `MUL_MAT_ID` on a borrowed threadpool, and was built and tested earlier. The duplicate in `moe-cache.cu` exists only because the publication lives in the CUDA backend, which cannot call into `llm_graph`.
+
+That is the structural problem to solve next, and it is a wiring question rather than a numerical one: the backend needs to hand cold packets to the existing executor instead of computing them itself.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/hybrid-worker-{probe,layer,range,staging,full}.log`.
+
+### Cold routes computed by the existing CPU helper
+
+The CUDA backend cannot call into `llm_graph`, so the dependency runs the other way. The backend exposes `ggml_backend_moe_hybrid_set_cold_handler` through the existing proc convention, and the worker hands each cold packet to the registered handler, falling back to its own dequantizing path only if the handler declines. Under `LLAMA_MOE_HYBRID_CPU`, `llama_context` registers a handler backed by one `llm_graph_moe_hybrid_cpu` per layer, the helper built and tested earlier, which runs ggml's quantized CPU `MUL_MAT_ID` and borrows the host bank bytes without copying. It uses a dedicated threadpool, eight threads by default, so it never shares the inference pool concurrently. Clearing the handler takes the worker's lock, so context destruction waits for a call in progress before the helpers are freed.
+
+On the real model all 48 layers' helpers initialized, and the owner handled every route: `handled_by_owner=1344 per_route_us=71.9`, against 12517 for the dequantizing worker, about 174 times faster and below the 170 us memory-bound estimate. Over 48 tokens it held at 67.8 us. Decode in the measurement harness fell from 2710 to 236 ms per token.
+
+Parity moved: `mean_nmse=1.96e-04 worst_nmse=8.69e-04`, against 1.1e-04 and 2.8e-04 for the float worker. That is expected, since ggml's CPU path quantizes the activation for its integer dot products while the GPU quantizes it its own way, so two quantized implementations now disagree rather than one exact and one quantized. The worst route exceeds the 5e-4 bound this port has used for whole FFN parity in fixtures. With substitution the 48 token greedy output still matched the baseline exactly, so the tokens did not move here, but the margin is thinner than before, and this is precisely the hazard Strata's fp32 scale rule addresses. It needs a decision before the flag, not a widened tolerance.
+
+Cleanup found two faults of my own. Removals of temporary role logs had silently failed earlier, and a decline diagnostic printed even with every gate off. A disabled run now prints no hybrid lines at all, which is checked rather than assumed.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed; both the 8 and 48 token substituted runs matched their references. Artifacts: `build/hybrid-cpuexec-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-cpuexec-smoke.{py,json,log}`, `build/run-qwen-cpuexec48-smoke.{py,json,log}`.
+
+Next: decide the activation quantization question for the two halves, then let admission decide so cold routes are genuinely absent from the resident half, and replace the device waiting on the doorbell after every layer with genuine overlap.
 
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
