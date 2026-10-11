@@ -1836,6 +1836,177 @@ void llama_context::place_moe_regions(llm_graph_result * res) {
     }
 }
 
+// Cuts the graph at the hybrid seam of every placed region, so the halves can run between splits.
+void llama_context::moe_hybrid_set_cuts(llm_graph_result * res, ggml_cgraph * gf) {
+    static const bool cuts = getenv("LLAMA_MOE_HYBRID_CUTS") != nullptr;
+    if (!cuts || res == nullptr || gf == nullptr) {
+        return;
+    }
+    std::vector<int> boundaries;
+    for (const auto & region : res->get_moe_regions()) {
+        if (region.backend == nullptr) {
+            continue;
+        }
+        const auto span = llm_graph_moe_hybrid_find_span(gf, region);
+        if (!span.valid()) {
+            continue;
+        }
+        boundaries.push_back(span.routing_end);
+        boundaries.push_back(span.expert_end);
+    }
+    if (boundaries.empty()) {
+        return;
+    }
+    if (!ggml_backend_sched_set_split_boundaries(sched.get(), gf, boundaries.data(), (int) boundaries.size())) {
+        LLAMA_LOG_WARN("moe-hybrid-cuts: rejected %zu boundaries\n", boundaries.size());
+        return;
+    }
+    moe_hybrid_cut_nodes = boundaries;
+
+    moe_hybrid_shadow_pending.clear();
+    for (const auto & region : res->get_moe_regions()) {
+        if (region.backend == nullptr) {
+            continue;
+        }
+        const auto span = llm_graph_moe_hybrid_find_span(gf, region);
+        const auto & ffn = region.hybrid_ffn;
+        if (!span.valid() || ffn.gate == nullptr || ffn.up == nullptr || ffn.gate_up != nullptr ||
+                (ffn.type_op != LLM_FFN_SILU && ffn.type_op != LLM_FFN_GELU)) {
+            continue;
+        }
+        moe_hybrid_shadow_pending.push_back({region.backend, region.route, ffn.input, ffn.down_output, ffn.gate,
+                                             ffn.up, ffn.down, span.expert_end, region.layer,
+                                             ffn.type_op == LLM_FFN_GELU, false});
+    }
+}
+
+// Runs the graph one split at a time instead of in one submission. Same work, same order.
+ggml_status llama_context::graph_compute_certified(
+        ggml_cgraph * gf, const ggml_graph_execution_certificate & certificate) {
+    static const bool ranged = getenv("LLAMA_MOE_HYBRID_RANGES") != nullptr;
+    static bool announced = false;
+    if (!announced) {
+        LLAMA_LOG_WARN("moe-hybrid-ranges: certified dispatch reached, ranged=%d\n", (int) ranged);
+        announced = true;
+    }
+    if (!ranged) {
+        return ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+    }
+    for (auto & entry : moe_hybrid_shadow_pending) {
+        entry.done = false;
+    }
+    const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
+    static bool reported = false;
+    if (!reported) {
+        std::vector<int> starts;
+        for (int split = 0; split < n_splits; ++split) {
+            int begin = 0, end = 0;
+            if (ggml_backend_sched_get_split_range(sched.get(), split, &begin, &end)) {
+                starts.push_back(begin);
+            }
+        }
+        size_t honored = 0;
+        for (int cut : moe_hybrid_cut_nodes) {
+            honored += std::find(starts.begin(), starts.end(), cut) != starts.end();
+        }
+        LLAMA_LOG_WARN("moe-hybrid-cuts: splits=%d requested=%zu honored=%zu\n", n_splits,
+                       moe_hybrid_cut_nodes.size(), honored);
+        reported = true;
+    }
+    for (int split = 0; split < n_splits; ++split) {
+        int node_begin = 0, node_end = 0;
+        if (!ggml_backend_sched_get_split_range(sched.get(), split, &node_begin, &node_end)) {
+            LLAMA_LOG_ERROR("%s: split %d has no node range\n", __func__, split);
+            return GGML_STATUS_FAILED;
+        }
+        const ggml_status status =
+            ggml_backend_sched_graph_compute_range(sched.get(), gf, &certificate, node_begin, node_end);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        moe_hybrid_shadow_regions(node_end);
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+// Recomputes the resident half of regions whose experts just ran, and compares. Diagnostic only.
+void llama_context::moe_hybrid_shadow_regions(int node_end) {
+    static const bool shadow = getenv("LLAMA_MOE_HYBRID_SHADOW") != nullptr;
+    if (!shadow || moe_hybrid_shadow_pending.empty()) {
+        return;
+    }
+    static ggml_backend_moe_hybrid_shadow_t shadow_fn = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        for (size_t i = 0; i < ggml_backend_reg_count() && shadow_fn == nullptr; ++i) {
+            shadow_fn = (ggml_backend_moe_hybrid_shadow_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_reg_get(i), GGML_BACKEND_MOE_HYBRID_SHADOW_PROC_NAME);
+        }
+        resolved = true;
+        LLAMA_LOG_WARN("moe-hybrid-shadow: entry point %s grouped_supported=%d slots=%d\n",
+                       shadow_fn != nullptr ? "available" : "missing", (int) moe_hybrid_grouped_supported,
+                       (int) model.moe_expert_cache_slots());
+    }
+    if (shadow_fn == nullptr) {
+        return;
+    }
+    for (auto & entry : moe_hybrid_shadow_pending) {
+        if (entry.done || entry.expert_end != node_end) {
+            continue;
+        }
+        entry.done = true;
+        ggml_backend_moe_hybrid_shadow_result result = {};
+        const bool ok = shadow_fn(entry.backend, entry.ids, entry.input, entry.down_output, entry.gate, entry.up,
+                                  entry.down, entry.gelu, &result);
+        LLAMA_LOG_WARN("moe-hybrid-shadow: layer=%d ok=%d routes=%d hot=%d nmse=%g\n", entry.layer, (int) ok,
+                       result.n_routes, result.n_hot, result.nmse);
+    }
+}
+
+// Reports whether real graphs expose hybrid spans. Diagnostic only, it does not change execution.
+void llama_context::moe_hybrid_probe_spans(llm_graph_result * res, ggml_cgraph * gf) {
+    static const bool probe = getenv("LLAMA_MOE_HYBRID_PROBE") != nullptr;
+    if (!probe || res == nullptr || gf == nullptr) {
+        return;
+    }
+    size_t placed = 0, valid = 0, eligible = 0;
+    int first_layer = -1, first_rejected = -1;
+    const char * first_reason = "";
+    llm_graph_moe_hybrid_span first_span;
+    for (const auto & region : res->get_moe_regions()) {
+        if (region.backend == nullptr) {
+            continue;
+        }
+        ++placed;
+        const auto span = llm_graph_moe_hybrid_find_span(gf, region);
+        if (!span.valid()) {
+            LLAMA_LOG_INFO("moe-hybrid-probe: layer=%d no span\n", region.layer);
+            continue;
+        }
+        ++valid;
+        // The resident half supports separate banks with a plain gated activation only.
+        const auto & ffn = region.hybrid_ffn;
+        const bool separate = ffn.gate != nullptr && ffn.up != nullptr && ffn.gate_up == nullptr;
+        const bool plain_op = ffn.type_op == LLM_FFN_SILU || ffn.type_op == LLM_FFN_GELU;
+        if (separate && plain_op) {
+            ++eligible;
+        } else if (first_rejected < 0) {
+            first_rejected = region.layer;
+            first_reason   = !separate ? "bank layout" : "activation";
+        }
+        if (first_layer < 0) {
+            first_layer = region.layer;
+            first_span  = span;
+        }
+    }
+    if (first_rejected >= 0) {
+        LLAMA_LOG_WARN("moe-hybrid-probe: layer=%d unsupported (%s)\n", first_rejected, first_reason);
+    }
+    LLAMA_LOG_WARN("moe-hybrid-probe: nodes=%d regions=%zu placed=%zu spans=%zu eligible=%zu first_layer=%d routing_end=%d expert_end=%d region_end=%d\n",
+                   ggml_graph_n_nodes(gf), res->get_moe_regions().size(), placed, valid, eligible, first_layer,
+                   first_span.routing_end, first_span.expert_end, first_span.region_end);
+}
+
 bool llama_context::moe_graph_supports_required_grouped(ggml_cgraph * gf) const {
     return model.moe_expert_cache_slots() > 0 && graph_supports_required_grouped_execution(sched.get(), gf);
 }
@@ -2743,6 +2914,8 @@ llm_graph_result * llama_context::process_ubatch(
 
         place_moe_regions(res);
         place_sampled_inputs(res);
+        moe_hybrid_probe_spans(res, gf);
+        moe_hybrid_set_cuts(res, gf);
         sampled_inputs_device = use_sampled_input_async;
         const bool allocated = rebuild_async ? ggml_backend_sched_alloc_graph_async(sched.get(), gf) :
                                                ggml_backend_sched_alloc_graph(sched.get(), gf);
@@ -4197,6 +4370,8 @@ ggml_cgraph * llama_context::graph_reserve(
     // initialize scheduler with the specified graph
     place_moe_regions(res);
     place_sampled_inputs(res);
+    moe_hybrid_probe_spans(res, gf);
+    moe_hybrid_set_cuts(res, gf);
     if (split_only) {
         if (sizes) {
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
@@ -4266,6 +4441,7 @@ ggml_status llama_context::graph_compute(
 
     ggml_status status;
     const bool  required_grouped_supported = moe_graph_supports_required_grouped(gf);
+    moe_hybrid_grouped_supported = required_grouped_supported;
     if (ubatch != nullptr && execution_intent != nullptr &&
             execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN) {
         if (!ubatch_matches_graph_execution_intent(
@@ -4285,7 +4461,7 @@ ggml_status llama_context::graph_compute(
         certificate.owner_generation = graph_execution_owner_generation;
         certificate.n_rows = ubatch->n_tokens;
         certificate.n_sequences = ubatch->n_seqs_unq;
-        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+        status = graph_compute_certified(gf, certificate);
     } else if (ubatch != nullptr && execution_intent != nullptr &&
             (execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT ||
              execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP)) {
@@ -4306,7 +4482,7 @@ ggml_status llama_context::graph_compute(
         certificate.owner_generation = graph_execution_owner_generation;
         certificate.n_rows = ubatch->n_tokens;
         certificate.n_sequences = ubatch->n_seqs_unq;
-        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+        status = graph_compute_certified(gf, certificate);
     } else if (execution_intent != nullptr) {
         LLAMA_LOG_ERROR("%s: unsupported graph execution intent\n", __func__);
         return GGML_STATUS_FAILED;
@@ -4329,7 +4505,7 @@ ggml_status llama_context::graph_compute(
             certificate.flags =
                 required_grouped_execution_flags(model.moe_expert_cache_slots(), required_grouped_supported);
         }
-        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+        status = graph_compute_certified(gf, certificate);
     } else {
         if ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) &&
             required_grouped_execution_flags(model.moe_expert_cache_slots(), required_grouped_supported) !=

@@ -2663,6 +2663,10 @@ struct moe_grouped_decode_plan {
     uint32_t n_misses;
     uint64_t next_clock;
     uint64_t frequency_epoch;
+    // Strata's rule replayed beside the real one: fill a free slot, never evict, admit on decode only.
+    uint64_t admit_hot;
+    uint64_t admit_cold;
+    uint64_t admit_fills;
 };
 
 enum moe_grouped_plan_array_index : uint32_t {
@@ -3906,6 +3910,83 @@ static __device__ bool moe_device_prefetch_ready(uint32_t * completion) {
         cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(*completion).load(cuda::memory_order_acquire) == 1;
 }
 
+// Mapped host memory the planner publishes cold routes into, with Strata's fence then sequence order.
+// The CPU half reads it without a device copy, which is what keeps the publication capture-legal.
+#define MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY 256
+struct moe_grouped_admit_publication {
+    uint32_t sequence;
+    uint32_t count;
+    uint32_t acknowledged;  // written by the CPU worker once it has consumed the packet
+    uint32_t timeouts;      // the device gave up waiting, so the handshake is not reliable
+    int32_t  routes[MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY];
+    int32_t  experts[MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY];
+};
+
+// Strata's doorbell: spin until the CPU acknowledges this packet. Bounded here, because a lost worker
+// would otherwise hang the device, and this path carries no results yet.
+static __global__ void moe_grouped_admit_doorbell(moe_grouped_admit_publication * publication, uint64_t spin_limit) {
+    if (publication == nullptr) {
+        return;
+    }
+    volatile uint32_t * acknowledged = &publication->acknowledged;
+    const uint32_t want = publication->sequence;
+    for (uint64_t spin = 0; spin < spin_limit; ++spin) {
+        if (*acknowledged == want) {
+            __threadfence_system();
+            return;
+        }
+    }
+    ++publication->timeouts;
+    __threadfence_system();
+}
+
+static bool moe_grouped_admit_shadow_enabled() {
+    static const bool enabled = getenv("LLAMA_MOE_ADMIT_SHADOW") != nullptr;
+    return enabled;
+}
+
+// Replays Strata's admission beside the real one: a miss takes a free slot, never evicts, and only
+// decode may fill. Counts only, the assignment below is unchanged.
+static __device__ void moe_grouped_admit_shadow(
+        const int32_t * ids, uint32_t n_routes, uint32_t top_k, uint32_t row_stride,
+        uint32_t n_experts, uint32_t n_slots, bool is_decode,
+        int32_t * admit_slots, moe_grouped_decode_plan * plan,
+        moe_grouped_admit_publication * publication) {
+    if (admit_slots == nullptr || threadIdx.x != 0) {
+        return;
+    }
+    uint32_t published = 0;
+    for (uint32_t route = 0; route < n_routes; ++route) {
+        const uint32_t row = top_k != 0 ? route / top_k : 0;
+        const uint32_t rank = top_k != 0 ? route % top_k : 0;
+        const int32_t expert = ids[row * row_stride + rank];
+        if (expert < 0 || (uint32_t) expert >= n_experts) {
+            continue;
+        }
+        if (admit_slots[expert] >= 0) {
+            ++plan->admit_hot;
+        } else if (is_decode && plan->admit_fills < n_slots) {
+            admit_slots[expert] = (int32_t) plan->admit_fills;
+            ++plan->admit_fills;
+            ++plan->admit_hot;
+        } else {
+            ++plan->admit_cold;
+            if (publication != nullptr && published < MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY) {
+                publication->routes[published] = (int32_t) route;
+                publication->experts[published] = expert;
+                ++published;
+            }
+        }
+    }
+    if (publication != nullptr) {
+        publication->count = published;
+        // The payload must be visible to the host before the sequence that announces it.
+        __threadfence_system();
+        publication->sequence = publication->sequence + 1;
+        __threadfence_system();
+    }
+}
+
 static __global__ void moe_grouped_plan_decode(
         const int32_t * ids,
         uint32_t n_routes,
@@ -3926,10 +4007,15 @@ static __global__ void moe_grouped_plan_decode(
         uint64_t * device_clock,
         moe_grouped_decode_plan * plan,
         int32_t * prefetch_positions = nullptr,
-        uint32_t * prefetch_completion = nullptr) {
+        uint32_t * prefetch_completion = nullptr,
+        int32_t * admit_slots = nullptr,
+        bool admit_is_decode = false,
+        moe_grouped_admit_publication * admit_publication = nullptr) {
     if (blockIdx.x != 0) {
         return;
     }
+    moe_grouped_admit_shadow(ids, n_routes, top_k, row_stride, n_experts, n_slots, admit_is_decode,
+        admit_slots, plan, admit_publication);
 
     __shared__ int32_t warp_route_experts[WARP_SIZE];
     __shared__ uint32_t warp_frequencies[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
@@ -5570,6 +5656,12 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (slot_for_expert != nullptr) {
                 (void) cudaFree(slot_for_expert);
             }
+            if (admit_slot_for_expert != nullptr) {
+                (void) cudaFree(admit_slot_for_expert);
+            }
+            if (admit_publication_host != nullptr) {
+                (void) cudaFreeHost(admit_publication_host);
+            }
             if (expert_for_slot != nullptr) {
                 (void) cudaFree(expert_for_slot);
             }
@@ -5629,6 +5721,10 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint64_t prefill_auxiliary_pending_declines = 0;
         int32_t * slot_for_expert = nullptr;
         int32_t * expert_for_slot = nullptr;
+        int32_t * admit_slot_for_expert = nullptr;
+        moe_grouped_admit_publication * admit_publication_host = nullptr;
+        moe_grouped_admit_publication * admit_publication_device = nullptr;
+        uint32_t admit_publication_seen = 0;
         uint8_t * invalidated_slot = nullptr;
         uint8_t * occupied_slot = nullptr;
         uint64_t * last_used = nullptr;
@@ -7309,6 +7405,17 @@ struct ggml_cuda_moe_grouped_context::impl {
         if (result->words_per_miss > SIZE_MAX / snapshot.n_slots ||
                 result->auxiliary_values_per_miss > SIZE_MAX / snapshot.n_slots) {
             return nullptr;
+        }
+        if (moe_grouped_admit_shadow_enabled()) {
+            if (!moe_grouped_cuda_success(cudaMalloc(&result->admit_slot_for_expert, n_experts * sizeof(int32_t))) ||
+                    !moe_grouped_cuda_success(cudaMemset(result->admit_slot_for_expert, 0xff, n_experts * sizeof(int32_t))) ||
+                    !moe_grouped_cuda_success(cudaHostAlloc(&result->admit_publication_host,
+                        sizeof(moe_grouped_admit_publication), cudaHostAllocMapped)) ||
+                    !moe_grouped_cuda_success(cudaHostGetDevicePointer(&result->admit_publication_device,
+                        result->admit_publication_host, 0))) {
+                return nullptr;
+            }
+            memset(result->admit_publication_host, 0, sizeof(moe_grouped_admit_publication));
         }
         if (!moe_grouped_cuda_success(cudaMalloc(&result->slot_for_expert, n_experts * sizeof(int32_t))) ||
                 !moe_grouped_cuda_success(cudaMalloc(&result->expert_for_slot, snapshot.n_slots * sizeof(int32_t))) ||
@@ -10303,6 +10410,33 @@ bool ggml_cuda_moe_hybrid_select(
     return moe_grouped_cuda_success(cudaGetLastError());
 }
 
+static __global__ void moe_hybrid_gather_rows(
+        const float * src, int64_t n_embd, int64_t n_src_rows, const int32_t * rows, int32_t n_rows, float * dst) {
+    const int64_t job = blockIdx.x;
+    if (job >= n_rows) {
+        return;
+    }
+    const int32_t row = rows[job];
+    if (row < 0 || row >= n_src_rows) {
+        return;
+    }
+    for (int64_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        dst[job * n_embd + i] = src[row * n_embd + i];
+    }
+}
+
+bool ggml_cuda_moe_hybrid_gather_rows(
+        const float * src, int64_t n_embd, int64_t n_src_rows, const int32_t * rows, int32_t n_rows,
+        float * dst, ggml_cuda_moe_stream_t stream) {
+    if (src == nullptr || rows == nullptr || dst == nullptr || stream == nullptr ||
+            n_embd <= 0 || n_src_rows <= 0 || n_rows <= 0) {
+        return false;
+    }
+    moe_hybrid_gather_rows<<<(unsigned) n_rows, 256, 0, (cudaStream_t) stream>>>(
+        src, n_embd, n_src_rows, rows, n_rows, dst);
+    return moe_grouped_cuda_success(cudaGetLastError());
+}
+
 static __global__ void moe_hybrid_scatter_add(
         float * parts, const float * hot_out, const int32_t * columns, const int32_t * count,
         int64_t capacity, int64_t n_embd) {
@@ -11170,7 +11304,8 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
             device_prefetch_job != nullptr ? impl_->early[0]->positions[device_prefetch_job->lane] : nullptr,
-            device_prefetch_job != nullptr ? impl_->device_prefetch->copy_done + device_prefetch_job->lane : nullptr);
+            device_prefetch_job != nullptr ? impl_->device_prefetch->copy_done + device_prefetch_job->lane : nullptr,
+            device.admit_slot_for_expert, n_rows == 1, device.admit_publication_device);
         CUDA_CHECK(cudaGetLastError());
         auto * debug = impl_->debug_stats();
         uint64_t * transfer_counters = debug != nullptr && device.occupied_slot != nullptr ?
@@ -17145,6 +17280,39 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
     }
     for (int phase = 0; phase < 2; ++phase) {
         ggml_cuda_moe_add_phase_stats(aggregate.phase_stats[phase], moe_cache_take_op_stats(g_moe_cache_op_stats[phase], true));
+    }
+    if (moe_grouped_admit_shadow_enabled()) {
+        uint64_t hot = 0, cold = 0, fills = 0, publications = 0;
+        uint32_t last_published = 0;
+        std::lock_guard<std::mutex> owner_registry_lock(owners.mutex);
+        for (ggml_cuda_moe_grouped_context * owner : owners.active) {
+            std::lock_guard<std::mutex> lifecycle_lock(owner->impl_->resource_lifecycle_mutex);
+            for (const auto & resource : owner->impl_->resources) {
+                if (resource == nullptr || resource->device == nullptr) {
+                    continue;
+                }
+                const auto & device = *resource->device;
+                moe_grouped_decode_plan plan = {};
+                if (device.admit_slot_for_expert == nullptr || device.plan == nullptr ||
+                        !moe_grouped_cuda_success(cudaMemcpy(&plan, device.plan, sizeof(plan), cudaMemcpyDeviceToHost))) {
+                    continue;
+                }
+                hot += plan.admit_hot;
+                cold += plan.admit_cold;
+                fills += plan.admit_fills;
+                // Read straight out of mapped memory, no device copy, as the CPU half will.
+                const auto * published = device.admit_publication_host;
+                if (published != nullptr) {
+                    publications += published->sequence;
+                    last_published = published->count;
+                }
+            }
+        }
+        const uint64_t total = hot + cold;
+        GGML_LOG_INFO("moe-admit-shadow: no-evict decode-only hot=%llu cold=%llu fills=%llu hot-rate=%.2f%% publications=%llu last_cold_routes=%u\n",
+            (unsigned long long) hot, (unsigned long long) cold, (unsigned long long) fills,
+            total > 0 ? 100.0 * (double) hot / (double) total : 0.0,
+            (unsigned long long) publications, last_published);
     }
     const ggml_cuda_moe_grouped_debug_telemetry grouped = aggregate.grouped;
     moe_cache_log_telemetry(std::move(aggregate));

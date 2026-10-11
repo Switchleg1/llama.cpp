@@ -40,6 +40,26 @@ typedef void (*ggml_backend_moe_cache_log_and_reset_stats_t)(void);
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION 1u
 #define GGML_BACKEND_MOE_CANDIDATE_REPLACE_V2_PROC_NAME "ggml_backend_moe_candidate_replace_v2"
 #define GGML_BACKEND_REQUIRED_GROUPED_EXECUTION_SUPPORTED_PROC_NAME "ggml_backend_required_grouped_execution_supported"
+// Diagnostic: recomputes the resident routes of one region and compares them with the executed output.
+#define GGML_BACKEND_MOE_HYBRID_SHADOW_PROC_NAME "ggml_backend_moe_hybrid_shadow"
+
+struct ggml_backend_moe_hybrid_shadow_result {
+    int32_t n_routes;
+    int32_t n_hot;
+    double  nmse;
+};
+
+typedef bool (*ggml_backend_moe_hybrid_shadow_t)(
+        ggml_backend_t backend,
+        const struct ggml_tensor * ids,
+        const struct ggml_tensor * input,
+        const struct ggml_tensor * down_output,
+        const struct ggml_tensor * gate,
+        const struct ggml_tensor * up,
+        const struct ggml_tensor * down,
+        bool gelu,
+        struct ggml_backend_moe_hybrid_shadow_result * result);
+
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC 0x4d4f4532u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION 2u
 

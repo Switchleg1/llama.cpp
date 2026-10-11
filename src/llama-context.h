@@ -339,6 +339,27 @@ private:
     void place_sampled_inputs(llm_graph_result * res);
     void            refresh_moe_layer_owners();
     void            place_moe_regions(llm_graph_result * res);
+    void            moe_hybrid_probe_spans(llm_graph_result * res, ggml_cgraph * gf);
+    void            moe_hybrid_set_cuts(llm_graph_result * res, ggml_cgraph * gf);
+    void            moe_hybrid_shadow_regions(int node_end);
+    std::vector<int> moe_hybrid_cut_nodes;
+    bool             moe_hybrid_grouped_supported = false;
+
+    struct moe_hybrid_shadow_entry {
+        ggml_backend_t      backend;
+        const ggml_tensor * ids;
+        const ggml_tensor * input;
+        const ggml_tensor * down_output;
+        const ggml_tensor * gate;
+        const ggml_tensor * up;
+        const ggml_tensor * down;
+        int                 expert_end;
+        int                 layer;
+        bool                gelu;
+        bool                done;
+    };
+    std::vector<moe_hybrid_shadow_entry> moe_hybrid_shadow_pending;
+    ggml_status     graph_compute_certified(ggml_cgraph * gf, const ggml_graph_execution_certificate & certificate);
     bool            moe_graph_supports_required_grouped(ggml_cgraph * gf) const;
     void finish_compute(int64_t n_tokens, int64_t elapsed_us);
     void set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch);

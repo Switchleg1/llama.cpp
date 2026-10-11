@@ -1072,6 +1072,235 @@ The fixture's input quantizer therefore does not explain its full-FFN discrepanc
 
 Validation: Release build, focused insertion/frozen runner, full MoE suite and diff check passed (`build/hybrid-quant-isolate-{build,focused,full}.log`). No real-model hybrid or performance claim follows from these controls.
 
+### Real graphs expose hybrid spans
+
+Every span test so far used synthetic two-layer fixtures, so it was unknown whether a real model graph splits the same way. `llama_context::moe_hybrid_probe_spans()` answers that: gated by `LLAMA_MOE_HYBRID_PROBE`, it runs `llm_graph_moe_hybrid_find_span()` over the placed regions after allocation and logs the result. It changes no execution and is temporary scaffolding.
+
+On the IQ3_S Qwen model with `--moe-expert-cache-size 8`, a 6772-node graph reports `regions=48 placed=48 spans=48`, with layer 0 at `routing_end=100 expert_end=104 region_end=124`. All 48 regions are placed and all 48 produce valid spans, so the seam the hybrid path needs exists in production graphs and is not a fixture artifact.
+
+Two findings along the way: with `--cpu-moe` alone the expert cache is off, so `placed=0` and no region is a hybrid candidate; and core `llama` logs are filtered in the smoke scripts, which is why the first probe appeared silent. The probe logs at warning level to stay visible.
+
+This proves span discovery only. Ranged execution is still not wired into `llama_context`, which dispatches whole graphs through `ggml_backend_sched_graph_compute_async_ext` for every certified path; per-region execution, residency authority, the CPU half and merge are not connected.
+
+Validation: Release build, insertion probe, full MoE suite, 3/3 MoE CTests and diff check passed. Both probe smokes completed and the ordinary-mode output still matched the preserved baseline. Artifacts: `build/hybrid-span-probe-{probe,full}.log`, `build/run-qwen-probe-smoke.{py,json,log}`, `build/run-qwen-probe-cache-smoke.{py,json,log}`.
+
+### Real inference driven split by split
+
+Every certified dispatch in `llama_context::graph_compute()` submitted the whole graph at once, which leaves no point to insert the hybrid seam. The three certified call sites now go through `graph_compute_certified()`. By default it still submits the whole graph. Under `LLAMA_MOE_HYBRID_RANGES` it walks the splits with `ggml_backend_sched_get_split_range()` and executes each one with `ggml_backend_sched_graph_compute_range()`, carrying the same certificate. Same work, same order, one submission per split.
+
+On the real model this runs end to end and reproduces the reference text exactly in both configurations: with `--moe-expert-cache-size 8` it matches the cached whole-graph run, and with plain `--cpu-moe` it matches the preserved ordinary baseline. So the loop that the hybrid path needs, stop between regions and do work, now exists in production and does not change results by itself.
+
+This is still only a driver shape. No hybrid work happens between the ranges: there is no transaction held, no residency snapshot, no device selection, no resident or cold execution and no merge in the inference path. The gate is temporary scaffolding, not `--moe-hybrid`. Per-split submission is also not free, and no timing claim is made here.
+
+Validation: Release build/relink, insertion probe, ranged runner, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/hybrid-ranged-{build,probe,range,full}.log`, `build/run-qwen-ranged-smoke.{py,json,log}`, `build/run-qwen-ranged-cpumoe-smoke.{py,json,log}`.
+
+### Production graphs cut at the seam
+
+`moe_hybrid_set_cuts()`, gated by `LLAMA_MOE_HYBRID_CUTS`, requests a split boundary at `routing_end` and `expert_end` of every placed region before allocation, using the existing `ggml_backend_sched_set_split_boundaries()`. The ranged driver then reports how many requested cuts actually begin a split.
+
+On the real model: `splits=98 requested=96 honored=96`, against `splits=2` for the same graph without cuts, and the generated text still matches the cached reference exactly. So all 48 layers are cut at both hybrid seams in a production graph, and the scheduler honours every one.
+
+Two scaffolding faults were found and fixed rather than reported around. The first honored report was gated on a non-empty cut list and printed nothing, which could have been mistaken for a scheduler refusal; the real cause was that an earlier scripted edit to record the cut list never applied, so the list was always empty and the check was measuring nothing. A one-time log also confirmed the certified dispatch is actually reached with `ranged=1`, which the previous ranged result had assumed rather than shown.
+
+Still no hybrid work: the splits are executed back to back with nothing in between, no transaction, snapshot, selection, resident or cold execution, or merge. Three env gates (`PROBE`, `RANGES`, `CUTS`) remain temporary scaffolding.
+
+Validation: Release build/relink, insertion probe, ranged runner, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/hybrid-cuts-{build,probe,range,full}.log`, `build/run-qwen-cuts-smoke.{py,json,log}`.
+
+### Real layers are eligible, and no new API is needed
+
+The probe now also reports how many placed regions the resident half can actually execute: separate gate/up banks and a plain SiLU or GELU activation, which is what `ggml_backend_cuda_moe_hybrid_execute_hot()` supports. The first unsupported layer, if any, is named with its reason.
+
+On the real model: `placed=48 spans=48 eligible=48`. Every layer of this Qwen model qualifies, so the restricted first version is not a model-wide blocker here.
+
+This also settles the API question raised earlier. A new public entry point is not required to drive the seam: the bank layout and activation come from the graph region, and `llama-context` already resolves backend-specific entry points through the existing `ggml-backend-moe.h` proc-address convention, which the CUDA registry already implements. The hybrid driver can use that mechanism instead of adding a new public header.
+
+Still unchanged: no hybrid work runs in inference. Eligibility is a static property check, not proof that execution, residency authority or lifetimes are correct in the inference path.
+
+Validation: Release build/relink, insertion probe, ranged runner, full MoE suite, 3/3 MoE CTests and diff check passed; the cut smoke still matched its reference. Artifacts: `build/hybrid-eligible-{build,probe,range,full}.log`.
+
+### Measured residency on the real model
+
+The split between the halves is decided by residency, so it was measured rather than assumed, using the cache statistics the server already reports at verbose level.
+
+On the IQ3_S Qwen model, same short prompt, 144 caches (48 layers x 3 banks):
+
+| slots per expert tensor | hits | misses | evictions | hit rate | peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| 8  |  6055 | 9273 | 8121 | 39.50% | 12.64 GiB |
+| 32 | 15989 | 9030 | 4464 | 63.91% | 13.28 GiB |
+
+Both runs produced identical text. Two consequences for the port. The resident fraction is a minority at small slot counts, so the CPU half carries most routes and the cold path, not the resident one, sets the pace; and the eviction counts show the demand engine is constantly refilling, which is exactly the traffic a frozen partition removes and the reason adaptive residency has to be driven by observed reuse.
+
+These numbers come from the existing demand-refill cache, where a miss is filled on the GPU. Under the frozen hybrid partition a miss goes to the CPU instead, so the hit rate indicates the expected hot/cold ratio, not hybrid performance. One short prompt, one model, no timing claim.
+
+Validation: no code change; both smokes completed and matched. Artifacts: `build/run-qwen-residency-smoke.{py,json,log}`, `build/run-qwen-residency32-smoke.{py,json,log}`.
+
+### What limits the cold half
+
+Since residency puts most routes on the CPU, the CPU half decides the result, so its limit was checked with the existing `test-backend-ops perf` runner rather than new code. On this machine CPU `MUL_MAT_ID` at `n_mats=128 n_used=8 m=768 k=2048` reaches 547 GFLOPS at one row and 550-830 GFLOPS at larger batches, Q4_K at or above Q8_0.
+
+Against this model's geometry (2560 wide, 640 FF, top-k 10, 48 layers) the arithmetic is not the limit. Per token the cold half needs about 2.8 GFLOP at 6 cold routes, which is a few milliseconds of the measured rate, but it must read every selected expert's weights from RAM:
+
+| cold routes/layer | expert format | bytes/token | 60 GB/s | 90 GB/s |
+| --- | --- | --- | --- | --- |
+| 6  | ~3.5 bpw | 619 MB | 10.3 ms | 6.9 ms |
+| 10 | ~3.5 bpw | 1032 MB | 17.2 ms | 11.5 ms |
+| 6  | ~4.5 bpw | 796 MB | 13.3 ms | 8.8 ms |
+| 10 | ~4.5 bpw | 1327 MB | 22.1 ms | 14.7 ms |
+
+The cold half is memory bandwidth bound, not compute bound. Three consequences: cold expert bytes, that is quantization and route count, matter far more than CPU kernel efficiency, which supports the plan's aggressive quantization of draft experts; residency is worth most when it removes bandwidth, so promoting frequently reused experts beats raw hit count; and the GPU hot half has to overlap this window to be useful at all, since it cannot shorten it.
+
+These are bounds derived from a benchmark at a nearby shape plus model geometry and assumed achievable bandwidth, not measured hybrid throughput. Actual sustained bandwidth on this machine was not measured, prefetch and page cache are ignored, and no claim is made about final speed.
+
+Validation: no code change. Benchmark output from the existing `test-backend-ops perf -o MUL_MAT_ID -b CPU` runner.
+
+### Measured decode, and the baseline that matters
+
+Decode times from the smoke logs, 8 generated tokens each, same prompt and model:
+
+| configuration | ms/token | tok/s |
+| --- | --- | --- |
+| `--cpu-moe`, whole graph | 89.33 | 11.19 |
+| `--cpu-moe`, ranged splits | 89.12 | 11.22 |
+| `--cpu-moe`, repeat | 91.92 | 10.88 |
+| expert cache, 8 slots | 237.62 | 4.21 |
+| expert cache, 8 slots, repeat | 236.28 | 4.23 |
+| expert cache, 8 slots, seam cuts + ranged | 233.67 | 4.28 |
+| expert cache, 32 slots | 189.51 | 5.28 |
+
+Two results. Ranged execution and the 96 seam cuts cost nothing measurable, so the driver restructuring is not a tax on the path. And the demand-refill expert cache is currently about 2.6x slower than plain CPU experts on this workload, reproducibly, improving only partially with more slots. That is the engine this port replaces, so the hybrid path must be compared against the `--cpu-moe` baseline of roughly 11 tok/s, not against the cache mode. Comparing against the cache would flatter the result.
+
+The measured 89 ms/token also puts the cold half far from the bandwidth bound estimated above, roughly 12 GB/s effective against tens of GB/s available. The smokes use 8 of 24 threads with mmap, so thread count and page faults, not DRAM, appear to dominate today. The earlier bandwidth table is therefore an optimistic ceiling, not a current description.
+
+Caveats: 8 tokens per run, one prompt, one model, cold start included, no thread sweep. These are directional measurements for deciding what to optimize, not benchmarks.
+
+Validation: no code change. Artifacts: `build/run-qwen-rep-cpumoe-smoke.{py,json,log}`, `build/run-qwen-rep-residency-smoke.{py,json,log}` and the earlier smoke logs.
+
+### Thread sweep, and a corrected diagnosis
+
+The previous entry guessed that thread count dominated the cold half. That was tested and is wrong. Same `--cpu-moe` path, same prompt, 8 generated tokens:
+
+| threads | ms/token | tok/s | relative |
+| --- | --- | --- | --- |
+| 8  | 89.12 | 11.22 | 1.00x |
+| 16 | 77.36 | 12.93 | 1.15x |
+| 24 | 74.77 | 13.37 | 1.19x |
+
+Three times the threads buys 19 percent. The cold half is neither compute bound nor thread bound; it is bound by the memory path that feeds it, at roughly 14 GB/s effective against a far higher DRAM ceiling, which points at the mmap page-fault and page-cache path rather than raw bandwidth. Output stayed identical at every thread count.
+
+Consequences: giving the CPU half more threads is close to free but nearly pointless on its own, so the Strata-style borrowed pool needs no urgent tuning; reducing bytes touched per token remains the lever; and the honest bar for the hybrid path is now the best ordinary configuration, about 13.4 tok/s at 24 threads, not the 11.19 tok/s figure quoted earlier.
+
+Caveats unchanged: 8 tokens, one prompt, one model, cold start included, no page-cache control, so the absolute rate may shift.
+
+Validation: no code change. Artifacts: `build/run-qwen-threads16-smoke.{py,json,log}`, `build/run-qwen-threads24-smoke.{py,json,log}`.
+
+### The paging hypothesis is unproven, and one experiment failed
+
+To test whether the mmap page path limits the cold half, the same 24-thread run was repeated with `--load-mode mlock`. It failed: peak RSS reached 47.3 GiB with 31.7 GiB still available, then the process aborted with `CUDA error: out of memory` in `ggml_backend_cuda_device_event_synchronize`. Locking a 77.8 GiB model plus host staging and GPU allocations does not fit this 96 GB machine. This is an interaction of an existing load mode with memory pressure, not a regression from the hybrid work, and nothing in this port was changed to accommodate it.
+
+So the hypothesis is not confirmed. Evidence against it is that the mmap runs are reproducible at 89.12 and 91.92 ms per token with a warm page cache and roughly 67 GiB still free, and a warm repeat gained nothing. A more likely explanation for about 14 GB/s effective is the access pattern itself: each token touches around 1 GB of expert weights scattered across 512 experts per layer, which is a random-access pattern rather than a streaming one.
+
+This does not change the plan; it only removes a wrong justification for part of it. The RAM and file tiers are still worth building for capacity, but they should not be sold as a fix for a paging bottleneck that has not been demonstrated. The measured bar remains about 13.4 tok/s at 24 threads.
+
+Validation: no code change. Artifact: `build/run-qwen-mlock-smoke.{py,json,log}` with the failure preserved.
+
+### The seam cuts disable grouped execution in production
+
+A shadow entry point was added to validate the resident half on real weights inside live inference: `ggml_backend_moe_hybrid_shadow`, exposed through the existing proc convention, holds a transaction after a region's experts have run, snapshots residency, selects the resident routes, recomputes them from the slot arena with `ggml_backend_cuda_moe_hybrid_execute_hot()` and compares with the output the graph produced. `llama-context` calls it between splits under `LLAMA_MOE_HYBRID_SHADOW`. It changes no results.
+
+It never ran. Every call was refused, and following the refusal codes gave a much more important answer than the shadow check itself.
+
+`begin_group_transaction()` refused because the group was under legacy authority. The planner's own debug output shows why: with the hybrid gates enabled, all 338 plans report `outcome=2`, decode legacy, and `reason=2`, execution ineligible. A control run with the gates off reports 96 prefill legacy and 48 `outcome=1`, decode grouped. Enabling only `LLAMA_MOE_HYBRID_RANGES` also keeps 48 grouped plans. The seam cuts are the cause: splitting between the routes and the expert matmuls, and after them, means the planner no longer sees one complete group in a dispatch, so the whole layer falls back to the legacy per-tensor path.
+
+This invalidates an earlier claim here. The cut smoke produced identical text, so the cuts looked free, but at 8 slots decode is legacy anyway, since plain MAIN decode requires `n_routes <= n_slots` and this model routes 10 experts. The comparison was legacy against legacy. At 32 slots, where grouped decode does happen, the cuts replace it with the legacy path. Identical output hid a silent downgrade, which is exactly the kind of regression that must not be reported as a success.
+
+The tests did not catch this because they publish split-route origins through the lease mechanism, which qualifies cached cuts for grouped execution; nothing in the inference path does that yet. So the gap is not in the scheduler but in the production driver.
+
+Consequences. The hybrid path cannot simply cut the graph and expect the grouped residency authority it depends on to survive; either the driver publishes split-route origins the way the tests do, or the hybrid half runs under the legacy authority instead, or the planner has to admit a cut layer as one group. This has to be decided before any further wiring, and the earlier statement that seam cuts cost nothing is withdrawn.
+
+Validation: Release build. The smokes completed with matching text, which is precisely why the downgrade needed the planner's own diagnostics to see. Artifacts: `build/run-qwen-shadow-smoke.{py,json,log}`, `build/run-qwen-shadow32-smoke.{py,json,log}`, `build/run-qwen-shadow-dbg-smoke.{py,json,log}`, `build/run-qwen-shadow-dbg32-smoke.{py,json,log}`, `build/run-qwen-plain-dbg32-smoke.{py,json,log}`, `build/run-qwen-rangesonly-dbg32-smoke.{py,json,log}`.
+
+Decision: do not cut the graph. Strata has no authority negotiation at all - `rg -i 'transaction|authority|lease|epoch'` over its sources returns nothing - because its session owns the arena pointer and the residency table and enqueues the layer itself. The equivalent here is to work inside the grouped dispatch, where the transaction is already held and the bank views already exist, instead of recreating a seam from outside.
+
+### Validated inside grouped dispatch, on real weights
+
+`ggml_cuda_moe_hybrid_compact_check()` runs at the down projection of an active grouped group, under `LLAMA_MOE_HYBRID_COMPACT_CHECK`. It re-executes that projection from the same slot arena through the same bank and id views into a separate buffer and compares. No cuts, no extra splits, no lease publication.
+
+Result: 48 of 48 layers bit-identical, `nmse=0`, on the real IQ3_S model with the run completing and the text matching. The in-place arena read and the dispatch-level integration point are therefore correct on production weights and shapes, not only on 256-wide Q4_0 fixtures.
+
+Two findings matter more than the check.
+
+First, the compact shape does not fit the production kernels. Rewriting the routes as one route per plane, `[n_embd, 1, n_routes]`, which is Strata's hit layout, was refused by `ggml_cuda_mul_mat_id_impl`. Decode presents ten routes of one token as `ne2 = 1`, which selects MMVQ, while the compact form presents ten tokens of one expert and no consumer accepts it with a direct source view. So the hybrid half should subset the expert dimension of the existing layout rather than reshape into Strata's planes. Strata's layout suits its own private kernel, not these.
+
+Second, the first version aborted the run: `CUDA error: operation not permitted when stream is capturing`. The first decode passed all 48 layers, the second decode captures a CUDA graph, and allocating, copying and synchronizing inside it is illegal. This is the production confirmation of the rule Strata follows, caller-owned scratch and a doorbell instead of a host sync, and it applies to the real hybrid path: no allocation, no host copy and no synchronization may sit in the dispatch. The check now declines while capturing.
+
+Validation: Release build/relink, insertion probe, ranged runner, full MoE suite, 3/3 MoE CTests and diff check passed; the smoke completed with matching text. Artifacts: `build/hybrid-compact-{build,probe,range,full}.log`, `build/run-qwen-compact-smoke.{py,json,log}`.
+
+Still not hybrid: this recomputes resident routes that the grouped path already computed. No cold half, no CPU work, no merge and no overlap run in inference.
+
+### The split seam reproduces production exactly
+
+The check now splits each layer's routes into two disjoint halves, executes each half on its own against the same slot arena by subsetting the expert dimension of the production layout, gathers the matching activation rows, and scatters both results into one buffer with `ggml_cuda_moe_hybrid_scatter_add()`. The sum is compared with the output the grouped path produced.
+
+Result: 48 of 48 layers bit-identical, `nmse=0`, routes 10 split 5 and 5, on the real model with matching text. This is the arithmetic the hybrid seam depends on - two halves computed apart and merged - demonstrated on production weights rather than fixtures, and it confirms the subset-the-expert-dimension layout decided above works where Strata's plane layout was refused.
+
+What this does not show: both halves ran on the GPU. There is no CPU half, no overlap, no residency decision, and the diagnostic still allocates and synchronizes, so it declines while a CUDA graph is capturing. A real hybrid half must preallocate its scratch and avoid host synchronization entirely.
+
+The remaining blocker is unchanged and structural: grouped decode fills every miss, so all routes are resident and there is nothing cold to give the CPU. Producing a genuine split needs the frozen policy, prepare decode must leave misses unfilled and report them, which is the next change.
+
+Validation: Release build/relink, insertion probe, ranged runner, full MoE suite, CUDA `MUL_MAT_ID` 929/929, 3/3 MoE CTests and diff check passed; the smoke completed with matching text. Artifacts: `build/hybrid-subset-{build,probe,range,full}.log`, `build/run-qwen-compact-smoke.{py,json,log}`.
+
+### Strata's admission rule, confirmed and replayed
+
+`ExpertCache::admit()` is fill-once and never evicts: `if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately`. Per layer each routed expert is either resident, or admitted and filled on the same stream so it is a hit on that call, or refused because the layer's quota is full, in which case it is cold and the CPU owns it. A per-layer quota variant exists because one shared counter held the measured hit rate at 2.97 percent. So the hot and cold split comes from capacity refusal, not from freezing residency, which corrects the plan's earlier wording. Two neighbouring rules were recorded for the same reason seen here: `hit_out` is zeroed per layer so a row that was hot last layer cannot carry a stale expert into the sum, and the activation is quantized in that function with required fp32 scales rather than reused from the previous layer.
+
+Rather than change admission blind, the real routing stream was captured under `LLAMA_MOE_ROUTE_DUMP` and the policies replayed offline over 461 layer calls of the IQ3_S model:
+
+| slots per layer | policy | hot | cold routes | fills | evictions |
+| --- | --- | --- | --- | --- | --- |
+| 8  | LRU | 100% | 0 | 8790 | 8406 |
+| 8  | no-evict | 13.1% | 8495 | 384 | 0 |
+| 32 | LRU | 100% | 0 | 4877 | 3341 |
+| 32 | no-evict | 42.1% | 5655 | 1536 | 0 |
+| 64 | no-evict | 82.3% | 1726 | 3072 | 0 |
+| 128 | no-evict | 99.9% | 10 | 4254 | 0 |
+
+LRU reaches every route only by evicting, which is the H2D churn the measurements already showed. No-evict removes it entirely and pays with cold routes, which is the design: the CPU is supposed to carry them.
+
+Capacity decides the ratio. At roughly 2.15 MiB per expert for this model, 64 slots per layer is about 6.6 GiB of residency, which fits this 16 GiB card, and gives 82 percent hot. 128 slots would be about 13.2 GiB and does not fit beside everything else.
+
+One more replay changes the design. Admission order matters: if prefill is allowed to fill the slots, it takes them with experts decode does not reuse. Admitting only during decode gives 90.0 percent hot at 32 slots and 99.9 percent at 64, against 42.1 and 82.3 when prefill fills. Prefill routes 12 tokens wide and touches far more experts than decode, so a first-come rule spends the whole quota on them. The port should therefore admit on decode only, which Strata's per-layer quota note hints at but does not state.
+
+Caveats: one short run, around ten generated tokens, one prompt. A longer run widens the decode working set, so these hot rates are optimistic, and the ordering effect, not the absolute numbers, is the result to keep.
+
+Validation: no behaviour change. The dump is a diagnostic in the legacy cached path under an environment variable. Artifacts: `build/qwen-routes.txt`, `build/run-qwen-routedump-smoke.{py,json,log}`.
+
+### The admission rule, now decided in the engine
+
+`moe_grouped_admit_shadow()` implements Strata's rule inside the decode planner: a routed expert that is resident is hot, a miss takes a free slot and is hot on that call, a miss with no free slot is cold, and only decode may fill. It keeps its own residency array per group, counts hot, cold and fills into the plan, and is reported through the existing stats line. Under `LLAMA_MOE_ADMIT_SHADOW` it runs beside the real assignment and changes nothing, so the policy that will drive execution is exercised on live traffic before it controls anything.
+
+On the real model at 32 slots it reports `hot=2989 cold=371 fills=1477 hot-rate=88.96%`, against the production LRU policy's `hit-rate=63.91%` with 4464 evictions in the same run, with identical output. The offline replay of the captured routing stream predicted 90.0 percent for the same configuration, so two independent methods agree within about a point, which is the cross-check the replay alone could not give.
+
+The number that matters for the CPU half is the cold count: about 11 percent of routes, roughly one route per layer per token at this capacity.
+
+This is still counting only. The real assignment continues to evict, no route is actually sent to the CPU, and nothing executes differently. Switching the policy on requires the CPU half in the same change, because a refused route with nowhere to go is either a wrong result or a silent fall back to the evicting path.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed; the smoke matched its reference. Artifacts: `build/hybrid-admit-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-admit-smoke.{py,json,log}`.
+
+### Cold routes published to host memory
+
+Handing cold routes to a CPU worker cannot use a device copy, because the dispatch may be inside a CUDA graph capture, which is what aborted an earlier diagnostic. Strata solves this by writing into mapped pinned memory from a kernel and announcing it with a sequence number, `doorbell_wait_kernel` spinning on the flag with `__threadfence_system()` on both sides.
+
+The publication half of that is now implemented. The decode planner writes each cold route's index and expert id into a mapped pinned buffer owned by the group resource, fences, then increments the sequence, so a reader never sees a count ahead of its payload. The device side writes through the mapped device pointer from `cudaHostGetDevicePointer`, so it is a plain kernel store and stays legal under capture.
+
+On the real model: `hot=2989 cold=371 fills=1477 hot-rate=88.96% publications=336 last_cold_routes=8`. The host reads the packet directly out of mapped memory with no device copy, which is how the CPU half will consume it, and the output is unchanged.
+
+Still missing from Strata's mechanism: the wait. There is no doorbell kernel making the GPU wait for CPU results, no CPU worker consuming these packets, and the publication is bounded at 256 routes per packet with no handling yet for a larger batch. Execution is unchanged; these are counts and a payload, not a hybrid path.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, 3/3 MoE CTests and diff check passed; the smoke matched its reference. Artifacts: `build/hybrid-publish-{build,probe,layer,range,staging,full}.log`, `build/run-qwen-admit-smoke.{py,json,log}`.
+
+Next: a CPU worker that consumes these packets and computes the cold routes, then the return path, results into mapped memory and a doorbell wait before the combine, after which admission can switch from counting to deciding.
+
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
 ### Stream-ordered insertion without an intermediate drain

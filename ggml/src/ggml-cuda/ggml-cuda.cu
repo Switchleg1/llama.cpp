@@ -2520,6 +2520,136 @@ bool ggml_backend_cuda_moe_hybrid_execute_hot(
     return ggml_cuda_mul_mat_id_impl(*cuda_ctx, &result, ggml_cuda_moe_use_mmq(&down_view, n_hits));
 }
 
+// Diagnostic only: holds a transaction after the region executed, recomputes its resident routes from the
+// slot arena and compares them with the output the graph produced. Allocates and synchronizes, so it is
+// not an inference path. Returns false when the region cannot be shadowed.
+static bool ggml_backend_cuda_moe_hybrid_shadow(
+        ggml_backend_t backend,
+        const ggml_tensor * ids,
+        const ggml_tensor * input,
+        const ggml_tensor * down_output,
+        const ggml_tensor * gate,
+        const ggml_tensor * up,
+        const ggml_tensor * down,
+        bool gelu,
+        ggml_backend_moe_hybrid_shadow_result * result) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || ids == nullptr || input == nullptr ||
+            down_output == nullptr || gate == nullptr || up == nullptr || down == nullptr || result == nullptr) {
+        return false;
+    }
+    result->n_routes = -1;
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    auto * context  = cuda_ctx->moe_grouped_context;
+    if (context == nullptr || ids->type != GGML_TYPE_I32 || input->type != GGML_TYPE_F32 ||
+            down_output->type != GGML_TYPE_F32) {
+        return false;
+    }
+    result->n_routes = -2;
+    ggml_cuda_moe_candidate_group_key key = {};
+    ggml_cuda_moe_grouped_acquisition acquisition = {};
+    if (!context->find_down_group_key(down, &key)) {
+        return false;
+    }
+    result->n_routes = -3;
+    if (!context->acquire_group_resources(key, &acquisition)) {
+        return false;
+    }
+    result->n_routes = -4;
+    ggml_cuda_moe_grouped_resource_info info = {};
+    const int64_t n_experts = down->ne[2];
+    if (!context->get_group_resources(acquisition, &info)) {
+        return false;
+    }
+    result->n_routes = -40 - (int32_t) info.n_slots;
+    result->n_hot    = (int32_t) info.transaction_active;
+    if (info.n_slots == 0 || n_experts <= 0 || n_experts > INT32_MAX) {
+        return false;
+    }
+    ggml_cuda_moe_grouped_transaction transaction = {};
+    if (!context->begin_group_transaction(acquisition, &transaction)) {
+        return false;
+    }
+    result->n_routes = -5;
+    bool ok = false;
+    auto * stream = cuda_ctx->stream();
+    const int64_t n_embd  = input->ne[0];
+    const int64_t n_rows  = input->ne[1];
+    const int64_t top_k   = ids->ne[0];
+    const int64_t routes  = top_k * n_rows;
+    const size_t  ints    = (size_t) (5 * routes + 2 + n_experts) * sizeof(int32_t);
+    int32_t * device_ints = nullptr;
+    float   * device_act  = nullptr;
+    float   * device_hot  = nullptr;
+    void    * device_work = nullptr;
+    const size_t work_bytes = ggml_backend_cuda_moe_hybrid_hot_scratch_bytes(routes, down->ne[1]);
+    if (work_bytes != 0 &&
+            cudaMalloc(&device_ints, ints) == cudaSuccess &&
+            cudaMalloc(&device_act, routes * n_embd * sizeof(float)) == cudaSuccess &&
+            cudaMalloc(&device_hot, routes * n_embd * sizeof(float)) == cudaSuccess &&
+            cudaMalloc(&device_work, work_bytes) == cudaSuccess) {
+        int32_t * hot_slots     = device_ints;
+        int32_t * hot_rows      = hot_slots + routes;
+        int32_t * hot_columns   = hot_rows + routes;
+        int32_t * cold_ids      = hot_columns + routes;
+        int32_t * cold_columns  = cold_ids + routes;
+        int32_t * counts        = cold_columns + routes;
+        int32_t * residents     = counts + 2;
+        int32_t host_counts[2]  = {-1, -1};
+        result->n_routes = -6;
+        if (context->snapshot_resident_slots(transaction, stream, residents, n_experts) &&
+                ggml_cuda_moe_hybrid_select(
+                    static_cast<const int32_t *>(ids->data), ids->nb[1] / sizeof(int32_t), (int32_t) top_k,
+                    (int32_t) n_rows, residents, (int32_t) n_experts, (int32_t) info.n_slots,
+                    hot_slots, hot_columns, hot_rows, cold_ids, cold_columns, counts, stream) &&
+                cudaMemcpyAsync(host_counts, counts, sizeof(host_counts), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                cudaStreamSynchronize(stream) == cudaSuccess &&
+                host_counts[0] >= 0) {
+            result->n_routes = (int32_t) routes;
+            result->n_hot    = host_counts[0];
+            result->nmse     = 0.0;
+            ok = true;
+            if (host_counts[0] > 0 &&
+                    (!ggml_cuda_moe_hybrid_gather_rows(static_cast<const float *>(input->data), n_embd, n_rows,
+                         hot_rows, host_counts[0], device_act, stream) ||
+                     !ggml_backend_cuda_moe_hybrid_execute_hot(backend, transaction, gate, up, down, device_act,
+                         hot_slots, host_counts[0], gelu, device_work, work_bytes, device_hot))) {
+                ok = false;
+            }
+            if (ok && host_counts[0] > 0) {
+                std::vector<float> produced((size_t) host_counts[0] * n_embd);
+                std::vector<float> expected(produced.size());
+                std::vector<int32_t> columns(host_counts[0]);
+                ok = cudaMemcpyAsync(produced.data(), device_hot, produced.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                     cudaMemcpyAsync(columns.data(), hot_columns, columns.size() * sizeof(int32_t),
+                         cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                     cudaStreamSynchronize(stream) == cudaSuccess;
+                for (int32_t job = 0; ok && job < host_counts[0]; ++job) {
+                    const int32_t column = columns[job];
+                    ok = column >= 0 && column < routes &&
+                         cudaMemcpyAsync(expected.data() + (size_t) job * n_embd,
+                             static_cast<const char *>(down_output->data) + (size_t) column * down_output->nb[1],
+                             n_embd * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+                }
+                ok = ok && cudaStreamSynchronize(stream) == cudaSuccess;
+                double error = 0.0, norm = 0.0;
+                for (size_t i = 0; ok && i < produced.size(); ++i) {
+                    const double difference = (double) produced[i] - expected[i];
+                    error += difference * difference;
+                    norm  += (double) expected[i] * expected[i];
+                }
+                result->nmse = norm > 0.0 ? error / norm : error;
+            }
+        }
+    }
+    cudaFree(device_ints);
+    cudaFree(device_act);
+    cudaFree(device_hot);
+    cudaFree(device_work);
+    context->end_group_transaction(transaction);
+    return ok;
+}
+
 bool ggml_cuda_moe_quantize_q8_1_for_test(const float * input, void * output, int64_t width,
         int64_t rows, ggml_cuda_moe_stream_t stream) {
     if (input == nullptr || output == nullptr || stream == nullptr || width <= 0 || rows <= 0 ||
@@ -3490,6 +3620,24 @@ static void ggml_cuda_mul_mat_id_cached(
     const bool ids_group_pending = ids_host.group_pending;
     const size_t expert_stride = src0->nb[2];
 
+    // Diagnostic: record the routed experts so admission policies can be replayed offline.
+    static FILE * route_dump = []() -> FILE * {
+        const char * path = getenv("LLAMA_MOE_ROUTE_DUMP");
+        return path != nullptr ? fopen(path, "w") : nullptr;
+    }();
+    if (route_dump != nullptr && ids_host_bytes != nullptr) {
+        fprintf(route_dump, "%s %d", src0->name, (int) telemetry_is_decode);
+        for (int64_t i2 = 0; i2 < ids->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+                for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+                    fprintf(route_dump, " %d", *(const int32_t *) (ids_host_bytes->data() +
+                        i2*ids_host_nb2 + i1*ids_host_nb1 + i0*ids_host_nb0));
+                }
+            }
+        }
+        fputc('\n', route_dump);
+    }
+
     if (cache == nullptr) {
         ggml_cuda_mul_mat_id_staged(
             ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2,
@@ -3727,6 +3875,128 @@ static inline void ggml_cuda_moe_shadow_probe(
     ggml_cuda_moe_shadow_probe_registered(*registry, weight, ids, fusion);
 }
 
+// Diagnostic: re-runs the down projection of the routes already selected by the grouped path, reading the
+// same slot arena in place through a compact route list, and compares. Synchronizes, so it is not a path.
+static void ggml_cuda_moe_hybrid_compact_check(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_moe_graph_group_dispatch & group,
+        const ggml_tensor & bank_view,
+        const ggml_tensor & ids_view,
+        const ggml_tensor * dst,
+        bool use_mmq,
+        ggml_cuda_mmid_consumer consumer,
+        const ggml_cuda_mmid_direct_source_view & direct_source_view) {
+    static const bool enabled = getenv("LLAMA_MOE_HYBRID_COMPACT_CHECK") != nullptr;
+    if (!enabled || dst == nullptr || dst->src[1] == nullptr) {
+        return;
+    }
+    // Allocating, copying and synchronizing are illegal while the stream is capturing.
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(ctx.stream(), &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    const int64_t n_routes = ids_view.ne[0] * ids_view.ne[1];
+    const int64_t n_embd   = dst->ne[0];
+    if (n_routes <= 0 || n_embd <= 0 || dst->type != GGML_TYPE_F32) {
+        return;
+    }
+    auto * stream = ctx.stream();
+    float * compact = nullptr;
+    if (cudaMalloc(&compact, (size_t) n_routes * n_embd * sizeof(float)) != cudaSuccess) {
+        return;
+    }
+    const ggml_tensor * src1 = dst->src[1];
+    if (!ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || !ggml_is_contiguous(&ids_view)) {
+        cudaFree(compact);
+        return;
+    }
+    // Split the routes in two disjoint halves, run each against the arena, then scatter both together.
+    const int64_t n_ff = src1->ne[0];
+    const int64_t halves[2] = { n_routes / 2, n_routes - n_routes / 2 };
+    int32_t * subset_ids = nullptr;
+    int32_t * subset_columns = nullptr;
+    int32_t * subset_count = nullptr;
+    float   * subset_act = nullptr;
+    float   * subset_out = nullptr;
+    bool ok = halves[0] > 0 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+        cudaMalloc(&subset_ids, (size_t) n_routes * sizeof(int32_t)) == cudaSuccess &&
+        cudaMalloc(&subset_columns, (size_t) n_routes * sizeof(int32_t)) == cudaSuccess &&
+        cudaMalloc(&subset_count, sizeof(int32_t)) == cudaSuccess &&
+        cudaMalloc(&subset_act, (size_t) n_routes * n_ff * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&subset_out, (size_t) n_routes * n_embd * sizeof(float)) == cudaSuccess &&
+        cudaMemsetAsync(compact, 0, (size_t) n_routes * n_embd * sizeof(float), stream) == cudaSuccess;
+    for (int half = 0; ok && half < 2; ++half) {
+        const int64_t begin = half == 0 ? 0 : halves[0];
+        const int64_t count = halves[half];
+        std::vector<int32_t> columns(count);
+        for (int64_t i = 0; i < count; ++i) {
+            columns[i] = (int32_t) (begin + i);
+        }
+        const int32_t host_count = (int32_t) count;
+        ok = cudaMemcpyAsync(subset_ids, (const int32_t *) ids_view.data + begin, count * sizeof(int32_t),
+                 cudaMemcpyDeviceToDevice, stream) == cudaSuccess &&
+             cudaMemcpyAsync(subset_columns, columns.data(), count * sizeof(int32_t),
+                 cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+             cudaMemcpyAsync(subset_count, &host_count, sizeof(host_count), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+             ggml_cuda_moe_hybrid_gather_rows((const float *) src1->data, n_ff, n_routes, subset_columns,
+                 (int32_t) count, subset_act, stream);
+        if (!ok) {
+            break;
+        }
+        ggml_tensor activation = *src1;
+        activation.data = subset_act;
+        activation.ne[1] = count;
+        activation.nb[2] = activation.nb[1] * count;
+        activation.nb[3] = activation.nb[2];
+        ggml_tensor routes = ids_view;
+        routes.data = subset_ids;
+        routes.ne[0] = count;
+        routes.nb[1] = routes.nb[0] * count;
+        routes.nb[2] = routes.nb[1];
+        routes.nb[3] = routes.nb[1];
+        ggml_tensor shadow = *dst;
+        shadow.data = subset_out;
+        shadow.ne[1] = count;
+        shadow.nb[2] = shadow.nb[1] * count;
+        shadow.nb[3] = shadow.nb[2];
+        shadow.src[0] = const_cast<ggml_tensor *>(&bank_view);
+        shadow.src[1] = &activation;
+        shadow.src[2] = &routes;
+        ok = ggml_cuda_mul_mat_id_impl(ctx, &shadow, use_mmq, nullptr, consumer, &direct_source_view) &&
+             ggml_cuda_moe_hybrid_scatter_add(compact, subset_out, subset_columns, subset_count, n_routes,
+                 n_embd, stream);
+        if (!ok) {
+            GGML_LOG_INFO("moe-hybrid-subset: semantic_group=%u half=%d refused count=%d\n",
+                group.key.candidate.group_index, half, (int) count);
+        }
+    }
+    const bool dispatched = ok;
+    cudaFree(subset_ids);
+    cudaFree(subset_columns);
+    cudaFree(subset_count);
+    cudaFree(subset_act);
+    cudaFree(subset_out);
+    if (!dispatched) {
+        cudaFree(compact);
+        return;
+    }
+    std::vector<float> produced((size_t) n_routes * n_embd);
+    std::vector<float> expected(produced.size());
+    ok =
+        cudaMemcpyAsync(produced.data(), compact, produced.size() * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+        cudaMemcpyAsync(expected.data(), dst->data, expected.size() * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+        cudaStreamSynchronize(stream) == cudaSuccess;
+    double error = 0.0, norm = 0.0;
+    for (size_t i = 0; ok && i < produced.size(); ++i) {
+        const double difference = (double) produced[i] - expected[i];
+        error += difference * difference;
+        norm  += (double) expected[i] * expected[i];
+    }
+    GGML_LOG_INFO("moe-hybrid-subset: semantic_group=%u ok=%d routes=%d nmse=%g\n",
+        group.key.candidate.group_index, (int) ok, (int) n_routes, ok && norm > 0.0 ? error / norm : -1.0);
+    cudaFree(compact);
+}
+
 static bool ggml_cuda_moe_group_views(
         const ggml_cuda_moe_graph_group_dispatch & group,
         const ggml_cuda_moe_graph_binding & binding,
@@ -3940,9 +4210,12 @@ static bool ggml_cuda_mul_mat_id(
         if (!dispatched) {
             return false;
         }
-        if (binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT &&
-                !ctx.moe_grouped_context->finish_graph_group(group, binding, dst, ctx.stream())) {
-            return false;
+        if (binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) {
+            ggml_cuda_moe_hybrid_compact_check(ctx, *group, bank_view, ids_view, dst, use_mmq,
+                static_cast<ggml_cuda_mmid_consumer>(capability.consumer), direct_source_view);
+            if (!ctx.moe_grouped_context->finish_graph_group(group, binding, dst, ctx.stream())) {
+                return false;
+            }
         }
         return true;
     }
@@ -8615,6 +8888,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_HYBRID_SHADOW_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_hybrid_shadow;
     }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_cached_buffer_type;

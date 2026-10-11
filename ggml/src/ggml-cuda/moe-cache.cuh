@@ -1117,6 +1117,11 @@ bool ggml_cuda_moe_hybrid_select(
         int32_t * hot_slots, int32_t * hot_rows, int32_t * hot_columns, int32_t * cold_ids, int32_t * cold_columns,
         int32_t * counts, ggml_cuda_moe_stream_t stream);
 
+// Copies the rows named by rows[0..n) out of src into packed dst rows.
+bool ggml_cuda_moe_hybrid_gather_rows(
+        const float * src, int64_t n_embd, int64_t n_src_rows, const int32_t * rows, int32_t n_rows,
+        float * dst, ggml_cuda_moe_stream_t stream);
+
 // FFN intermediate bytes only; existing CUDA matmul paths also use their backend pool.
 size_t ggml_backend_cuda_moe_hybrid_hot_scratch_bytes(int64_t n_hits, int64_t n_ff);
 
