@@ -1191,7 +1191,6 @@ llama_context::~llama_context() {
         LLAMA_LOG_WARN("moe-expert-store: cold routes=%llu\n", (unsigned long long) moe_hybrid_store_routes);
     }
     moe_hybrid_cpu.clear();
-    moe_hybrid_store.reset();
     if (moe_hybrid_cpu_pool != nullptr) {
         ggml_threadpool_free(moe_hybrid_cpu_pool);
     }
@@ -2098,25 +2097,14 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
         }
     }
     static const char * store_mb = getenv("LLAMA_MOE_EXPERT_STORE_MB");
-    if (store_mb != nullptr && !moe_hybrid_store_required) {
+    if (store_mb != nullptr && !moe_hybrid_store_required && !model.hparams.no_alloc) {
         moe_hybrid_store_required = true;
         const auto & groups = model.moe_sources();
-        size_t bundle = 0;
-        for (const auto & group : groups) {
-            size_t bytes = 0;
-            for (const auto & bank : group.banks) {
-                if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor != nullptr) {
-                    bytes += (bank.tensor->nb[2] + 63) / 64 * 64;
-                }
-            }
-            bundle = std::max(bundle, bytes);
-        }
         const size_t budget = size_t(std::max(0LL, atoll(store_mb))) * 1024 * 1024;
-        // Cold calls are serialized under moe_hybrid_cpu_mutex; 16 staged bundles cover most layer batches.
-        // Pinned like Strata's RAM complement, so GPU copies avoid pageable staging; pageable if locking fails.
+        // Pinned like Strata's RAM complement; pageable if locking fails. Shared by the model's contexts.
         ggml_backend_buffer_type_t host_buft = model.devices.empty() ? nullptr :
             ggml_backend_dev_host_buffer_type(model.devices[0].dev);
-        moe_hybrid_store = model.create_moe_expert_store({}, {}, budget, 16 * bundle, 16, host_buft);
+        moe_hybrid_store = model.moe_expert_store(budget, host_buft);
         if (!moe_hybrid_store) {
             LLAMA_LOG_ERROR("moe-expert-store: creation failed; cold routes will fail\n");
         } else {
@@ -2127,9 +2115,6 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
                     }
                 }
             }
-            LLAMA_LOG_WARN("moe-expert-store: resident=%.2f MiB staging=%.2f MiB groups=%zu pinned=%d\n",
-                moe_hybrid_store->resident_bytes() / 1048576.0, moe_hybrid_store->staging_bytes() / 1048576.0,
-                groups.size(), (int) moe_hybrid_store->pinned());
         }
         if (moe_hybrid_cold_failures == nullptr) {
             for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {

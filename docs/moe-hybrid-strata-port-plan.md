@@ -2028,6 +2028,40 @@ Artifacts: `build/store-live-*.log`, `build/store-pinned-*.log`, `build/qwen-kld
 
 Next: point grouped CUDA fills at store memory (bank-major resident layout or per-expert bundle uploads through `upload_expert`), then exclude GPU-resident experts (complement) with event-bound exchanges. The failure injection of a live store read error has not been run; the strict channel was exercised live only by the unplanned-packet case above.
 
+### GPU fills from the model-owned store
+
+The store is now owned by the model (`llama_model::moe_expert_store()`), built once on first use and shared by its contexts, and freed after they are. `no_alloc` probe models (cache `auto` sizing) never build one. When every expert of a routed bank is resident and the store is pinned, the model registers per-expert host addresses through `GGML_BACKEND_MOE_SET_EXPERT_SOURCES`; the CUDA side validates count, stride, 16-byte alignment and that each pointer is pinned host memory, and unregisters in the model destructor. Grouped device resources created afterwards copy misses from those addresses: evenly spaced experts (one store bundle apart) use a base plus source stride, anything else a per-expert device table. Such banks are marked `MOE_GROUPED_SOURCE_EXPERT_TABLE`, so base-plus-expert-stride readers (device prefetch, early prediction) do not treat them as mapped tensor data. Banks that are not fully resident keep their previous source, so this removes the duplicate only at full residency. Resources created before the store exists keep the old source too; in practice the store is built at the first graph build, before any resource.
+
+Unit checks: pinned resident pointers register; wrong stride, wrong count and a pageable pointer are refused; null unregisters.
+
+Live (IQ3_S, decide, 32 slots, KLD harness): all 3.14 GB of decode fills came from the store (`source_mapped_bytes`, no pageable or registered-file bytes), with KLD still 0.008835 / 97.884%. Server, 40 slots, d2: 29.97 tok/s with 48.5 GiB shared GPU memory, identical greedy text, against 17.5 tok/s for the duplicated store and 31.4 for legacy pinned.
+
+At the launcher's tuned configuration (d2, hybrid budget 64, auto 77 slots), interleaved pairs of store and legacy pinned (median decode tok/s): 52.84/57.86, 54.71/58.18, 54.33/57.07, 50.29/53.98, 44.43/50.51, 46.11/52.36, 50.91/52.04, 49.82/51.76, 41.30/50.42. The machine drifted slower across the session, and the store has larger variance. Fill counts and bytes were identical in both modes. The store cold path costs about 4% more per call (304 vs 292 us), too little to explain the gap. Base-plus-stride sources gave no improvement over the table. A zero-copy microbenchmark showed `cudaMallocHost` at 46.5 GB/s and `cudaHostRegister` at 49.2 GB/s (`build/zerocopy-bench.cu`). Building the store reads the whole file and lowers available RAM to about 14 GiB, with hard faults continuing early in decode; the remaining mmap file pages compete with the mmap'd host lookup tables. The likely fix is not to map or prefetch expert ranges when the store owns them, so it has not been tuned further.
+
+Artifacts: `build/store-gpu-source-*.log`, `build/qwen-kld-hybrid-storesrc.log`, `build/bench-{store,legacy}*-bench.log`, `build/run-bench-faults.py`, `build/moe-tuned-store.json`.
+
+Next: bounded residency for fills (the device planner must not choose experts that are only file-backed; those stay cold on the CPU), skip mmap prefetch for store-owned expert ranges, then complement and exchanges.
+
+### Bounded residency for GPU fills
+
+Expert source registration now accepts null entries: an expert the store does not hold is never filled and stays with the CPU, which computes it from bounded file staging. The model registers every routed bank, including banks with no resident experts. A grouped resource uses owner sources for all its banks or none. When any expert is unfillable, it uploads a per-expert `fillable` mask, which the decide planner honors by refusing slot candidates for that expert, so the miss stays cold. Other planners cannot leave a miss unfilled, so a partial resource is created only with decide and the doorbell enabled, and dispatch falls back to the ordinary path for any call that would not use decide (for example more than 8 rows or 64 routes). Required-grouped calls in the current speculative shapes stay within those limits. Without usage statistics, the store's resident budget is now ranked round-robin across layers instead of filling whole leading layers.
+
+Results (IQ3_S, decide, ub=1 KLD harness, 32 slots):
+
+| Store budget | GPU fill sources | Cold routes | KLD | Same top |
+| --- | --- | --- | --- | --- |
+| full (47.96 GiB) | 3.14 GB store | 298,360 | 0.008835 | 97.884% |
+| 8 GiB, round-robin | 3.14 GB store, 0 file | 310,490 | 0.009146 +- 0.001799 | 97.619% |
+| 0 | none | 365,750 (all) | 0.007730 +- 0.001450 | 97.619% |
+
+KLD moves with how many routes run on the CPU rather than the GPU (their roundings differ, as measured earlier); all values are within the statistical error of each other and of the full-store run. Before round-robin ranking, an 8 GiB store filled only nine leading layers, and the other layers' fills still came from pageable mmap (2.59 GB); that is the case the ranking and all-null registration close.
+
+Server, tuned launcher configuration with a 24 GiB store: 10.07 tok/s. About half the experts are file-backed, so each token reads on the order of a gigabyte through positional reads from the OS file cache. This bounded mode is functional, not fast; a usage-ranked complement (Strata ranks from a profile) and prefetching are the levers. No speed claim.
+
+Artifacts: `build/store-partial-*.log`, `build/qwen-kld-hybrid-partial{8g,0}.log`, `build/bench-store24-bench.log`.
+
+Still open: prefill and other non-decide calls fall back to the ordinary path, which reads the mmap'd tensors, so RAM is bounded only for decide-mode decode; mmap prefetch of expert ranges is unchanged; usage-ranked residency, complement exchanges with event-bound commits, and the prefill replacement remain.
+
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
 ### Stream-ordered insertion without an intermediate drain

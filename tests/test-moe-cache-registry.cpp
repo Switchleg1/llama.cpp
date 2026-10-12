@@ -2498,6 +2498,29 @@ void test_moe_expert_store() {
         CHECK(lease && cudaPointerGetAttributes(&attributes, lease.data(0)) == cudaSuccess);
         CHECK(attributes.type == cudaMemoryTypeHost);
         CHECK(std::memcmp(lease.data(0), bytes.data(), 64) == 0);
+        store_type full;
+        CHECK(full.init(groups, {}, {}, 704, 0, 0, read, &source, {}, ggml_backend_cuda_host_buffer_type()));
+        ggml_tensor bank = {};
+        bank.ne[2] = 4;
+        bank.nb[2] = 64;
+        std::array<const void *, 4> hosts;
+        for (uint32_t e = 0; e < 4; ++e) {
+            hosts[e] = full.resident_data({0, e}, 1);
+            CHECK(hosts[e] != nullptr && std::memcmp(hosts[e], bytes.data() + e * 128 + 64, 64) == 0);
+        }
+        CHECK(!pinned.resident_data({0, 1}, 0));
+        CHECK(ggml_backend_cuda_moe_set_expert_sources(&bank, hosts.data(), 4, 64));
+        CHECK(!ggml_backend_cuda_moe_set_expert_sources(&bank, hosts.data(), 4, 128));
+        CHECK(!ggml_backend_cuda_moe_set_expert_sources(&bank, hosts.data(), 3, 64));
+        std::array<const void *, 4> pageable = hosts;
+        pageable[2] = bytes.data();
+        CHECK(!ggml_backend_cuda_moe_set_expert_sources(&bank, pageable.data(), 4, 64));
+        std::array<const void *, 4> partial = hosts;
+        partial[2] = nullptr;
+        CHECK(ggml_backend_cuda_moe_set_expert_sources(&bank, partial.data(), 4, 64));
+        partial.fill(nullptr);
+        CHECK(ggml_backend_cuda_moe_set_expert_sources(&bank, partial.data(), 4, 64));
+        CHECK(ggml_backend_cuda_moe_set_expert_sources(&bank, nullptr, 0, 0));
         store_type empty_pinned;
         CHECK(empty_pinned.init(groups, gpu, {}, 0, 0, 0, read, &source, {}, ggml_backend_cuda_host_buffer_type()));
         CHECK(!empty_pinned.pinned());

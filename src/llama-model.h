@@ -798,6 +798,9 @@ struct llama_model {
     void finalize_moe_expert_cache();
     const std::vector<llama_moe_source_group> & moe_sources() const;
     void retain_moe_file_sources(const llama_model_loader & ml);
+    // One store shared by every context of this model, built on first use. Fully resident banks become the GPU
+    // fill sources of grouped resources created afterwards. Returns null when the store cannot be built.
+    llama_moe_expert_store * moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft) const;
     // Group ids follow moe_sources(); banks contain only routed base weights, in the same order.
     std::unique_ptr<llama_moe_expert_store> create_moe_expert_store(
         const std::vector<llama_moe_expert_store::expert> & gpu,

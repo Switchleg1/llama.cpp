@@ -377,6 +377,23 @@ llama_moe_expert_store::exchange & llama_moe_expert_store::exchange::operator=(e
     return *this;
 }
 size_t llama_moe_expert_store::resident_bytes() const { return state ? state->resident_size : 0; }
+const void * llama_moe_expert_store::resident_data(expert key, uint32_t bank) const {
+    if (!state) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const uint32_t index = state->index(key);
+    if (index == UINT32_MAX) {
+        return nullptr;
+    }
+    const auto & entry = state->entries[index];
+    const auto & layout = state->layouts[key.group];
+    if (entry.gpu || entry.offset == SIZE_MAX || bank >= layout.offsets.size()) {
+        return nullptr;
+    }
+    return state->resident_data() + entry.offset + layout.offsets[bank];
+}
+
 bool llama_moe_expert_store::pinned() const {
     return state && state->pinned && (state->resident || state->staging);
 }

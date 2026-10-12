@@ -78,6 +78,9 @@ public:
     size_t staging_bytes() const;
     // True when both buffers came from host_buft rather than the pageable CPU fallback.
     bool pinned() const;
+    // Resident bank bytes without a lease, or null. Valid until the store is destroyed; callers must not use
+    // this while exchanges can run, since commit moves bundles.
+    const void * resident_data(expert key, uint32_t bank) const;
 private:
     std::shared_ptr<impl> state;
 };

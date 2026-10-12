@@ -381,7 +381,7 @@ private:
     std::unordered_map<const ggml_tensor *, std::unique_ptr<llm_graph_moe_hybrid_cpu>> moe_hybrid_cpu;
     std::vector<float> moe_hybrid_cpu_output;
     // Opt-in bounded expert store for cold routes. Store errors fail the graph; no fallback to bank pointers.
-    std::unique_ptr<llama_moe_expert_store> moe_hybrid_store;
+    llama_moe_expert_store * moe_hybrid_store = nullptr;   // owned by the model
     std::unordered_map<const ggml_tensor *, uint32_t> moe_hybrid_store_groups;
     bool moe_hybrid_store_required = false;
     uint64_t moe_hybrid_store_routes = 0;

@@ -28,6 +28,8 @@
 #include "ggml-cpp.h"
 #include "../ggml/src/ggml-backend-moe.h"
 
+#include <mutex>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -1228,6 +1230,11 @@ struct llama_model::impl {
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
     std::vector<llama_moe_source_group> moe_sources;
     std::shared_ptr<llama_moe_file_sources> moe_file_sources;
+    std::mutex moe_store_mutex;
+    bool moe_store_attempted = false;
+    std::unique_ptr<llama_moe_expert_store> moe_store;
+    std::vector<const ggml_tensor *> moe_store_registered;
+    ggml_backend_moe_set_expert_sources_t moe_set_expert_sources = nullptr;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1323,6 +1330,10 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    for (const auto * tensor : pimpl->moe_store_registered) {
+        pimpl->moe_set_expert_sources(tensor, nullptr, 0, 0);
+    }
+    pimpl->moe_store.reset();
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -3156,6 +3167,84 @@ void llama_model::retain_moe_file_sources(const llama_model_loader & ml) {
         sources->groups.push_back(std::move(banks));
     }
     pimpl->moe_file_sources = std::move(sources);
+}
+
+llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft) const {
+    std::lock_guard<std::mutex> lock(pimpl->moe_store_mutex);
+    if (pimpl->moe_store_attempted) {
+        return pimpl->moe_store.get();
+    }
+    pimpl->moe_store_attempted = true;
+    size_t bundle = 0;
+    for (const auto & group : pimpl->moe_sources) {
+        size_t bytes = 0;
+        for (const auto & bank : group.banks) {
+            if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor) {
+                bytes += (bank.tensor->nb[2] + 63) / 64 * 64;
+            }
+        }
+        bundle = std::max(bundle, bytes);
+    }
+    // 16 staged bundles cover most layer batches of file-backed experts.
+    // Without usage statistics, share the resident budget evenly across layers.
+    std::vector<llama_moe_expert_store::expert> rank;
+    uint32_t max_experts = 0;
+    for (const auto & group : pimpl->moe_sources) {
+        for (const auto & bank : group.banks) {
+            if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor) {
+                max_experts = std::max(max_experts, uint32_t(bank.tensor->ne[2]));
+            }
+        }
+    }
+    for (uint32_t e = 0; e < max_experts; ++e) {
+        for (uint32_t g = 0; g < pimpl->moe_sources.size(); ++g) {
+            for (const auto & bank : pimpl->moe_sources[g].banks) {
+                if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor) {
+                    if (e < bank.tensor->ne[2]) {
+                        rank.push_back({g, e});
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    pimpl->moe_store = create_moe_expert_store({}, rank, resident_budget, 16 * bundle, 16, host_buft);
+    if (!pimpl->moe_store) {
+        return nullptr;
+    }
+    auto & store = *pimpl->moe_store;
+    for (size_t i = 0; i < ggml_backend_reg_count() && !pimpl->moe_set_expert_sources; ++i) {
+        pimpl->moe_set_expert_sources = (ggml_backend_moe_set_expert_sources_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_reg_get(i), GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME);
+    }
+    size_t registered_bytes = 0;
+    if (pimpl->moe_set_expert_sources && store.pinned()) {
+        std::vector<const void *> hosts;
+        for (uint32_t g = 0; g < pimpl->moe_sources.size(); ++g) {
+            uint32_t index = 0;
+            for (const auto & bank : pimpl->moe_sources[g].banks) {
+                if (bank.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                    continue;
+                }
+                const uint32_t n = uint32_t(bank.tensor->ne[2]);
+                hosts.assign(n, nullptr);
+                for (uint32_t e = 0; e < n; ++e) {
+                    hosts[e] = store.resident_data({g, e}, index);
+                }
+                ++index;
+                // File-backed experts stay null: the GPU never fills them, the CPU computes them from staging.
+                const size_t held = n - std::count(hosts.begin(), hosts.end(), nullptr);
+                if (pimpl->moe_set_expert_sources(bank.tensor, hosts.data(), n, bank.tensor->nb[2])) {
+                    pimpl->moe_store_registered.push_back(bank.tensor);
+                    registered_bytes += held * bank.tensor->nb[2];
+                }
+            }
+        }
+    }
+    LLAMA_LOG_INFO("%s: resident=%.2f MiB staging=%.2f MiB pinned=%d gpu_source_banks=%zu (%.2f MiB)\n", __func__,
+        store.resident_bytes() / 1048576.0, store.staging_bytes() / 1048576.0, (int) store.pinned(),
+        pimpl->moe_store_registered.size(), registered_bytes / 1048576.0);
+    return pimpl->moe_store.get();
 }
 
 std::unique_ptr<llama_moe_expert_store> llama_model::create_moe_expert_store(

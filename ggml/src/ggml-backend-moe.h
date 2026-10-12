@@ -80,6 +80,18 @@ typedef void (*ggml_backend_moe_hybrid_set_cold_handler_t)(ggml_backend_moe_hybr
 typedef void (*ggml_backend_moe_hybrid_set_cold_strict_t)(bool strict);
 typedef uint64_t (*ggml_backend_moe_hybrid_cold_failures_t)(void);
 
+// Pinned per-expert sources for a routed bank tensor; grouped resources created afterwards fill from them.
+// A null entry marks an expert the owner does not hold: it is never filled and stays with the CPU.
+// The owner keeps the memory valid until it unregisters (null hosts) and the backend has released resources.
+// Planned-call count per expert since the grouped resource holding this bank was created. Synchronizes.
+#define GGML_BACKEND_MOE_EXPERT_USAGE_PROC_NAME "ggml_backend_moe_expert_usage"
+typedef bool (*ggml_backend_moe_expert_usage_t)(
+        ggml_backend_t backend, const struct ggml_tensor * tensor, uint32_t * counts, uint32_t n);
+
+#define GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME "ggml_backend_moe_set_expert_sources"
+typedef bool (*ggml_backend_moe_set_expert_sources_t)(
+        const struct ggml_tensor * tensor, const void * const * hosts, uint32_t n_experts, size_t stride);
+
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC 0x4d4f4532u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION 2u
 

@@ -486,6 +486,8 @@ enum moe_grouped_source_path : uint32_t {
     MOE_GROUPED_SOURCE_MAPPED,
     MOE_GROUPED_SOURCE_DEVICE,
     MOE_GROUPED_SOURCE_PATH_COUNT,
+    // Per-expert table into owner memory; not a telemetry path, and not usable by base+stride readers.
+    MOE_GROUPED_SOURCE_EXPERT_TABLE = 0x100,
 };
 
 enum moe_grouped_transfer_counter : uint32_t {
@@ -2721,12 +2723,102 @@ static bool moe_grouped_plan_size(uint32_t capacity, uint32_t n_experts, size_t 
     return true;
 }
 
+// Owner-provided pinned expert sources, keyed by bank tensor. The owner keeps the memory alive while registered
+// and unregisters before freeing it; resources created afterwards copy from these instead of the tensor data.
+struct moe_expert_source_entry {
+    size_t stride = 0;
+    std::vector<const void *> hosts;
+};
+
+static std::mutex & moe_expert_source_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<const ggml_tensor *, moe_expert_source_entry> & moe_expert_source_entries() {
+    static std::unordered_map<const ggml_tensor *, moe_expert_source_entry> entries;
+    return entries;
+}
+
+// Device aliases per expert; null marks an expert the owner does not hold. Call on the resource's device.
+static bool moe_expert_source_lookup(const ggml_tensor * tensor, uint32_t n_experts, size_t stride,
+        std::vector<const char *> * device_sources) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(n_experts);
+    GGML_UNUSED(stride);
+    GGML_UNUSED(device_sources);
+    return false;
+#else
+    std::lock_guard<std::mutex> lock(moe_expert_source_mutex());
+    const auto found = moe_expert_source_entries().find(tensor);
+    if (found == moe_expert_source_entries().end() || found->second.stride != stride ||
+            found->second.hosts.size() != n_experts) {
+        return false;
+    }
+    if (device_sources == nullptr) {
+        return true;
+    }
+    device_sources->resize(n_experts);
+    for (uint32_t e = 0; e < n_experts; ++e) {
+        void * alias = nullptr;
+        if (found->second.hosts[e] == nullptr) {
+            (*device_sources)[e] = nullptr;
+            continue;
+        }
+        if (cudaHostGetDevicePointer(&alias, const_cast<void *>(found->second.hosts[e]), 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        (*device_sources)[e] = static_cast<const char *>(alias);
+    }
+    return true;
+#endif
+}
+
+} // namespace
+
+bool ggml_backend_cuda_moe_set_expert_sources(const ggml_tensor * tensor, const void * const * hosts,
+        uint32_t n_experts, size_t stride) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(moe_expert_source_mutex());
+    if (hosts == nullptr) {
+        moe_expert_source_entries().erase(tensor);
+        return true;
+    }
+    if (n_experts == 0 || tensor->ne[2] != n_experts || tensor->nb[2] != stride || stride % sizeof(uint4) != 0) {
+        return false;
+    }
+    moe_expert_source_entry entry;
+    entry.stride = stride;
+    entry.hosts.assign(hosts, hosts + n_experts);
+    for (const void * host : entry.hosts) {
+        cudaPointerAttributes attributes = {};
+        if (host == nullptr) {
+            continue;
+        }
+        if (reinterpret_cast<uintptr_t>(host) % alignof(uint4) != 0 ||
+                cudaPointerGetAttributes(&attributes, host) != cudaSuccess || attributes.type != cudaMemoryTypeHost) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    moe_expert_source_entries()[tensor] = std::move(entry);
+    return true;
+}
+
+namespace {
+
 struct moe_grouped_device_bank {
     const char * source;
     char * data;
     size_t expert_stride;
     uint32_t source_path = MOE_GROUPED_SOURCE_DEVICE;
     bool staged = false;
+    const char * const * expert_sources = nullptr;   // when set, expert e starts at expert_sources[e]
+    size_t source_stride = 0;                         // source distance between experts; 0 means expert_stride
 };
 
 static constexpr uint32_t MOE_DEVICE_PREFETCH_LANES = 2;
@@ -4567,7 +4659,9 @@ static __global__ void moe_grouped_plan_decode(
         bool admit_decide = false,
         uint32_t * admit_cold_score = nullptr,
         uint32_t admit_promote_budget = 0,
-        uint32_t admit_promote_min = 2) {
+        uint32_t admit_promote_min = 2,
+        const uint8_t * fillable = nullptr,
+        uint32_t * expert_usage = nullptr) {
     if (blockIdx.x != 0) {
         return;
     }
@@ -4806,6 +4900,15 @@ static __global__ void moe_grouped_plan_decode(
         __syncthreads();
     }
 
+    // Long-run usage for residency ranking; unique experts are distinct, so no atomics.
+    if (expert_usage != nullptr && plan->status == MOE_GROUPED_PLAN_BUILDING) {
+        for (uint32_t unique = thread; unique < plan->n_unique; unique += blockDim.x) {
+            const int32_t expert = unique_experts[unique];
+            if (expert >= 0 && (uint32_t) expert < n_experts && expert_usage[expert] < UINT32_MAX) {
+                ++expert_usage[expert];
+            }
+        }
+    }
     for (uint32_t slot = thread; slot < n_slots; slot += blockDim.x) {
         const int32_t resident = expert_for_slot[slot];
         if (resident < -1 || (resident >= 0 && ((uint32_t) resident >= n_experts || slot_for_expert[resident] != (int32_t) slot)) ||
@@ -4831,6 +4934,7 @@ static __global__ void moe_grouped_plan_decode(
         __syncthreads();
     }
     __shared__ bool promote_this;
+    __shared__ bool fill_this;
     __shared__ uint32_t promotions;
     if (thread == 0) {
         promotions = 0;
@@ -4844,13 +4948,15 @@ static __global__ void moe_grouped_plan_decode(
             promote_this = admit_decide && admit_is_decode && admit_cold_score != nullptr &&
                 promotions < admit_promote_budget && expert >= 0 && (uint32_t) expert < n_experts &&
                 admit_cold_score[expert] >= admit_promote_min;
+            // Unfillable experts stay cold; without decide that is invalid and the caller falls back first.
+            fill_this = fillable == nullptr || (expert >= 0 && (uint32_t) expert < n_experts && fillable[expert] != 0);
         }
         __syncthreads();
         uint32_t frequency = UINT32_MAX;
         unsigned long long age = UINT64_MAX;
         uint32_t slot = UINT32_MAX;
         for (uint32_t candidate = thread; candidate < n_slots; candidate += blockDim.x) {
-            if (route_storage[candidate] == 0 &&
+            if (route_storage[candidate] == 0 && fill_this &&
                     (!admit_decide || (admit_is_decode && (expert_for_slot[candidate] < 0 || promote_this)))) {
                 const int32_t resident = expert_for_slot[candidate];
                 const unsigned long long candidate_age = last_used[candidate];
@@ -6021,7 +6127,10 @@ static __global__ void moe_grouped_gather_decode(
                 continue;
             }
             const int32_t slot = miss_slots[miss];
-            const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.source + (descriptor.staged ? miss - first_miss : (size_t) expert) * descriptor.expert_stride);
+            const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.expert_sources != nullptr ?
+                descriptor.expert_sources[expert] :
+                descriptor.source + (descriptor.staged ? miss - first_miss : (size_t) expert) *
+                    (descriptor.source_stride != 0 ? descriptor.source_stride : descriptor.expert_stride));
             if (control != nullptr && miss < control->capacity && moe_prepack_adopted(control)[miss] != nullptr) {
                 source = reinterpret_cast<const uint4 *>(moe_prepack_adopted(control)[miss]) + word % words_per_miss - bank_word;
             } else if (device_prefetch && prefetch_rank >= 0) {
@@ -6303,6 +6412,9 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (admit_slot_for_expert != nullptr) {
                 (void) cudaFree(admit_slot_for_expert);
             }
+            if (expert_usage != nullptr) {
+                (void) cudaFree(expert_usage);
+            }
             if (admit_cold_score != nullptr) {
                 (void) cudaFree(admit_cold_score);
             }
@@ -6346,6 +6458,12 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (device_banks != nullptr) {
                 (void) cudaFree(device_banks);
             }
+            for (auto * table : expert_source_tables) {
+                (void) cudaFree(table);
+            }
+            if (fillable != nullptr) {
+                (void) cudaFree(fillable);
+            }
             if (device_auxiliaries != nullptr) {
                 (void) cudaFree(device_auxiliaries);
             }
@@ -6362,6 +6480,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         size_t auxiliary_values_per_miss = 0;
         std::vector<void *> bank_data;
         std::vector<uint32_t> bank_source_paths;
+        std::vector<const char **> expert_source_tables;
+        uint8_t * fillable = nullptr;   // per expert; null means every expert can be filled
         std::array<float *, 3> auxiliary_data = {};
         std::array<size_t, 3> auxiliary_n_values = {};
         std::array<float *, 3> prefill_auxiliary_data = {};
@@ -6377,6 +6497,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         int32_t * expert_for_slot = nullptr;
         int32_t * admit_slot_for_expert = nullptr;
         uint32_t * admit_cold_score = nullptr;
+        uint32_t * expert_usage = nullptr;
         moe_grouped_admit_publication * admit_publication_host = nullptr;
         moe_grouped_admit_publication * admit_publication_device = nullptr;
         uint8_t * admit_quantized = nullptr;
@@ -7948,10 +8069,46 @@ struct ggml_cuda_moe_grouped_context::impl {
             return nullptr;
         }
 
+        // Owner sources replace every bank or none. A partial owner leaves some experts unfillable, which only the
+        // decide planner can honor, by keeping those experts cold for the CPU.
+        std::vector<std::vector<const char *>> owner_sources(snapshot.banks.size());
+        bool use_owner_sources = !snapshot.banks.empty();
+        for (uint32_t i = 0; use_owner_sources && i < snapshot.banks.size(); ++i) {
+            use_owner_sources = moe_expert_source_lookup(snapshot.banks[i].tensor, n_experts,
+                snapshot.banks[i].expert_stride, &owner_sources[i]);
+        }
+        std::vector<uint8_t> fillable;
+        if (use_owner_sources) {
+            fillable.assign(n_experts, 1);
+            for (const auto & sources : owner_sources) {
+                for (uint32_t e = 0; e < n_experts; ++e) {
+                    fillable[e] &= sources[e] != nullptr;
+                }
+            }
+            const bool partial = std::find(fillable.begin(), fillable.end(), 0) != fillable.end();
+            if (!partial) {
+                fillable.clear();
+            } else if (!moe_grouped_admit_decide_enabled() || !moe_grouped_admit_doorbell_enabled()) {
+                use_owner_sources = false;
+                fillable.clear();
+            }
+        }
+        if (!moe_grouped_cuda_success(cudaMalloc(&result->expert_usage, n_experts * sizeof(uint32_t))) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(result->expert_usage, 0, n_experts * sizeof(uint32_t), compute_stream))) {
+            return nullptr;
+        }
+        if (!fillable.empty()) {
+            if (!moe_grouped_cuda_success(cudaMalloc(&result->fillable, n_experts)) ||
+                    !moe_grouped_cuda_success(cudaMemcpyAsync(result->fillable, fillable.data(), n_experts,
+                        cudaMemcpyHostToDevice, compute_stream))) {
+                return nullptr;
+            }
+        }
+
         size_t staging_bytes = 0;
         for (const auto & bank : snapshot.banks) {
             const auto * source = source_for(bank.tensor);
-            if (source == nullptr) {
+            if (source == nullptr || use_owner_sources) {
                 continue;
             }
             if (result->source_owner != nullptr && result->source_owner != source->owner) {
@@ -8015,7 +8172,32 @@ struct ggml_cuda_moe_grouped_context::impl {
                 return nullptr;
             }
             const auto * source = source_for(bank.tensor);
-            if (source != nullptr && source->device_alias == nullptr) {
+            if (use_owner_sources) {
+                const auto & expert_sources = owner_sources[i];
+                const char ** table = nullptr;
+                if (!moe_grouped_cuda_success(cudaMalloc(&table, expert_sources.size() * sizeof(*table)))) {
+                    return nullptr;
+                }
+                result->expert_source_tables.push_back(table);
+                if (!moe_grouped_cuda_success(cudaMemcpyAsync(table, expert_sources.data(),
+                        expert_sources.size() * sizeof(*table), cudaMemcpyHostToDevice, compute_stream)) ||
+                        !moe_grouped_cuda_success(cudaStreamSynchronize(compute_stream))) {
+                    return nullptr;
+                }
+                // Evenly spaced sources (one store bundle stride) skip the per-word table load.
+                const size_t step = expert_sources.size() > 1 ? size_t(expert_sources[1] - expert_sources[0]) : 0;
+                bool affine = expert_sources.size() > 1 && expert_sources[1] > expert_sources[0] && step % alignof(uint4) == 0;
+                for (size_t e = 2; affine && e < expert_sources.size(); ++e) {
+                    affine = expert_sources[e] == expert_sources[0] + e * step;
+                }
+                if (affine) {
+                    device_banks[i].source_stride = step;
+                } else {
+                    device_banks[i].expert_sources = table;
+                }
+                device_banks[i].source_path = MOE_GROUPED_SOURCE_MAPPED;
+                alias_data = expert_sources[0];
+            } else if (source != nullptr && source->device_alias == nullptr) {
                 auto & materialization = *result->materialization;
                 materialization.sources[i] = source;
                 materialization.destinations[i] = static_cast<char *>(materialization.storage.payload) + next_staging;
@@ -8049,7 +8231,8 @@ struct ggml_cuda_moe_grouped_context::impl {
             device_banks[i].source = static_cast<const char *>(alias_data);
             device_banks[i].data = static_cast<char *>(result->bank_data[i]);
             device_banks[i].expert_stride = bank.expert_stride;
-            result->bank_source_paths[i] = device_banks[i].source_path;
+            result->bank_source_paths[i] = device_banks[i].expert_sources != nullptr || device_banks[i].source_stride != 0 ?
+                MOE_GROUPED_SOURCE_EXPERT_TABLE : device_banks[i].source_path;
         }
         for (uint32_t i = 0; i < snapshot.n_slot_auxiliaries; ++i) {
             const size_t n_values = device_auxiliaries[i].n_values;
@@ -9968,6 +10151,33 @@ bool ggml_cuda_moe_grouped_context::upload_expert(
     }
     return true;
 #endif
+}
+
+bool ggml_cuda_moe_grouped_context::read_expert_usage(const ggml_tensor * tensor, uint32_t * counts, uint32_t n) const {
+    if (tensor == nullptr || counts == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (const auto & resource : impl_->resources) {
+        if (resource == nullptr || resource->device == nullptr || resource->device->expert_usage == nullptr ||
+                resource->device->n_experts != n) {
+            continue;
+        }
+        for (const auto & bank : resource->snapshot.banks) {
+            if (bank.tensor == tensor) {
+                moe_grouped_device_scope device_scope(resource->device->device);
+                return moe_grouped_cuda_success(cudaDeviceSynchronize()) &&
+                    moe_grouped_cuda_success(cudaMemcpy(counts, resource->device->expert_usage, n * sizeof(uint32_t),
+                        cudaMemcpyDeviceToHost));
+            }
+        }
+    }
+    return false;
+}
+
+bool ggml_backend_cuda_moe_expert_usage(ggml_backend_t backend, const ggml_tensor * tensor, uint32_t * counts, uint32_t n) {
+    auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
+    return context != nullptr && context->read_expert_usage(tensor, counts, n);
 }
 
 void * ggml_cuda_moe_grouped_context::device_bank_data_for_test(
@@ -12164,6 +12374,13 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             }
         }
 
+        const bool decide = moe_grouped_admit_decide_enabled() && n_rows <= MOE_GROUPED_ADMIT_MAX_ROWS &&
+            n_routes <= MOE_GROUPED_ADMIT_RESULT_ROUTES && device.admit_publication_device != nullptr;
+        if (device.fillable != nullptr && !decide) {
+            // Only the decide planner can leave unfillable experts to the CPU.
+            (void) end_group_transaction(transaction);
+            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+        }
         const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
         // The worker must be done with the previous packet before the planner rewrites its routes.
         if (moe_grouped_admit_doorbell_enabled() && device.admit_publication_device != nullptr) {
@@ -12179,11 +12396,9 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device_prefetch_job != nullptr ? impl_->early[0]->positions[device_prefetch_job->lane] : nullptr,
             device_prefetch_job != nullptr ? impl_->device_prefetch->copy_done + device_prefetch_job->lane : nullptr,
             device.admit_slot_for_expert, n_rows <= MOE_GROUPED_ADMIT_MAX_ROWS, device.admit_publication_device,
-            moe_grouped_admit_quota(resource->snapshot.n_slots),
-            moe_grouped_admit_decide_enabled() && n_rows <= MOE_GROUPED_ADMIT_MAX_ROWS &&
-                n_routes <= MOE_GROUPED_ADMIT_RESULT_ROUTES &&
-                device.admit_publication_device != nullptr,
-            device.admit_cold_score, moe_grouped_admit_promote_budget(), moe_grouped_admit_promote_min());
+            moe_grouped_admit_quota(resource->snapshot.n_slots), decide,
+            device.admit_cold_score, moe_grouped_admit_promote_budget(), moe_grouped_admit_promote_min(), device.fillable,
+            device.expert_usage);
         CUDA_CHECK(cudaGetLastError());
         // The CPU half starts now, while the fills below run, instead of after them.
         device.admit_published_early = impl_->admit_early_input != nullptr && moe_grouped_admit_doorbell_enabled() &&
