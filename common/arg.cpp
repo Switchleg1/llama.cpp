@@ -2950,15 +2950,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
     add_opt(common_arg(
-        {"--moe-expert-cache-size"}, "N",
+        {"--moe-expert-cache-size"}, "N|auto",
         "MoE expert cache: keep N expert slabs per expert tensor on GPU with LRU eviction; "
-        "cold experts live in CPU pinned memory. 0 disables (default). "
+        "cold experts live in CPU pinned memory. 0 disables (default). 'auto' measures the configuration, "
+        "draft model included, and takes the most slots that fit free device memory. "
         "When enabled, all MoE expert tensors use the cache regardless of --cpu-moe or --n-cpu-moe.",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.n_moe_expert_cache_slots = -1;
+                return;
+            }
+            const int slots = std::stoi(value);
+            if (slots < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.n_moe_expert_cache_slots = value;
+            params.n_moe_expert_cache_slots = slots;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(

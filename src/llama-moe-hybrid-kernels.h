@@ -11,9 +11,12 @@ bool llama_moe_hybrid_q8_1_supported(const ggml_tensor * gate, const ggml_tensor
 
 // x_q8_1 holds gate->ne[0]/32 block_q8_1, shared by all routes. Route i writes down->ne[1] floats at
 // out + i*out_stride. All routes run as one parallel job per projection.
+// Route i uses activation row rows[i] at x_q8_1 + rows[i]*x_row_bytes. Routes sharing an expert are computed
+// together, so each weight row is read once for all of them.
 bool llama_moe_hybrid_q8_1_experts(
         const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
-        const int32_t * experts, uint32_t count, const void * x_q8_1, float * out, size_t out_stride, bool gelu);
+        const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
+        float * out, size_t out_stride, bool gelu);
 
 // The CUDA quantize_q8_1 rule, for the intermediate activation.
 void llama_moe_hybrid_quantize_q8_1(const float * x, void * y, int64_t n);

@@ -67,7 +67,8 @@ typedef bool (*ggml_backend_moe_hybrid_shadow_t)(
 
 typedef bool (*ggml_backend_moe_hybrid_cold_handler_t)(
         void * user, const struct ggml_tensor * down, const float * activation, const void * activation_q8_1,
-        const int32_t * experts, uint32_t count, float * results, size_t result_stride);
+        size_t q8_1_row_bytes, const int32_t * rows, const int32_t * experts, uint32_t count,
+        float * results, size_t result_stride);
 typedef void (*ggml_backend_moe_hybrid_set_cold_handler_t)(ggml_backend_moe_hybrid_cold_handler_t handler, void * user);
 
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC 0x4d4f4532u

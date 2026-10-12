@@ -1315,8 +1315,45 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+// Resolves --moe-expert-cache-size auto: measure the whole configuration, draft included, at two slot counts,
+// derive the device cost of one slot, then add slots while the measured slack allows. Oversubscribing the
+// device is not a soft failure on Windows: paged-out slots made expert kernels 20-250 times slower.
+static void common_moe_cache_auto_size(common_params & params) {
+    const auto measure = [&](int32_t slots, size_t & required, int64_t & slack) {
+        common_params probe = params;
+        probe.n_moe_expert_cache_slots = slots;
+        const auto measurement = common_measure_joint_configuration(probe, GGML_LOG_LEVEL_ERROR, true);
+        for (const auto & owner : measurement.owners) {
+            if (!owner.host && owner.capacity_available) {
+                required = owner.required_upper_bytes;
+                slack = owner.slack_bytes;
+                return true;
+            }
+        }
+        return false;
+    };
+    constexpr int32_t low = 16, high = 32;
+    size_t required_low = 0, required_high = 0;
+    int64_t slack_low = 0, slack_high = 0;
+    if (!measure(low, required_low, slack_low) || !measure(high, required_high, slack_high) ||
+            required_high <= required_low) {
+        COM_WRN("%s: could not measure the MoE expert cache; using %d slots\n", __func__, low);
+        params.n_moe_expert_cache_slots = low;
+        return;
+    }
+    const size_t per_slot = (required_high - required_low) / (high - low);
+    const int64_t extra = slack_high > 0 ? slack_high / (int64_t) per_slot : -1;
+    const int32_t slots = std::max<int32_t>(1, high + (int32_t) std::max<int64_t>(extra, -(high - 1)));
+    COM_INF("%s: MoE expert cache auto: %d slots (%.1f MiB per slot, %.0f MiB slack at %d slots)\n", __func__,
+        slots, per_slot / 1048576.0, slack_high / 1048576.0, high);
+    params.n_moe_expert_cache_slots = slots;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    if (params.n_moe_expert_cache_slots < 0) {
+        common_moe_cache_auto_size(params);
+    }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

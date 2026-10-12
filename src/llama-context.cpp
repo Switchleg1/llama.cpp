@@ -1968,7 +1968,8 @@ void llama_context::moe_hybrid_shadow_regions(int node_end) {
 }
 
 bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * down, const float * activation,
-        const void * activation_q8_1, const int32_t * experts, uint32_t count, float * results, size_t result_stride) {
+        const void * activation_q8_1, size_t q8_1_row_bytes, const int32_t * rows, const int32_t * experts,
+        uint32_t count, float * results, size_t result_stride) {
     auto * ctx = static_cast<llama_context *>(user);
     std::lock_guard<std::mutex> lock(ctx->moe_hybrid_cpu_mutex);
     // Shared quantization: consume the GPU's own Q8_1 activation when every bank type is covered.
@@ -1976,8 +1977,8 @@ bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * dow
     const auto layer = ctx->moe_hybrid_q8_1_layers.find(down);
     if (use_q8_1 && activation_q8_1 != nullptr && layer != ctx->moe_hybrid_q8_1_layers.end() && down != nullptr &&
             (size_t) down->ne[1] <= result_stride) {
-        if (llama_moe_hybrid_q8_1_experts(layer->second.gate, layer->second.up, down, experts, count,
-                activation_q8_1, results, result_stride, layer->second.gelu)) {
+        if (llama_moe_hybrid_q8_1_experts(layer->second.gate, layer->second.up, down, experts, rows, count,
+                activation_q8_1, q8_1_row_bytes, results, result_stride, layer->second.gelu)) {
             ctx->moe_hybrid_q8_1_routes += count;
             return true;
         }
@@ -1985,6 +1986,12 @@ bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * dow
     static const bool q8_1_only = getenv("LLAMA_MOE_HYBRID_Q8_1_ONLY") != nullptr;
     if (q8_1_only) {
         return false;
+    }
+    // The ggml helper below takes one activation row.
+    for (uint32_t i = 0; i < count; ++i) {
+        if (rows != nullptr && rows[i] != 0) {
+            return false;
+        }
     }
     const auto it = ctx->moe_hybrid_cpu.find(down);
     if (it == ctx->moe_hybrid_cpu.end() || down == nullptr) {

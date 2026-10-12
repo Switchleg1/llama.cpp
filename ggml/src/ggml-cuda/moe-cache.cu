@@ -1562,6 +1562,15 @@ struct moe_candidate_execution_geometry {
     bool grouped_eligible = false;
 };
 
+// Plan arrays hold one entry per route and per slot. Decide mode sends routes beyond the slots to the CPU,
+// so it can plan a pass with more routes than slots; every reader of a plan uses the same capacity.
+#define MOE_GROUPED_DECIDE_ROUTE_CAPACITY 64
+#define MOE_GROUPED_DECIDE_MAX_ROWS 8
+static uint32_t moe_grouped_plan_capacity(uint32_t n_slots) {
+    static const bool decide = getenv("LLAMA_MOE_HYBRID_DECIDE") != nullptr && getenv("LLAMA_MOE_ADMIT_DOORBELL") != nullptr;
+    return decide ? std::max<uint32_t>(n_slots, MOE_GROUPED_DECIDE_ROUTE_CAPACITY) : n_slots;
+}
+
 static moe_candidate_execution_geometry moe_candidate_execution_geometry_for(
         const ggml_cgraph * cgraph,
         const ggml_tensor * node,
@@ -1623,10 +1632,11 @@ static moe_candidate_execution_geometry moe_candidate_execution_geometry_for(
         certificate.n_sequences < result.n_rows;
     result.grouped_eligible = result.certificate_valid && result.n_rows <= certificate.n_rows &&
         result.n_rows >= 1 && n_slots > 0 && n_slots <= INT32_MAX &&
-        ((main_independent && result.n_routes <= n_slots) || draft_independent || draft_sequential ||
+        ((main_independent && result.n_routes <= moe_grouped_plan_capacity(n_slots)) || draft_independent || draft_sequential ||
             mtp_independent || mtp_sequential || target_speculative);
     if (result.grouped_eligible) {
-        result.strategy = result.n_routes <= n_slots ?
+        result.strategy = result.n_routes <= n_slots ||
+                (result.n_routes <= moe_grouped_plan_capacity(n_slots) && result.n_rows <= MOE_GROUPED_DECIDE_MAX_ROWS) ?
             GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT : GGML_CUDA_MOE_EXECUTION_STRATEGY_HOST_STAGED;
     }
     return result;
@@ -2668,6 +2678,7 @@ struct moe_grouped_decode_plan {
     uint64_t admit_hot;
     uint64_t admit_cold;
     uint64_t admit_fills;
+    uint64_t admit_promotions;
 };
 
 enum moe_grouped_plan_array_index : uint32_t {
@@ -2877,7 +2888,7 @@ static bool moe_staging_size_v1(
         size_t plan_bytes = 0, control_offset = 0, staging_offset = 0, allocation_bytes = 0;
         const uint32_t prediction_capacity =
             (query.flags & GGML_BACKEND_MOE_STAGING_FLAG_V1_PREDICTION_CONTROL) != 0 ? query.n_experts : 0;
-        if (!moe_grouped_plan_size(query.n_slots, query.n_experts, &plan_bytes) ||
+        if (!moe_grouped_plan_size(moe_grouped_plan_capacity(query.n_slots), query.n_experts, &plan_bytes) ||
                 !moe_grouped_staging_layout(plan_bytes, payload, prediction_capacity,
                     control_offset, staging_offset, allocation_bytes)) {
             return false;
@@ -3914,7 +3925,8 @@ static __device__ bool moe_device_prefetch_ready(uint32_t * completion) {
 // Mapped host memory the planner publishes cold routes into, with Strata's fence then sequence order.
 // The CPU half reads it without a device copy, which is what keeps the publication capture-legal.
 #define MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY 256
-#define MOE_GROUPED_ADMIT_RESULT_ROUTES 4
+#define MOE_GROUPED_ADMIT_RESULT_ROUTES 64
+#define MOE_GROUPED_ADMIT_MAX_ROWS 8
 #define MOE_GROUPED_ADMIT_WIDTH 4096
 struct moe_grouped_admit_publication {
     uint32_t sequence;
@@ -3924,6 +3936,7 @@ struct moe_grouped_admit_publication {
     uint32_t n_embd;
     uint32_t computed;      // routes the worker actually evaluated, bounded by the result storage
     uint32_t planned_for;    // the sequence these routes belong to; another value means they are stale
+    uint32_t computed_ready; // routes the device may copy for the packet it just waited on
     uint32_t plans;          // planner runs, to compare against publications
     uint32_t last_compared;  // sequence the device last compared; equal to sequence means nothing new
     uint32_t stale;          // comparisons refused because no fresh packet was published this token
@@ -3932,11 +3945,78 @@ struct moe_grouped_admit_publication {
     float    parity_max;
     int32_t  routes[MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY];
     int32_t  experts[MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY];
-    float    activation[MOE_GROUPED_ADMIT_WIDTH];
-    // The same Q8_1 blocks the GPU's own kernels consume, written by the same quantize kernel.
-    uint8_t  activation_q8_1[MOE_GROUPED_ADMIT_WIDTH / QK8_1 * sizeof(block_q8_1)];
+    uint32_t n_rows;         // activation rows published for this packet
+    uint32_t top_k;          // routes per row, so a route's row is route / top_k
+    float    activation[MOE_GROUPED_ADMIT_MAX_ROWS * MOE_GROUPED_ADMIT_WIDTH];
+    // The same Q8_1 blocks the GPU's own kernels consume, written by the same quantize kernel, one row each.
+    uint8_t  activation_q8_1[MOE_GROUPED_ADMIT_MAX_ROWS * (MOE_GROUPED_ADMIT_WIDTH / QK8_1) * sizeof(block_q8_1)];
     float    results[MOE_GROUPED_ADMIT_RESULT_ROUTES * MOE_GROUPED_ADMIT_WIDTH];
 };
+
+// Production handoff, Strata's shape: one thread waits for the acknowledgement of this packet, then a
+// parallel kernel copies the CPU results into their routed columns. Reads are volatile because the host
+// writes this memory and the GPU's caches do not observe host writes.
+static __global__ void moe_grouped_admit_wait(moe_grouped_admit_publication * publication, uint64_t spin_limit,
+        int32_t * meta) {
+    if (publication == nullptr) {
+        return;
+    }
+    if (meta != nullptr) {
+        meta[0] = 0;
+    }
+    const uint32_t want = publication->sequence;
+    if (want == publication->last_compared) {
+        ++publication->stale;   // nothing published this token: leave the GPU's values
+        publication->computed_ready = 0;
+        __threadfence_system();
+        return;
+    }
+    publication->last_compared = want;
+    volatile uint32_t * acknowledged = &publication->acknowledged;
+    uint64_t spin = 0;
+    while (*acknowledged != want && spin < spin_limit) {
+        ++spin;
+    }
+    if (*acknowledged != want) {
+        ++publication->timeouts;
+        publication->computed_ready = 0;
+    } else {
+        const volatile moe_grouped_admit_publication * host = publication;
+        const uint32_t ready = host->computed;
+        publication->computed_ready = ready;
+        if (meta != nullptr) {
+            // Host reads cost a PCIe round trip each: do them once here, so the copy reads device memory.
+            for (uint32_t k = 0; k < ready && k < MOE_GROUPED_ADMIT_RESULT_ROUTES; ++k) {
+                meta[1 + k] = host->routes[k];
+            }
+            meta[0] = (int32_t) ready;
+        }
+    }
+    __threadfence_system();
+}
+
+static __global__ void moe_grouped_admit_copy(
+        const moe_grouped_admit_publication * publication, float * down_output, int64_t n_embd,
+        int64_t n_routes, int64_t routes_per_row, const int32_t * meta) {
+    const uint32_t index = blockIdx.x;
+    if ((int32_t) index >= meta[0]) {
+        return;
+    }
+    const int32_t route = meta[1 + index];
+    if (route < 0 || route >= n_routes || route >= routes_per_row) {
+        return;
+    }
+    // __ldcv: one uncached 16-byte read each. A volatile float4 split into four ordered 4-byte PCIe round trips
+    // and cost about 300 us per layer.
+    // One float4 per thread across blockIdx.y slices: every PCIe read is in flight at once, so the copy costs
+    // about one round trip rather than one per loop iteration.
+    const float4 * src = (const float4 *) (publication->results + (size_t) index * MOE_GROUPED_ADMIT_WIDTH);
+    float4 * dst = (float4 *) (down_output + (size_t) route * n_embd);
+    const int64_t i = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (i < n_embd / 4) {
+        dst[i] = __ldcv(src + i);
+    }
+}
 
 // Compares the CPU half's results with the GPU's own output for the same routes, on the device, so it
 // stays legal under graph capture. Waits for the acknowledgement of the packet it reads.
@@ -3997,15 +4077,27 @@ static __global__ void moe_grouped_admit_compare(
 // raised here and not in the planner, so a reader never sees routes without their activation.
 static __global__ void moe_grouped_admit_publish_activation(
         moe_grouped_admit_publication * publication, const float * activation, uint32_t n_embd,
-        const uint8_t * quantized, uint32_t quantized_bytes) {
-    if (publication == nullptr || activation == nullptr) {
+        uint32_t n_rows, int64_t row_stride, const uint8_t * quantized, uint32_t quantized_row_bytes) {
+    if (publication == nullptr || activation == nullptr || n_rows > MOE_GROUPED_ADMIT_MAX_ROWS) {
         return;
     }
-    for (uint32_t i = threadIdx.x; i < n_embd && i < MOE_GROUPED_ADMIT_WIDTH; i += blockDim.x) {
-        publication->activation[i] = activation[i];
+    // No cold routes: announce nothing, so the worker stays idle and the waits find no new packet.
+    if (((const volatile moe_grouped_admit_publication *) publication)->count == 0) {
+        return;
     }
-    for (uint32_t i = threadIdx.x; quantized != nullptr && i < quantized_bytes; i += blockDim.x) {
-        publication->activation_q8_1[i] = quantized[i];
+    for (uint32_t row = 0; row < n_rows; ++row) {
+        for (uint32_t i = threadIdx.x; i < n_embd && i < MOE_GROUPED_ADMIT_WIDTH; i += blockDim.x) {
+            publication->activation[row * MOE_GROUPED_ADMIT_WIDTH + i] = activation[row * row_stride + i];
+        }
+    }
+    const uint32_t q8_row = (MOE_GROUPED_ADMIT_WIDTH / QK8_1) * sizeof(block_q8_1);
+    for (uint32_t row = 0; quantized != nullptr && row < n_rows; ++row) {
+        for (uint32_t i = threadIdx.x; i < quantized_row_bytes; i += blockDim.x) {
+            publication->activation_q8_1[row * q8_row + i] = quantized[row * quantized_row_bytes + i];
+        }
+    }
+    if (threadIdx.x == 0) {
+        publication->n_rows = n_rows;
     }
     // Every writer fences at system scope, so the host never sees the sequence ahead of any byte.
     __threadfence_system();
@@ -4050,9 +4142,35 @@ static uint32_t moe_grouped_admit_quota(uint32_t n_slots) {
     return quota != 0 && quota < n_slots ? quota : n_slots;
 }
 
+// Admission decides for real: no eviction, cold routes go to the CPU and are absent from the transfer.
+static bool moe_grouped_admit_decide_enabled();
+
 static bool moe_grouped_admit_doorbell_enabled() {
     static const bool enabled = getenv("LLAMA_MOE_ADMIT_DOORBELL") != nullptr;
     return enabled && moe_grouped_admit_shadow_enabled();
+}
+
+// Adaptive residency between tokens: an expert that went cold this many times may evict the least recently
+// used slot not needed by the current call, at most `budget` times per layer per call. Budget 0 freezes.
+static uint32_t moe_grouped_admit_promote_budget() {
+    static const uint32_t budget = []() -> uint32_t {
+        const char * value = getenv("LLAMA_MOE_HYBRID_PROMOTE");
+        return value != nullptr ? (uint32_t) atoi(value) : 0;
+    }();
+    return budget;
+}
+
+static uint32_t moe_grouped_admit_promote_min() {
+    static const uint32_t min = []() -> uint32_t {
+        const char * value = getenv("LLAMA_MOE_HYBRID_PROMOTE_MIN");
+        return value != nullptr ? std::max(1, atoi(value)) : 2;
+    }();
+    return min;
+}
+
+static bool moe_grouped_admit_decide_enabled() {
+    static const bool enabled = getenv("LLAMA_MOE_HYBRID_DECIDE") != nullptr;
+    return enabled && moe_grouped_admit_doorbell_enabled();
 }
 
 // The CPU half of the split: computes the published cold routes from the host-side expert weights.
@@ -4249,8 +4367,11 @@ struct moe_grouped_admit_worker {
             if (expert < 0) {
                 continue;
             }
-            moe_grouped_admit_project(group.gate, expert, packet->activation, gate.data(), scratch);
-            moe_grouped_admit_project(group.up, expert, packet->activation, up.data(), scratch);
+            const uint32_t row = packet->top_k != 0 ? (uint32_t) packet->routes[index] / packet->top_k : 0;
+            const float * x = packet->activation + (size_t) std::min<uint32_t>(row, MOE_GROUPED_ADMIT_MAX_ROWS - 1) *
+                MOE_GROUPED_ADMIT_WIDTH;
+            moe_grouped_admit_project(group.gate, expert, x, gate.data(), scratch);
+            moe_grouped_admit_project(group.up, expert, x, up.data(), scratch);
             for (size_t i = 0; i < gate.size(); ++i) {
                 gate[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];   // SiLU gate times up
             }
@@ -4285,8 +4406,13 @@ struct moe_grouped_admit_worker {
                         }
                         const auto started = std::chrono::steady_clock::now();
                         const uint32_t count = std::min<uint32_t>(packet->count, MOE_GROUPED_ADMIT_RESULT_ROUTES);
+                        int32_t rows[MOE_GROUPED_ADMIT_RESULT_ROUTES];
+                        for (uint32_t k = 0; k < count; ++k) {
+                            rows[k] = packet->top_k != 0 ? packet->routes[k] / (int32_t) packet->top_k : 0;
+                        }
                         if (handler != nullptr && count != 0 && packet->n_embd != 0 &&
                                 handler(handler_user, group.down_tensor, packet->activation, packet->activation_q8_1,
+                                    (MOE_GROUPED_ADMIT_WIDTH / QK8_1) * sizeof(block_q8_1), rows,
                                     packet->experts, count, packet->results, MOE_GROUPED_ADMIT_WIDTH)) {
                             packet->computed = count;
                             handled_routes.fetch_add(count, std::memory_order_relaxed);
@@ -4419,12 +4545,18 @@ static __global__ void moe_grouped_plan_decode(
         int32_t * admit_slots = nullptr,
         bool admit_is_decode = false,
         moe_grouped_admit_publication * admit_publication = nullptr,
-        uint32_t admit_quota = 0) {
+        uint32_t admit_quota = 0,
+        bool admit_decide = false,
+        uint32_t * admit_cold_score = nullptr,
+        uint32_t admit_promote_budget = 0,
+        uint32_t admit_promote_min = 2) {
     if (blockIdx.x != 0) {
         return;
     }
-    moe_grouped_admit_shadow(ids, n_routes, top_k, row_stride, n_experts, n_slots, admit_is_decode,
-        admit_slots, plan, admit_publication, admit_quota);
+    if (!admit_decide) {
+        moe_grouped_admit_shadow(ids, n_routes, top_k, row_stride, n_experts, n_slots, admit_is_decode,
+            admit_slots, plan, admit_publication, admit_quota);
+    }
 
     __shared__ int32_t warp_route_experts[WARP_SIZE];
     __shared__ uint32_t warp_frequencies[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
@@ -4521,7 +4653,7 @@ static __global__ void moe_grouped_plan_decode(
 
     if (n_routes == 0 || n_routes > plan_capacity || top_k == 0 || row_stride < top_k ||
             n_routes % top_k != 0 || n_experts == 0 || n_experts > INT32_MAX ||
-            n_slots == 0 || n_slots > INT32_MAX || plan_capacity != n_slots || n_routes > n_slots) {
+            n_slots == 0 || n_slots > INT32_MAX || plan_capacity < n_slots || n_routes > plan_capacity) {
         moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
     }
 
@@ -4672,14 +4804,36 @@ static __global__ void moe_grouped_plan_decode(
     }
     __syncthreads();
 
+    __shared__ uint8_t cold_unique[MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY];
+    if (admit_decide) {
+        for (uint32_t unique = thread; unique < plan->n_unique && unique < MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY;
+                unique += blockDim.x) {
+            cold_unique[unique] = 0;
+        }
+        __syncthreads();
+    }
+    __shared__ bool promote_this;
+    __shared__ uint32_t promotions;
+    if (thread == 0) {
+        promotions = 0;
+    }
+    __syncthreads();
     const uint32_t lane = thread % WARP_SIZE;
     const uint32_t warp = thread / WARP_SIZE;
     for (uint32_t miss = 0; miss < plan->n_misses; ++miss) {
+        if (thread == 0) {
+            const int32_t expert = miss_experts[miss];
+            promote_this = admit_decide && admit_is_decode && admit_cold_score != nullptr &&
+                promotions < admit_promote_budget && expert >= 0 && (uint32_t) expert < n_experts &&
+                admit_cold_score[expert] >= admit_promote_min;
+        }
+        __syncthreads();
         uint32_t frequency = UINT32_MAX;
         unsigned long long age = UINT64_MAX;
         uint32_t slot = UINT32_MAX;
         for (uint32_t candidate = thread; candidate < n_slots; candidate += blockDim.x) {
-            if (route_storage[candidate] == 0) {
+            if (route_storage[candidate] == 0 &&
+                    (!admit_decide || (admit_is_decode && (expert_for_slot[candidate] < 0 || promote_this)))) {
                 const int32_t resident = expert_for_slot[candidate];
                 const unsigned long long candidate_age = last_used[candidate];
                 const uint64_t stored_epoch = resident < 0 ? 0 : expert_frequency_epoch[resident];
@@ -4698,7 +4852,12 @@ static __global__ void moe_grouped_plan_decode(
             }
         }
         if (blockDim.x == WARP_SIZE) {
-            const uint32_t candidate_slot = moe_grouped_warp_min_slot(frequency, age);
+            uint32_t candidate_slot = moe_grouped_warp_min_slot(frequency, age);
+            // With no qualifying slot every lane ties at the maximum and lane 0 would win, which would evict a
+            // slot this call uses. Only the no-eviction rule can leave a miss without a candidate.
+            if (!__any_sync(0xffffffff, slot != UINT32_MAX)) {
+                candidate_slot = UINT32_MAX;
+            }
             if (lane == 0) {
                 selected_slot = candidate_slot;
             }
@@ -4723,15 +4882,71 @@ static __global__ void moe_grouped_plan_decode(
         __syncthreads();
         if (thread == 0) {
             const int32_t unique = miss_unique[miss];
-            if (selected_slot >= n_slots || unique < 0 || (uint32_t) unique >= plan->n_unique) {
-                moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+            const int32_t miss_expert = miss_experts[miss];
+            const bool scored = admit_cold_score != nullptr && miss_expert >= 0 && (uint32_t) miss_expert < n_experts;
+            if (admit_decide && selected_slot >= n_slots && unique >= 0 && (uint32_t) unique < plan->n_unique) {
+                // Every slot already holds weights, so slot 0 is valid; the CPU replaces this column.
+                cold_unique[unique] = 1;
+                unique_slots[unique] = 0;
+                miss_slots[miss] = -1;
+                if (scored && admit_cold_score[miss_expert] < UINT32_MAX) {
+                    ++admit_cold_score[miss_expert];
+                }
+            } else {
+                if (admit_decide && selected_slot < n_slots) {
+                    if (expert_for_slot[selected_slot] >= 0) {
+                        ++promotions;   // evicted a resident: counts against the budget
+                        ++plan->admit_promotions;
+                    }
+                    if (scored) {
+                        admit_cold_score[miss_expert] = 0;
+                    }
+                }
+                if (selected_slot >= n_slots || unique < 0 || (uint32_t) unique >= plan->n_unique) {
+                    moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+                }
+                unique_slots[unique] = selected_slot;
+                miss_slots[miss] = selected_slot;
+                route_storage[selected_slot] = 1;
             }
-            unique_slots[unique] = selected_slot;
-            miss_slots[miss] = selected_slot;
-            route_storage[selected_slot] = 1;
         }
         __syncthreads();
     }
+    if (admit_decide && thread == 0) {
+        // Cold misses move nothing: drop them from the transfer, then publish them for the CPU.
+        uint32_t kept = 0;
+        for (uint32_t miss = 0; miss < plan->n_misses; ++miss) {
+            if (miss_slots[miss] >= 0) {
+                miss_unique[kept] = miss_unique[miss];
+                miss_experts[kept] = miss_experts[miss];
+                miss_slots[kept] = miss_slots[miss];
+                ++kept;
+            }
+        }
+        plan->admit_fills += kept;
+        plan->n_misses = kept;
+        uint32_t published = 0;
+        for (uint32_t route = 0; route < n_routes; ++route) {
+            const int32_t unique = route_unique[route];
+            if (unique >= 0 && (uint32_t) unique < plan->n_unique && cold_unique[unique]) {
+                if (admit_publication != nullptr && published < MOE_GROUPED_ADMIT_PUBLICATION_CAPACITY) {
+                    admit_publication->routes[published] = (int32_t) route;
+                    admit_publication->experts[published] = unique_experts[unique];
+                }
+                ++published;
+            }
+        }
+        plan->admit_cold += published;
+        plan->admit_hot += n_routes - published;
+        if (admit_publication != nullptr) {
+            admit_publication->count = published;
+            admit_publication->top_k = top_k;
+            admit_publication->planned_for = admit_publication->sequence + 1;
+            ++admit_publication->plans;
+            __threadfence_system();
+        }
+    }
+    __syncthreads();
 
     for (uint32_t unique = thread; unique < plan->n_unique; unique += blockDim.x) {
         if (unique_slots[unique] < 0) {
@@ -5847,6 +6062,8 @@ static bool ggml_cuda_moe_cache_handoff_grouped(ggml_cuda_moe_cache * cache, cud
 static bool ggml_cuda_moe_cache_abort_host_staged(ggml_cuda_moe_cache * cache, cudaStream_t compute_stream);
 
 struct ggml_cuda_moe_grouped_context::impl {
+    // Expert input for the decode being prepared, so its publication can precede the fills.
+    const ggml_tensor * admit_early_input = nullptr;
     explicit impl(ggml_backend_dev_t owner, int device, uint32_t max_rows) : owner(owner), device(device) {
         early_max_rows = std::max(1u, max_rows);
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
@@ -6068,8 +6285,14 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (admit_slot_for_expert != nullptr) {
                 (void) cudaFree(admit_slot_for_expert);
             }
+            if (admit_cold_score != nullptr) {
+                (void) cudaFree(admit_cold_score);
+            }
             if (admit_quantized != nullptr) {
                 (void) cudaFree(admit_quantized);
+            }
+            if (admit_meta != nullptr) {
+                (void) cudaFree(admit_meta);
             }
             if (admit_publication_host != nullptr) {
                 moe_grouped_admit_worker_instance().remove(admit_publication_host);
@@ -6135,9 +6358,13 @@ struct ggml_cuda_moe_grouped_context::impl {
         int32_t * slot_for_expert = nullptr;
         int32_t * expert_for_slot = nullptr;
         int32_t * admit_slot_for_expert = nullptr;
+        uint32_t * admit_cold_score = nullptr;
         moe_grouped_admit_publication * admit_publication_host = nullptr;
         moe_grouped_admit_publication * admit_publication_device = nullptr;
         uint8_t * admit_quantized = nullptr;
+        int32_t * admit_meta = nullptr;
+        bool admit_published_early = false;   // published inside prepare, before the fills
+        uint32_t plan_capacity = 0;            // entries per plan array; every plan reader uses it
         uint32_t admit_publication_seen = 0;
         uint8_t * invalidated_slot = nullptr;
         uint8_t * occupied_slot = nullptr;
@@ -7340,7 +7567,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 continue;
             }
             size_t plan_bytes = 0, control_offset = 0, staging_offset = 0, allocation_bytes = 0;
-            if (!moe_grouped_plan_size(candidates.n_slots, n_experts, &plan_bytes) ||
+            if (!moe_grouped_plan_size(moe_grouped_plan_capacity(candidates.n_slots), n_experts, &plan_bytes) ||
                     !moe_grouped_staging_layout(plan_bytes, tile_bytes, moe_early_router_enabled() ? n_experts : 0, control_offset, staging_offset, allocation_bytes) ||
                     !moe_host_reserve_size(SIZE_MAX - MOE_PAGEABLE_STAGING_HEADROOM, allocation_bytes, reserved)) {
                 throw std::bad_alloc();
@@ -7698,7 +7925,8 @@ struct ggml_cuda_moe_grouped_context::impl {
             device_auxiliaries[i].n_values = n_values;
         }
 
-        if (!moe_grouped_plan_size(snapshot.n_slots, n_experts, &result->plan_bytes)) {
+        result->plan_capacity = moe_grouped_plan_capacity(snapshot.n_slots);
+        if (!moe_grouped_plan_size(result->plan_capacity, n_experts, &result->plan_bytes)) {
             return nullptr;
         }
 
@@ -7742,7 +7970,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 throw std::bad_alloc();
             }
             result->materialization = std::make_unique<moe_grouped_materialization>(result->source_owner,
-                staging_offset, staging_bytes, snapshot.n_slots, n_experts, top_k, &demand_materialized_bytes);
+                staging_offset, staging_bytes, result->plan_capacity, n_experts, top_k, &demand_materialized_bytes);
             if (result->materialization->storage.data == nullptr) {
                 return nullptr;
             }
@@ -7822,13 +8050,16 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         if (moe_grouped_admit_shadow_enabled()) {
             if (!moe_grouped_cuda_success(cudaMalloc(&result->admit_slot_for_expert, n_experts * sizeof(int32_t))) ||
+                    !moe_grouped_cuda_success(cudaMalloc(&result->admit_cold_score, n_experts * sizeof(uint32_t))) ||
 
                     !moe_grouped_cuda_success(cudaHostAlloc(&result->admit_publication_host,
                         sizeof(moe_grouped_admit_publication), cudaHostAllocMapped)) ||
                     !moe_grouped_cuda_success(cudaHostGetDevicePointer(&result->admit_publication_device,
                         result->admit_publication_host, 0)) ||
+                    !moe_grouped_cuda_success(cudaMalloc(&result->admit_meta,
+                        (1 + MOE_GROUPED_ADMIT_RESULT_ROUTES) * sizeof(int32_t))) ||
                     !moe_grouped_cuda_success(cudaMalloc(&result->admit_quantized,
-                        sizeof(((moe_grouped_admit_publication *) nullptr)->activation_q8_1)))) {
+                        MOE_GROUPED_ADMIT_MAX_ROWS * (MOE_GROUPED_ADMIT_WIDTH / QK8_1) * sizeof(block_q8_1)))) {
                 return nullptr;
             }
             memset(result->admit_publication_host, 0, sizeof(moe_grouped_admit_publication));
@@ -7926,6 +8157,8 @@ struct ggml_cuda_moe_grouped_context::impl {
                 // the first planner launch, and fresh memory reads as slot 0, so experts looked resident at random.
                 (result->admit_slot_for_expert != nullptr && !moe_grouped_cuda_success(cudaMemsetAsync(
                     result->admit_slot_for_expert, 0xff, n_experts * sizeof(int32_t), compute_stream))) ||
+                (result->admit_cold_score != nullptr && !moe_grouped_cuda_success(cudaMemsetAsync(
+                    result->admit_cold_score, 0, n_experts * sizeof(uint32_t), compute_stream))) ||
                 !moe_grouped_cuda_success(cudaMemcpyAsync(
                     result->device_banks, device_banks.data(), snapshot.banks.size() * sizeof(moe_grouped_device_bank),
                     cudaMemcpyHostToDevice, compute_stream)) ||
@@ -9545,12 +9778,38 @@ bool ggml_cuda_moe_grouped_context::device_slot_for_expert_for_test(
         slot, resource->device->slot_for_expert + expert, sizeof(*slot), cudaMemcpyDeviceToHost));
 }
 
+// Quantizes the expert input with MMVQ's own kernel and publishes it with the packet. Enqueue only.
+static bool moe_grouped_admit_publish_input(
+        moe_grouped_admit_publication * packet, uint8_t * quantized, const ggml_tensor * input, cudaStream_t stream) {
+    if (packet == nullptr || input == nullptr || input->type != GGML_TYPE_F32 || stream == nullptr) {
+        return false;
+    }
+    // One activation row per token; a broadcast expert dimension (ne[1] == 1) is the usual layout.
+    const int64_t n_embd = input->ne[0];
+    const int64_t n_rows = input->ne[1] == 1 ? input->ne[2] : input->ne[1] * input->ne[2];
+    const int64_t row_stride = (input->ne[1] == 1 ? input->nb[2] : input->nb[1]) / (int64_t) sizeof(float);
+    const float * activation = static_cast<const float *>(input->data);
+    if (n_embd <= 0 || n_rows <= 0 || n_rows > MOE_GROUPED_ADMIT_MAX_ROWS || input->ne[3] != 1 ||
+            input->nb[0] != sizeof(float)) {
+        return false;
+    }
+    uint32_t quantized_row_bytes = 0;
+    if (quantized != nullptr && n_embd <= MOE_GROUPED_ADMIT_WIDTH && n_embd % MATRIX_ROW_PADDING == 0) {
+        // The kernel MMVQ uses, over the same rows: rows land contiguously in the scratch.
+        quantize_row_q8_1_cuda(activation, nullptr, quantized, GGML_TYPE_COUNT, n_embd, row_stride,
+            row_stride * n_rows, row_stride * n_rows, n_embd, n_rows, 1, 1, stream);
+        quantized_row_bytes = (uint32_t) (n_embd / QK8_1 * sizeof(block_q8_1));
+    }
+    moe_grouped_admit_publish_activation<<<1, 256, 0, stream>>>(packet, activation, (uint32_t) n_embd,
+        (uint32_t) n_rows, row_stride, quantized_row_bytes != 0 ? quantized : nullptr, quantized_row_bytes);
+    return moe_grouped_cuda_success(cudaGetLastError());
+}
+
 bool ggml_cuda_moe_grouped_context::publish_admit_activation(
         const ggml_cuda_moe_candidate_group_key & key,
-        const float * activation,
-        int64_t n_embd,
+        const ggml_tensor * input,
         cudaStream_t stream) {
-    if (!moe_grouped_admit_doorbell_enabled() || activation == nullptr || stream == nullptr || n_embd <= 0) {
+    if (!moe_grouped_admit_doorbell_enabled()) {
         return false;
     }
     moe_grouped_admit_publication * packet = nullptr;
@@ -9560,25 +9819,19 @@ bool ggml_cuda_moe_grouped_context::publish_admit_activation(
         if (key.generation != impl_->state.generation || key.group_index >= impl_->resources.size()) {
             return false;
         }
-        const auto * resource = impl_->resources[key.group_index].get();
+        auto * resource = impl_->resources[key.group_index].get();
         if (resource == nullptr || resource->device == nullptr) {
             return false;
+        }
+        if (resource->device->admit_published_early) {
+            // Already published between the planner and the fills; a second one would orphan the routes.
+            resource->device->admit_published_early = false;
+            return true;
         }
         packet = resource->device->admit_publication_device;
         quantized = resource->device->admit_quantized;
     }
-    if (packet == nullptr) {
-        return false;
-    }
-    uint32_t quantized_bytes = 0;
-    if (quantized != nullptr && n_embd <= MOE_GROUPED_ADMIT_WIDTH && n_embd % MATRIX_ROW_PADDING == 0) {
-        quantize_row_q8_1_cuda(activation, nullptr, quantized, GGML_TYPE_COUNT, n_embd, n_embd,
-            n_embd, n_embd, n_embd, 1, 1, 1, stream);
-        quantized_bytes = (uint32_t) (n_embd / QK8_1 * sizeof(block_q8_1));
-    }
-    moe_grouped_admit_publish_activation<<<1, 256, 0, stream>>>(packet, activation, (uint32_t) n_embd,
-        quantized_bytes != 0 ? quantized : nullptr, quantized_bytes);
-    return moe_grouped_cuda_success(cudaGetLastError());
+    return moe_grouped_admit_publish_input(packet, quantized, input, stream);
 }
 
 
@@ -9591,6 +9844,7 @@ void ggml_cuda_moe_grouped_context::compare_admit_results(
         return;
     }
     moe_grouped_admit_publication * packet = nullptr;
+    int32_t * meta = nullptr;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (key.generation != impl_->state.generation || key.group_index >= impl_->resources.size()) {
@@ -9601,6 +9855,7 @@ void ggml_cuda_moe_grouped_context::compare_admit_results(
             return;
         }
         packet = resource->device->admit_publication_device;
+        meta = resource->device->admit_meta;
     }
     const int64_t n_embd = down_output->ne[0];
     const int64_t n_routes = down_output->ne[1] * down_output->ne[2];
@@ -9608,10 +9863,19 @@ void ggml_cuda_moe_grouped_context::compare_admit_results(
         return;
     }
     // Only the first row's activation is published, so only its routes can be compared.
-    const int64_t routes_per_row = down_output->ne[2] > 1 ? down_output->ne[1] : n_routes;
-    static const bool substitute = getenv("LLAMA_MOE_ADMIT_SUBSTITUTE") != nullptr;
-    moe_grouped_admit_compare<<<1, 1, 0, stream>>>(packet, static_cast<float *>(down_output->data),
-        n_embd, n_routes, routes_per_row, 200000000ull, substitute);
+    const int64_t routes_per_row = n_routes;   // every row's activation is published
+    static const bool substitute = getenv("LLAMA_MOE_ADMIT_SUBSTITUTE") != nullptr || moe_grouped_admit_decide_enabled();
+    static const bool parity = getenv("LLAMA_MOE_ADMIT_PARITY") != nullptr || !substitute;
+    if (parity) {
+        // Diagnostic: one thread compares in double, and substitutes if asked. Slow by design.
+        moe_grouped_admit_compare<<<1, 1, 0, stream>>>(packet, static_cast<float *>(down_output->data),
+            n_embd, n_routes, routes_per_row, 200000000ull, substitute);
+    } else if (n_embd % 4 == 0 && meta != nullptr) {
+        moe_grouped_admit_wait<<<1, 1, 0, stream>>>(packet, 200000000ull, meta);
+        const dim3 copy_grid(MOE_GROUPED_ADMIT_RESULT_ROUTES, (unsigned) ((n_embd / 4 + 127) / 128));
+        moe_grouped_admit_copy<<<copy_grid, 128, 0, stream>>>(packet,
+            static_cast<float *>(down_output->data), n_embd, n_routes, routes_per_row, meta);
+    }
     (void) moe_grouped_cuda_success(cudaGetLastError());
 }
 
@@ -11618,22 +11882,22 @@ void ggml_cuda_moe_grouped_context::launch_early_router(
         if (binding.program != nullptr && binding.n_rows == 1) {
             moe_early_router_select<1, false, true><<<1, 32, 0, early.stream>>>(
                 nullptr, device.n_experts, binding.candidate_k,
-                device.slot_for_expert, device.plan, resource.snapshot.n_slots, early.selected,
+                device.slot_for_expert, device.plan, device.plan_capacity, early.selected,
                 early.positions[predictor_lane], early.counters, device.words_per_miss * sizeof(uint4),
                 binding.n_rows, (const int32_t *) binding.program->ids->data, binding.program->ids->nb[1]);
         } else if (binding.program != nullptr) {
             moe_early_router_select<1, true, true><<<1, 32, 0, early.stream>>>(
                 nullptr, device.n_experts, binding.candidate_k,
-                device.slot_for_expert, device.plan, resource.snapshot.n_slots, early.selected,
+                device.slot_for_expert, device.plan, device.plan_capacity, early.selected,
                 early.positions[predictor_lane], early.counters, device.words_per_miss * sizeof(uint4),
                 binding.n_rows, (const int32_t *) binding.program->ids->data, binding.program->ids->nb[1]);
         } else if (binding.n_rows == 1) {
             moe_early_router_select_launch(early.scores, device.n_experts, binding.candidate_k,
-                device.slot_for_expert, device.plan, resource.snapshot.n_slots, early.selected, early.positions[predictor_lane],
+                device.slot_for_expert, device.plan, device.plan_capacity, early.selected, early.positions[predictor_lane],
                 early.counters, device.words_per_miss * sizeof(uint4), early.stream);
         } else {
             moe_early_router_select_launch<1, true>(early.scores, device.n_experts, binding.candidate_k,
-                device.slot_for_expert, device.plan, resource.snapshot.n_slots, early.selected, early.positions[predictor_lane],
+                device.slot_for_expert, device.plan, device.plan_capacity, early.selected, early.positions[predictor_lane],
                 early.counters, device.words_per_miss * sizeof(uint4), early.stream, binding.n_rows);
         }
         moe_early_router_compact<<<1, WARP_SIZE, 0, early.stream>>>(
@@ -11671,7 +11935,7 @@ void ggml_cuda_moe_grouped_context::launch_early_router(
                 binding.router_bias != nullptr ? (const float *) binding.router_bias->data : nullptr);
         }
         moe_early_router_select_launch(early.scores, device.n_experts, binding.candidate_k,
-            device.slot_for_expert, device.plan, resource.snapshot.n_slots, early.selected, early.positions[0],
+            device.slot_for_expert, device.plan, device.plan_capacity, early.selected, early.positions[0],
             early.counters, device.words_per_miss * sizeof(uint4), stream, 1, row == 0);
     }
     moe_early_router_compact<<<1, WARP_SIZE, 0, stream>>>(
@@ -11751,7 +12015,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             std::lock_guard<std::mutex> lock(impl_->mutex);
             resource = impl_->begin_decode(key, compute_stream, transaction, resource_missing);
         }
-        if (resource == nullptr || n_routes > resource->snapshot.n_slots) {
+        if (resource == nullptr || n_routes > moe_grouped_plan_capacity(resource->snapshot.n_slots)) {
             if (resource != nullptr) {
                 (void) end_group_transaction(transaction);
             }
@@ -11834,15 +12098,23 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         }
         moe_grouped_plan_decode<<<1, plan_threads, 0, compute_stream>>>(
             static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
-            device.n_experts, resource->snapshot.n_slots, resource->snapshot.n_slots,
+            device.n_experts, resource->snapshot.n_slots, device.plan_capacity,
             device.slot_for_expert, device.expert_for_slot, device.last_used,
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
             device_prefetch_job != nullptr ? impl_->early[0]->positions[device_prefetch_job->lane] : nullptr,
             device_prefetch_job != nullptr ? impl_->device_prefetch->copy_done + device_prefetch_job->lane : nullptr,
-            device.admit_slot_for_expert, n_rows == 1, device.admit_publication_device,
-            moe_grouped_admit_quota(resource->snapshot.n_slots));
+            device.admit_slot_for_expert, n_rows <= MOE_GROUPED_ADMIT_MAX_ROWS, device.admit_publication_device,
+            moe_grouped_admit_quota(resource->snapshot.n_slots),
+            moe_grouped_admit_decide_enabled() && n_rows <= MOE_GROUPED_ADMIT_MAX_ROWS &&
+                n_routes <= MOE_GROUPED_ADMIT_RESULT_ROUTES &&
+                device.admit_publication_device != nullptr,
+            device.admit_cold_score, moe_grouped_admit_promote_budget(), moe_grouped_admit_promote_min());
         CUDA_CHECK(cudaGetLastError());
+        // The CPU half starts now, while the fills below run, instead of after them.
+        device.admit_published_early = impl_->admit_early_input != nullptr && moe_grouped_admit_doorbell_enabled() &&
+            moe_grouped_admit_publish_input(device.admit_publication_device, device.admit_quantized,
+                impl_->admit_early_input, compute_stream);
         auto * debug = impl_->debug_stats();
         uint64_t * transfer_counters = debug != nullptr && device.occupied_slot != nullptr ?
             debug->device_transfers.load(std::memory_order_acquire) : nullptr;
@@ -11864,7 +12136,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                     moe_grouped_gather_decode<true><<<tile_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                         device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                        device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
+                        device.auxiliary_values_per_miss, device.plan_capacity, device.plan, transfer_counters,
                         key.candidate.group_index,
                         device.occupied_slot, device.invalidated_slot,
                         materialization.device_control, miss, tile_capacity);
@@ -11872,7 +12144,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                     moe_grouped_gather_decode<false><<<tile_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                         device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                        device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
+                        device.auxiliary_values_per_miss, device.plan_capacity, device.plan, nullptr,
                         key.candidate.group_index,
                         nullptr, nullptr,
                         materialization.device_control, miss, tile_capacity);
@@ -11884,7 +12156,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             moe_grouped_gather_decode<true><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
+                device.auxiliary_values_per_miss, device.plan_capacity, device.plan, transfer_counters,
                 key.candidate.group_index,
                 device.occupied_slot, device.invalidated_slot,
                 nullptr, 0, UINT32_MAX, device_prefetch_job != nullptr,
@@ -11897,7 +12169,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                     device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                     device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries, device.auxiliary_values_per_miss,
-                    resource->snapshot.n_slots, device.plan, nullptr, key.candidate.group_index, nullptr, nullptr,
+                    device.plan_capacity, device.plan, nullptr, key.candidate.group_index, nullptr, nullptr,
                     nullptr, 0, UINT32_MAX, true, impl_->early[0]->positions[lane],
                     impl_->device_prefetch->payload + size_t(lane) * impl_->device_prefetch->tile_bytes,
                     device_prefetch_job->expert_bytes);
@@ -11905,7 +12177,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                     device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                     device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                    device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
+                    device.auxiliary_values_per_miss, device.plan_capacity, device.plan, nullptr,
                     key.candidate.group_index,
                     nullptr, nullptr);
             }
@@ -11913,7 +12185,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         CUDA_CHECK(cudaGetLastError());
         decode->transaction = transaction;
         decode->remapped_ids = moe_grouped_plan_array_ptr(
-            device.plan, resource->snapshot.n_slots, MOE_GROUPED_PLAN_REMAPPED_IDS);
+            device.plan, device.plan_capacity, MOE_GROUPED_PLAN_REMAPPED_IDS);
         decode->layout = resource->snapshot.layout;
         decode->n_banks = resource->snapshot.banks.size();
         decode->n_slots = resource->snapshot.n_slots;
@@ -13386,7 +13658,7 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
         }
         const auto * resource = impl_->resources[group_index].get();
         if (resource == nullptr || resource->device == nullptr || resource->device->serial == 0 ||
-                n_routes > resource->snapshot.n_slots || resource->snapshot.n_slots > INT32_MAX ||
+                n_routes > resource->device->plan_capacity || resource->snapshot.n_slots > INT32_MAX ||
                 resource->active_transaction_token != 0 || resource->active_decode_stream != nullptr ||
                 impl_->refreshing[group_index] || !impl_->resource_matches_table(*resource) ||
                 resource->snapshot.acquisition.candidate.generation != group.key.candidate.generation ||
@@ -13403,7 +13675,7 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
                 device.expert_frequency == nullptr || device.expert_frequency_epoch == nullptr || device.device_step == nullptr ||
                 device.device_clock == nullptr || device.plan == nullptr || device.device_banks == nullptr ||
                 device.completion == nullptr || device.bank_data.size() != resource->snapshot.banks.size() ||
-                !moe_grouped_plan_size(resource->snapshot.n_slots, device.n_experts, &plan_bytes) ||
+                !moe_grouped_plan_size(device.plan_capacity, device.n_experts, &plan_bytes) ||
                 device.plan_bytes != plan_bytes) {
             return false;
         }
@@ -13626,7 +13898,7 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
         auto * resource = impl_->resources[group.key.candidate.group_index].get();
         const uint32_t n_routes = static_cast<uint32_t>(group.key.ids.ne[0] * group.key.ids.ne[1]);
         if (group.state != GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED || resource == nullptr || resource->device == nullptr ||
-                n_routes == 0 || n_routes > resource->snapshot.n_slots || resource->device->clock_bound > UINT64_MAX - n_routes ||
+                n_routes == 0 || n_routes > resource->device->plan_capacity || resource->device->clock_bound > UINT64_MAX - n_routes ||
                 (mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY && !resource->device->graph_clock_active)) {
             return decline();
         }
@@ -13669,7 +13941,7 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
         group.transaction.acquisition = resource.snapshot.acquisition;
         group.transaction.transaction_token = resource.active_transaction_token;
         group.remapped_ids = moe_grouped_plan_array_ptr(
-            device.plan, resource.snapshot.n_slots, MOE_GROUPED_PLAN_REMAPPED_IDS);
+            device.plan, device.plan_capacity, MOE_GROUPED_PLAN_REMAPPED_IDS);
         std::fill_n(group.bank_data, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS, nullptr);
         for (uint32_t bank_index = 0; bank_index < resource.snapshot.banks.size(); ++bank_index) {
             group.bank_data[bank_index] = device.bank_data[bank_index];
@@ -14715,7 +14987,9 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_graph
     }
 
     ggml_cuda_moe_grouped_decode_acquisition decode;
+    impl_->admit_early_input = node->src[1];
     const auto result = prepare_decode(group->key, stream, &decode, &group->authority);
+    impl_->admit_early_input = nullptr;
     if (result != GGML_CUDA_MOE_GROUPED_DECODE_READY) {
         return record_prepare_error();
     }
@@ -17822,7 +18096,7 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
         ggml_cuda_moe_add_phase_stats(aggregate.phase_stats[phase], moe_cache_take_op_stats(g_moe_cache_op_stats[phase], true));
     }
     if (moe_grouped_admit_shadow_enabled()) {
-        uint64_t hot = 0, cold = 0, fills = 0, publications = 0, timeouts = 0, parity_routes = 0, stale = 0;
+        uint64_t hot = 0, cold = 0, fills = 0, publications = 0, timeouts = 0, parity_routes = 0, stale = 0, promoted = 0;
         double parity_sum = 0.0, parity_max = 0.0;
         uint32_t last_published = 0;
         std::lock_guard<std::mutex> owner_registry_lock(owners.mutex);
@@ -17841,6 +18115,7 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
                 hot += plan.admit_hot;
                 cold += plan.admit_cold;
                 fills += plan.admit_fills;
+                promoted += plan.admit_promotions;
                 // Read straight out of mapped memory, no device copy, as the CPU half will.
                 const auto * published = device.admit_publication_host;
                 if (published != nullptr) {
@@ -17855,8 +18130,8 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
             }
         }
         const uint64_t total = hot + cold;
-        GGML_LOG_INFO("moe-admit-shadow: no-evict decode-only hot=%llu cold=%llu fills=%llu hot-rate=%.2f%% publications=%llu last_cold_routes=%u acks=%llu timeouts=%llu\n",
-            (unsigned long long) hot, (unsigned long long) cold, (unsigned long long) fills,
+        GGML_LOG_INFO("moe-admit-shadow: no-evict decode-only hot=%llu cold=%llu fills=%llu promoted=%llu hot-rate=%.2f%% publications=%llu last_cold_routes=%u acks=%llu timeouts=%llu\n",
+            (unsigned long long) hot, (unsigned long long) cold, (unsigned long long) fills, (unsigned long long) promoted,
             total > 0 ? 100.0 * (double) hot / (double) total : 0.0,
             (unsigned long long) publications, last_published,
             (unsigned long long) moe_grouped_admit_worker_instance().acknowledged.load(std::memory_order_relaxed),

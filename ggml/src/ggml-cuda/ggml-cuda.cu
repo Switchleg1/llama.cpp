@@ -3635,8 +3635,7 @@ static void ggml_cuda_mul_mat_id_cached(
             key.generation = info.generation;
             key.group_index = info.group_index;
             if (info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) {
-                (void) leased_owner->publish_admit_activation(key,
-                    static_cast<const float *>(dst->src[1]->data), dst->src[1]->ne[0], stream);
+                (void) leased_owner->publish_admit_activation(key, dst->src[1], stream);
             } else if (info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) {
                 leased_owner->compare_admit_results(key, dst, stream);
             }
@@ -6399,8 +6398,7 @@ static int ggml_cuda_try_fuse(
                         if (src1 != nullptr && src1->type == GGML_TYPE_F32) {
                             // Gate and up are fused here, so this is where the cold routes' activation lives.
                             (void) cuda_ctx->moe_grouped_context->publish_admit_activation(
-                                up_group->key.candidate, static_cast<const float *>(src1->data), src1->ne[0],
-                                cuda_ctx->stream());
+                                up_group->key.candidate, src1, cuda_ctx->stream());
                         }
                         ggml_tensor up_view;
                         ggml_tensor gate_view;
@@ -6526,7 +6524,7 @@ static int ggml_cuda_try_fuse(
                 if (grouped_pair && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
                     if (src1 != nullptr && src1->type == GGML_TYPE_F32) {
                         (void) cuda_ctx->moe_grouped_context->publish_admit_activation(up_group->key.candidate,
-                            static_cast<const float *>(src1->data), src1->ne[0], cuda_ctx->stream());
+                            src1, cuda_ctx->stream());
                     }
                     ggml_tensor up_view;
                     ggml_tensor gate_view;
@@ -6618,7 +6616,7 @@ static int ggml_cuda_try_fuse(
                 if (up_group != nullptr && gate_group == up_group && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
                     if (up->src[1] != nullptr && up->src[1]->type == GGML_TYPE_F32) {
                         (void) cuda_ctx->moe_grouped_context->publish_admit_activation(up_group->key.candidate,
-                            static_cast<const float *>(up->src[1]->data), up->src[1]->ne[0], cuda_ctx->stream());
+                            up->src[1], cuda_ctx->stream());
                     }
                     ggml_tensor up_view;
                     ggml_tensor gate_view;
@@ -7104,6 +7102,22 @@ static bool ggml_cuda_graph_evaluate_and_capture(
 #endif  // NDEBUG
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, moe_execution);
+                {
+                    // Debug aid: synchronize after every node and name the first one that faults.
+                    static const bool sync_debug = getenv("GGML_CUDA_SYNC_DEBUG") != nullptr;
+                    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+                    if (sync_debug && cudaStreamIsCapturing(cuda_ctx->stream(), &capture) == cudaSuccess &&
+                            capture == cudaStreamCaptureStatusNone) {
+                        const cudaError_t sync_error = cudaStreamSynchronize(cuda_ctx->stream());
+                        if (sync_error != cudaSuccess) {
+                            GGML_LOG_ERROR("%s: node %d %s (%s) faulted: %s; src0=%s (%s) src1=%s src2=%s\n", __func__, i,
+                                node->name, ggml_op_name(node->op), cudaGetErrorString(sync_error),
+                                node->src[0] ? node->src[0]->name : "-",
+                                node->src[0] && node->src[0]->buffer ? ggml_backend_buffer_name(node->src[0]->buffer) : "-",
+                                node->src[1] ? node->src[1]->name : "-", node->src[2] ? node->src[2]->name : "-");
+                        }
+                    }
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                     if (moe_execution != nullptr &&

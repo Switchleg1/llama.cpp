@@ -886,8 +886,8 @@ public:
     // The device slot arena of one bank. The descriptor's source_data is the host backing instead.
     void * get_group_bank_device_data(const ggml_cuda_moe_grouped_transaction & transaction, const ggml_tensor * tensor) const;
     // Publishes this layer's activation to the cold-route packet and announces it. Diagnostic path.
-    bool publish_admit_activation(const ggml_cuda_moe_candidate_group_key & key, const float * activation,
-            int64_t n_embd, ggml_cuda_moe_stream_t stream);
+    bool publish_admit_activation(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * input,
+            ggml_cuda_moe_stream_t stream);
     // Compares the CPU half's routes with the GPU's own output for the same routes. Synchronizes.
     void compare_admit_results(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * down_output,
             ggml_cuda_moe_stream_t stream);

@@ -370,6 +370,24 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 throw std::runtime_error("--moe-expert-cache-size requires a backend with MoE cache support");
             }
             ggml_backend_buffer_type_t buft = buffer_type_fn();
+            // Mapped expert weights are never auto-pinned, so a zero budget leaves every bank pageable and each cache
+            // fill is a synchronous staged copy (measured 59.8 ms against 16.3 ms per decode pass). Opt-in sizing to
+            // what can be locked now; not the default until the bounded path passes the selector and placement tests.
+            if (params.moe_expert_cache_host_pinned_size == 0 && !params.no_alloc &&
+                    getenv("LLAMA_MOE_AUTO_PIN") != nullptr) {
+                ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                size_t free_mem = 0, total_mem = 0;
+                if (cpu != nullptr) {
+                    ggml_backend_dev_memory(cpu, &free_mem, &total_mem);
+                }
+                const size_t keep_free = std::max<size_t>(size_t(2) << 30, total_mem / 50);
+                const size_t budget = free_mem > keep_free ? free_mem - keep_free : 0;
+                if (budget >= (size_t(4) << 30)) {
+                    params.moe_expert_cache_host_pinned_size = budget;
+                    LLAMA_LOG_INFO("%s: MoE expert cache host-pinned budget = %.0f MiB (automatic, %.0f MiB available)\n",
+                        __func__, budget / 1048576.0, free_mem / 1048576.0);
+                }
+            }
             // Zero-sized placeholder buffers do not retain a bounded buffer type.
             if (params.moe_expert_cache_host_pinned_size > 0 && !params.no_alloc) {
                 auto create = (ggml_backend_moe_cache_bounded_buffer_type_t) ggml_backend_reg_get_proc_address(
@@ -386,6 +404,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
             static const char * MOE_EXPS_PATTERN =
                 "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+            // Expert auxiliaries (scales, biases) are read in place by ordinary GPU ops. On Windows the bounded
+            // budget registers host memory whose device alias is not its host address, so those ops fault on it;
+            // keep auxiliaries in ordinary device memory there. The weights still route through the cache.
+            static const char * MOE_AUX_PATTERN = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps\\.(?!weight)";
+            ggml_backend_buffer_type_t aux_buft = nullptr;
+#if defined(_WIN32)
+            if (moe_buffer_type.type != nullptr) {
+                ggml_backend_dev_t cache_dev = ggml_backend_buft_get_device(buffer_type_fn());
+                aux_buft = cache_dev != nullptr ? ggml_backend_dev_buffer_type(cache_dev) : nullptr;
+            }
+#endif
             bool had_user_overrides = false;
             const bool residual = params.n_moe_expert_cache_layer_ranges != 0;
             const auto append_user_overrides = [&]() {
@@ -416,18 +445,27 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     }
                     selected_layers += static_cast<size_t>(count);
                 }
-                moe_layer_patterns.reserve(selected_layers);
-                effective_overrides.reserve(effective_overrides.size() + selected_layers + 1);
+                moe_layer_patterns.reserve(selected_layers * 2);
+                effective_overrides.reserve(effective_overrides.size() + selected_layers * 2 + 1);
                 for (size_t i = 0; i < params.n_moe_expert_cache_layer_ranges; ++i) {
                     const auto & range = params.moe_expert_cache_layer_ranges[i];
                     for (uint64_t layer = static_cast<uint64_t>(range.first);
                             layer <= static_cast<uint64_t>(range.last); ++layer) {
+                        if (aux_buft != nullptr) {
+                            moe_layer_patterns.push_back("blk\\." + std::to_string(layer) + std::string(MOE_AUX_PATTERN));
+                            effective_overrides.push_back({moe_layer_patterns.back().c_str(), aux_buft});
+                            effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_CACHE_SELECTOR);
+                        }
                         moe_layer_patterns.push_back("blk\\." + std::to_string(layer) + MOE_EXPS_PATTERN);
                         effective_overrides.push_back({moe_layer_patterns.back().c_str(), buft});
                         effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_CACHE_SELECTOR);
                     }
                 }
             } else {
+                if (aux_buft != nullptr) {
+                    effective_overrides.push_back({MOE_AUX_PATTERN, aux_buft});
+                    effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_CACHE_LEGACY);
+                }
                 effective_overrides.push_back({MOE_EXPS_PATTERN, buft});
                 effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_CACHE_LEGACY);
                 append_user_overrides();

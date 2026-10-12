@@ -1558,7 +1558,301 @@ Limits: one technical text, 768 tokens; the reference used batched evaluation wh
 
 Artifacts: `build/run-qwen-kld-ref.py`, `build/qwen-kld-ref-q4kxl-{base,gpu,hybrid,cpumoe}.log`, `build/qwen-kld-cpumoe.log`.
 
-Next: let admission decide so cold routes are skipped on the GPU, and move the doorbell wait to the combine for real overlap.
+### Admission decides, and the policy turns out to be the problem
+
+Under `LLAMA_MOE_HYBRID_DECIDE` the real decode planner applies the rule: a miss may take only an empty slot, and only during single row decode; a miss with no empty slot is cold. Cold misses leave the miss list, so nothing is transferred for them, and they map to slot 0, valid because a miss only goes cold once every slot holds weights. The planner publishes its own cold list, replacing the shadow, and substitution becomes mandatory and covers every cold route, up to 16 per decode row.
+
+The first run crashed. `moe_grouped_warp_min_slot` returns lane 0 when no lane has a candidate, because every lane ties at the maximum; the original planner always had an evictable slot so it never mattered, but under no eviction it silently evicted slot 0 while hits in the same call used it. The single warp path now reports no candidate explicitly.
+
+Correctness check: the shadow applied the same rule, so decide mode must choose exactly the same cold routes. It did: KLD 0.008835 with 97.884% same top token, identical to every digit with the substitution run at the same 16 route capacity, while the GPU now skips those transfers.
+
+That run took 1088 s because the comparison kernel was one thread reading 16 x 2560 mapped floats with volatile loads and computing NMSE in double, about 40 ms per layer. Production now uses Strata's shape, a one thread wait followed by a parallel `float4` copy, and the double precision comparison runs only under `LLAMA_MOE_ADMIT_PARITY`. Same KLD to every digit, 67 s.
+
+Decode speed, server, warm second request of 48 tokens, 8 threads:
+
+| mode | ms/token | tok/s | hot rate |
+| --- | --- | --- | --- |
+| all experts on CPU | 46.4 | 21.55 | |
+| expert cache, 32 slots | 57.65 | 17.35 | |
+| expert cache, 64 slots | 49.77 | 20.09 | |
+| hybrid decide, 32 slots | 78.18 | 12.79 | 23.4% |
+| hybrid decide, 64 slots | 59.82 | 16.72 | 63.4% |
+
+The hybrid is slower than both existing modes today. The CPU work per route, 110 to 150 us, and the handshake are not the cause. The hot rate is: 23% and 63% here, against 90% and 99.9% in the replay, which covered about ten tokens and was mostly the fill phase, as its caveat said. Over a real generation each layer touches far more distinct experts than it has slots, and fill once residency freezes on whichever experts arrived first, so 4 to 8 routes per layer go to the CPU and sit on the critical path, since a fast GPU finishes its hot routes long before the CPU finishes the cold ones.
+
+The warm all CPU result also corrects an earlier figure: 46 ms per token, not the 75 to 89 ms measured from cold starts with 8 tokens.
+
+Consequence for the design: admission without eviction is only right within a token. Between tokens residency has to adapt, promoting experts that keep going cold and demoting ones that stopped being used, at a bounded rate so transfers stay off the critical path. That is the adaptive residency item of this plan, and it is now the item that decides whether the hybrid is faster than the existing modes.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, CUDA `MUL_MAT_ID` 929/929, 3/3 MoE CTests and diff check passed; a run with every gate off printed no hybrid lines. Artifacts: `build/run-qwen-speed.py`, `build/qwen-speed-*.{log,json}`, `build/qwen-kld-hybrid-decide{1,2}.log`, `build/hybrid-decide-*.log`.
+
+### Adaptive residency, first version, and where the time actually goes
+
+Reference point from the owner: Strata IQ3_S writes 70 to 90 tok/s on this machine, with MTP drafting 4 tokens rather than llama.cpp's default of 2. Dividing out a 1.6 to 1.8x speculation gain leaves roughly 41 to 53 tok/s, about 19 to 24 ms per token, without speculation. Speculation comparisons here must use 3 to 4 drafts on both sides, and include speculation on the existing CPU expert mode as the baseline.
+
+Promotion: in decide mode each group keeps a cold score per expert. A miss whose expert went cold at least `LLAMA_MOE_HYBRID_PROMOTE_MIN` times, default 2, may evict the least recently used slot not used by the current call, at most `LLAMA_MOE_HYBRID_PROMOTE` times per layer per call; budget 0 keeps the frozen behaviour. Empty slot fills do not count against the budget, and a promoted expert's score resets.
+
+Server, warm 48 token decode, 8 threads:
+
+| config | ms/token | hot rate | promotions |
+| --- | --- | --- | --- |
+| all experts on CPU | 46.4 | | |
+| LRU cache, 96 slots | 47.12 | | |
+| decide 64, frozen | 59.82 | 63.4% | 0 |
+| decide 64, budget 1 | 59.72 | 75.1% | 804 |
+| decide 64, budget 2 | 56.05 | 76.3% | 1014 |
+| decide 64, budget 4 | 56.33 | 76.8% | 1074 |
+| decide 96, budget 2 | 53.53 | 87.5% | 451 |
+| decide 96, budget 2, threshold 1 | 56.13 | 91.9% | |
+| decide 128, budget 2 | 113.87 | 96.6% | 107 |
+
+Promotion lifts the hot rate, and capacity lifts it further, but 128 slots overcommits the 16 GB card and halves the speed, so about 96 is the practical ceiling here. More promotions raise the hot rate but add transfers, which is why threshold 1 is slower.
+
+The decisive comparison is decide 96 against the plain LRU cache at the same 96 slots: 53.5 against 47.1 ms, so the hybrid half and its handshake add about 6 ms per token at this hot rate. Per route CPU cost in the server is 210 us, twice the harness figure, plausibly because the dedicated pool competes with the server's own threads and this CPU mixes 8 performance and 16 efficiency cores.
+
+The larger finding is that the GPU path itself costs about 45 ms per token even with experts cached, against Strata's roughly 20 ms without speculation. So most of the gap to Strata is not the hybrid split but how fast this model's decode step runs on the cached GPU path at all. Per layer planner and transaction kernels, launch count and attention setup are the suspects; none is measured yet, and no profiler is installed in the toolchain.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/qwen-speed-decide{64,96,128}-t8-p*.{log,json}`, `build/qwen-speed-cached96-t8.{log,json}`, `build/patch_promote.py`.
+
+### What Strata's own log says, and the first speculation measurements
+
+The owner's Strata configuration, `strata-iq3_s.json`: `--spec 4 --spec-min-p 0.50 --pcie-frac 0.00 --expert-cache auto --expert-profile data/expert-profile.bin --kv int8 --kv-resident 32768`. The PCIe share is off for this Q3 pack and grows for Q4 packs; Strata's source defaults it to 0.55 by DMA for native packs and scales it by measured link speed, so it belongs on the plan for Q4 models, not for this one.
+
+Its log: `expert cache 3590 slots, 6.86 GiB ... pre-filled 3590 of 3590 slots from the profile`, `128 generated in 2115 ms (60.5 tok/s), drafts accepted 92 of 110`, `decode expert cache hit rate: 52.6%`. Strata's hit rate is lower than this port's decide mode at 96 slots, 87.5%. Its speed comes from speculation: about 36 passes for 128 tokens, roughly 3.5 tokens per 58 ms pass, with about 24 cold routes per layer per pass computed on the CPU, under 50 us per route. The likely reason is that routes sharing an expert across the tokens of a pass are computed in one weight pass, which is nearly free in a memory bound kernel. This port computes every route separately at 100 to 210 us. An earlier entry here overweighted residency; that is corrected.
+
+MTP sidecar: the owner's BF16 sidecar, 4.87 GiB, was quantized with `build/mtp-quant-sweep.py`, which gained a `--source` option, the CUDA runtime on its PATH, and the output size instead of the input size in its report. Experts at q2_0 give 733 MiB, iq3_s 1196 MiB, q4_K 1508 MiB, the rest at Q4_K_M; Strata's own q2_0 layer is 848 MiB. The whole draft runs on the GPU with `-ngld all`.
+
+Speculation, server, 128 tokens, second request, 8 threads, `build/run-qwen-spec.py`:
+
+| main model | draft experts | drafts | p-min | tok/s | accepted |
+| --- | --- | --- | --- | --- | --- |
+| CPU experts, no speculation | | | | 21.55 | |
+| CPU experts | q2_0 | 4 | | 17.73 | 81/182 |
+| CPU experts | q2_0 | 2 | | 23.13 | 72/108 |
+| CPU experts | q2_0 | 4 | 0.5 | 19.50 | 76/117 |
+| CPU experts | q4_K | 4 | | 21.29 | 89/150 |
+| CPU experts | q4_K | 2 | | 24.74 | 76/100 |
+| CPU experts | q4_K | 4 | 0.5 | 21.91 | 89/124 |
+| LRU cache 96 | q4_K | 2 | | 19.12 | 76/100 |
+| LRU cache 96 | q4_K | 4 | | 12.22 | 90/147 |
+| decide 96, promote 2 | q4_K | 2 | | 12.28 | 76/100 |
+| decide 96, promote 2 | q4_K | 4 | | 11.29 | 88/155 |
+
+Draft quantization matters, q4_K accepting more than q2_0, and acceptance trails Strata's 84% in every configuration. On CPU experts a verification pass touches far more distinct experts and costs about 2.2 times a single pass, so speculation barely pays. On the GPU cached paths it costs more than it gains: the LRU cache turns every extra miss into a transfer, and decide mode currently decides only single row decode, so verification passes fall back to the evicting path and churn the residency decide mode built.
+
+### Multi row decide, and the verification pass cost
+
+Decide mode now covers verification passes. Passes of up to 8 rows count as decode for fills and promotion, since with speculation nearly every target pass verifies; the planner publishes `top_k` so each cold route's row is `route / top_k`; the publication carries every row's activation, float and the GPU's own Q8_1 bytes from one multi row run of `quantize_row_q8_1_cuda`; capacity is 64 cold routes per packet. `publish_admit_activation` takes the activation tensor, so rows and strides are derived in one place. On the CPU, cold routes are sorted by expert and the jobs are (expert, weight row): each weight row comes from DRAM once and every route of that expert reuses it. The cold handler gained the per route rows and the Q8_1 row size; the ggml helper fallback declines anything but row 0.
+
+The first build crashed in every mode, the control included. The sort index and group boundaries were `thread_local` vectors referenced from the pool's job lambda, and a worker thread sees its own empty instance, not the caller's. The earlier version had copied its thread locals into plain pointers; this one had not. Found by reading the code, since no debugger is installed; fixed the same way. A crashed instance then held the executable open, which the owner cleared.
+
+Regression: single row decode reproduces exactly, KLD 0.008835 and 97.884% same top token.
+
+| config | tok/s | hot rate | CPU per route |
+| --- | --- | --- | --- |
+| decide 96, 2 drafts | 14.58 | 80.5% | 133.6 us |
+| decide 96, 4 drafts | 10.73 | 78.2% | 117.3 us |
+| decide 96, no speculation | 18.68 | 87.5% | |
+| LRU cache 96, 2 drafts | 19.12 | | |
+| LRU cache 96, no speculation | 21.22 | | |
+
+Deciding verification passes helps, 12.3 to 14.6 tok/s with two drafts, but speculation still loses. At about 2.5 tokens per pass a verification pass costs about 170 ms, of which the CPU half is roughly 10 ms, about 1.5 cold routes per layer. The plain LRU cache shows the same ratio without any hybrid code, a speculative pass costing about 2.8 times a single one. So the multi token verification pass is expensive on this model's GPU path regardless of the split. The leading suspect is rollback state for the recurrent DeltaNet layers, which speculation must snapshot and restore; Strata's log reports one checkpoint per request. A second suspect is the grouped expert path choosing a slower strategy for multi row passes. Neither is measured.
+
+Artifacts: `build/patch_multirow.py`, `build/q81_grouped.cpp`, `build/qwen-kld-hybrid-multirow.log`, `build/qwen-spec-decide-q4_K-d{2,4}-s96.{log,json}`.
+
+### Strata measured on this machine
+
+`build/bench-strata.py` runs Strata's own server with variations of the owner's config and reads its per request log line; same prompt as this port's benchmarks, 128 tokens, greedy, second request. Strata refuses `--spec 0` for this pack and refuses to verify without `--expert-profile`; the first version of the script did not notice either refusal and waited out a 15 minute timeout each, now fixed.
+
+| Strata variant | tok/s | drafts accepted | hit rate | slots |
+| --- | --- | --- | --- | --- |
+| default, 4 drafts, min-p 0.5 | 76.0 | 75/123 | 66.0% | 3745 |
+| 2 drafts | 77.9 | | 67.4% | |
+| 3 drafts | 72.8 | 66/104 | 67.8% | 3591 |
+| 4 drafts, min-p 0 | 65.7 | 76/153 | 66.1% | 3590 |
+| 4 drafts, min-p 0.8 | 59.2 | 61/75 | 68.0% | 3590 |
+| cache 2000 | 64.2 | 71/115 | 60.2% | 2582 |
+| cache 1000 | 58.2 | 74/119 | 42.5% | 1283 |
+
+Draft count barely matters, min-p 0.5 does, and residency matters only moderately: at 42.5% hit Strata still writes 58 tok/s. Its passes cost about 32 ms for about 2.4 tokens. Its log also states 23 expert pool workers and multi token AVX2 kernels for the i-quant gate and up rows.
+
+### The profile: pageable expert memory
+
+Nsight Systems 2026.1.3 was installed from NVIDIA's public CUDA redistributable index into `toolchain/`, checksum verified; CUDA tracing works without administrator rights.
+
+`build/run-qwen-ubatch.py` times a forward pass by width with `llama-perplexity`. On the plain LRU cache at 96 slots, pass cost grew linearly with tokens: 59.8, 171.4 and 263.5 ms for 1, 3 and 5 tokens. The trace of the 3 token case: 2.17 s of GPU kernels for 384 tokens, about 5.6 ms per token; 14.2 s of host time inside 128,556 `cudaMemcpyAsync` calls, about 110 us each; 69 GB copied host to device, about 180 MB per token in 0.59 MB pieces, at an effective 4.9 GB/s. The expert cache's default had left all 144 banks pageable, `pageable_sources=144 ... limit=165715968 auto_direct_groups=0`, so every fill was a synchronous staged copy from mapped file pages.
+
+With `--moe-expert-cache-host-pinned-mb 80000`:
+
+| tokens per pass | pageable | pinned |
+| --- | --- | --- |
+| 1 | 59.8 ms | 16.3 ms |
+| 3 | 171.4 ms | 49.0 ms |
+| 5 | 263.5 ms | 67.6 ms |
+
+Server, warm, 48 tokens, pinned:
+
+| mode | tok/s |
+| --- | --- |
+| LRU cache 96, no speculation | 50.76 |
+| LRU cache 96, 2 drafts | 44.97 |
+| LRU cache 96, 4 drafts | 37.88 |
+| LRU cache 96, 4 drafts, min-p 0.5 | 36.80 |
+| decide 96, promote 2, CPU 8 threads | 26.65 |
+| decide 96, promote 2, CPU 16 threads | 28.63 |
+| decide 96, promote 2, CPU 23 threads | 28.47 |
+| decide 96, 4 drafts, CPU 16 threads | 28.33 |
+| decide 96, 4 drafts, CPU 23 threads | 29.26 |
+
+Pinned memory is the largest single gain found in this port: the plain LRU cache goes from 21.2 to 50.8 tok/s. With pinned memory a fill is a DMA of about 86 us, cheaper than this port's CPU half, so filling misses beats computing them here, which is the trade Strata's PCIe share makes. Verification still costs nearly linearly because the LRU cache fills every miss.
+
+With 16 to 23 threads and expert grouping the CPU half reaches 37 to 59 us per route, comparable to Strata, yet decide mode stays near 28 tok/s. The remaining hybrid cost is latency, not throughput: every layer waits for the CPU round trip, about 0.3 ms per layer, and with only a few tokens of hot work per layer there is little GPU work to overlap it with.
+
+### Pinned expert memory: opt-in for now, and why not default
+
+Why the default left everything pageable: with `--load-mode mmap` the expert banks are wrapped from the file mapping as read only buffers whose automatic pinning is off, so the zero budget's automatic registration never applies to them, `auto_total_groups=0`. Only a positive budget creates the bounded buffer type that registers sources.
+
+Three attempts to default it:
+
+1. A budget set in the model constructor failed to load: the bounded buffer type is created earlier, in `src/llama.cpp`, from the caller's parameters, so the model saw a positive budget with an unbounded owner and `configure_sources` refused.
+2. Sizing the budget to the cached tensors at load failed for the same reason.
+3. Setting it in `src/llama.cpp` just before the bounded buffer type is created works. The budget is a cap: 78000, 81738 and 84000 MiB all load and give 18.5, 17.0 and 16.9 ms per decode pass, so partial registration is fine. Default server decode rose from 21.2 to 45.9 tok/s with an automatic 80888 MiB.
+
+It is not the default, because two moe-cache CTests fail with it and pass without it:
+
+- `test-moe-placement` compares real loads with allocation free probes, which `llama-fit-params` depends on. The automatic budget applies to real loads only and depends on free memory, so placement identities diverge. A total RAM based value would be deterministic but could fail to load where less memory is lockable.
+- `test-moe-cache-selector` hits a CUDA illegal memory access in the bounded pinned path. That path had only been exercised with explicit budgets; a default would expose every user to it.
+
+So `LLAMA_MOE_AUTO_PIN=1` enables the automatic budget, 16.6 ms per pass, and `--moe-expert-cache-host-pinned-mb` keeps working; the default is unchanged and all three CTests pass. Making it default requires fixing the selector crash and making the budget deterministic for placement identity.
+
+Validation: Release build, insertion probe, grouped-layer run, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/qwen-ubatch-*.log`, `build/patch_autopin*.py`, `build/hybrid-autopin-*.log`.
+
+### The bounded path crash, found and partly fixed
+
+Tools: compute-sanitizer was installed from the same public index, checksum verified, but on Windows it needs the WDDM debugger interface enabled by an administrator, which this work does not change. A debug aid replaced it: under `GGML_CUDA_SYNC_DEBUG` the CUDA graph loop synchronizes after every node, outside capture, and names the first node that faults with its sources and buffers.
+
+Result: node 123, a `REPEAT` of `blk.1.ffn_gate_exps.scale`, a per expert scale tensor in the bounded cached buffer. The bounded configure step already documents the cause: Windows gives host memory registered with `cudaHostRegister` a device alias that is not its host address, and the grouped path uses GPU shadows for auxiliaries, but ordinary GPU ops read `tensor->data` directly. Without a budget the cache buffer comes from `cudaHostAlloc`, whose alias is the identity, so the same op works. The IQ3_S model has no expert scale tensors, which is why it never crashed. The bug predates this work and is reachable with the explicit budget flag.
+
+Fix in `src/llama.cpp`: on Windows in bounded mode, expert auxiliaries, any `..._exps.` tensor other than `.weight`, are placed in ordinary device memory by an override ahead of the cache pattern, per selected layer in residual mode. The selector test then executes every case without faulting, and target outputs match, NMSE 0 or 3.4e-08 against a 1e-6 tolerance.
+
+Remaining, and the point where this was set aside: the MTP case now fails cleanly with `required grouped execution failed: grouped plan unavailable`. Draft and MTP contexts require grouped execution, and a layer whose scales are no longer beside its weights is not eligible for grouped planning. Making pinned memory the default needs the grouped planner to accept device resident auxiliaries, plus a budget that the allocation free placement probe can reproduce. The default is unchanged and all three moe-cache CTests pass; pinned decode through the explicit flag is unaffected, 17.2 ms per pass.
+
+Validation: Release build/relink, insertion probe, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/selector-*.log`, `build/patch_aux_placement.py`.
+
+### The handshake cost, and speculation finally pays
+
+Trace of decide mode, pinned, single token passes: `moe_grouped_admit_copy` averaged 308 us per layer, 40% of GPU time, about the 15 ms per token the hybrid cost over the plain cache. Three steps:
+
+1. Replacing the volatile `float4` reads, which split into four ordered 4 byte PCIe reads, with `__ldcv` changed little: 263 us.
+2. Spreading one `float4` per thread over more blocks made it worse, 656 us, because every block first read the count and its route from host memory, one PCIe round trip each.
+3. The one thread wait kernel now copies the count and routes into a small device buffer after the acknowledgement; the copy kernel reads metadata from device memory and only the payload from the host, all reads in flight. The copy left the profile, and a decide pass fell from 33.7 to 18.3 ms, against 16.3 to 17.2 ms for the pinned LRU cache. KLD unchanged, 0.008835.
+
+`llama-perplexity -ub 3` is not a valid stand in for verification: three tokens of one sequence do not satisfy the grouped path's ordinary certificate, so both decide and LRU fell back to the legacy cache with fills, and their traces were identical to the megabyte. Speculation has to be measured through the server.
+
+Tracing the real speculative server path showed the expert kernels themselves at 0.3 to 6.3 ms per call in verification passes, against about 20 us in decode, with the grouped path in use throughout. The cause is VRAM oversubscription: with the 1.5 GB draft model and larger compute buffers, 96 slots exceeds the card, and WDDM pages some device allocations to system memory. At fewer slots the problem disappears.
+
+Server, pinned, 128 tokens, q4_K MTP draft:
+
+| slots | mode | drafts | tok/s | accepted |
+| --- | --- | --- | --- | --- |
+| 80 | LRU | none | 50.56 | |
+| 48 | LRU | 4 | 28.08 | 90/147 |
+| 64 | LRU | 4 | 60.89 | 90/147 |
+| 64 | LRU | 2 | 60.83 | 76/100 |
+| 64 | LRU, min-p 0.5 | 4 | 57.92 | 89/119 |
+| 64 | LRU, q2_0 draft | 4 | 49.42 | 79/191 |
+| 72 | LRU | 4 | 63.48 | 90/147 |
+| 80 | LRU | 4 | 65.10 | 90/147 |
+| 88 | LRU | 4 | 57.55 | 90/147 |
+| 64 | decide | 2 | 51.04 | 76/100 |
+| 64 | decide | 4 | 45.55 | 89/152 |
+| 80 | decide | 4 | 51.57 | 89/147 |
+
+Best so far: 65.1 tok/s, pinned LRU cache at 80 slots with four MTP drafts, against 21.6 at the start of this work and Strata's 76.0 on the same prompt. Speculation is worth 1.29 times here. The hybrid's decide mode trails the pinned LRU cache at the same slots: with pinned memory a miss is an in stream DMA of about 86 us, while the CPU half's round trip on a multi token pass, about 400 us per layer, sits on the critical path. The hybrid can win only where misses are costlier than that, larger expert formats, slower links or far less VRAM, which is exactly the regime Strata's PCIe share and CPU split are tuned for.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/nsys-decide-*`, `build/nsys-spec-d4*`, `build/qwen-spec-pin-*.{log,json}`, `build/patch_copy_meta.py`.
+
+### Automatic cache sizing
+
+`--moe-expert-cache-size auto` resolves the slot count in `common_init_result` before any parameter conversion. `common_measure_joint_configuration`, which already measures the target and the draft or MTP component without allocating, is run at 16 and 32 slots; the difference gives the device cost per slot, and slots are added while the measured slack at 32 slots allows. That slack already subtracts the fit margin. Neither `--fit` nor the joint fitter chose a slot count before; they only accounted for the cache.
+
+On the IQ3_S model, pinned, 93.7 MiB per slot across 48 layers, about 1.95 MiB per layer per slot as expected:
+
+| configuration | slack at 32 slots | chosen | tok/s |
+| --- | --- | --- | --- |
+| with the q4_K MTP draft, 4 drafts | 4193 MiB | 76 | 60.57 |
+| without a draft | 6691 MiB | 103 | 49.11 |
+
+Both stay below the measured oversubscription cliffs, 88 with the draft and 128 without, and within run to run variation of the best manual choices.
+
+Validation: Release build/relink, insertion probe, full MoE suite, 3/3 MoE CTests and diff check passed. Artifacts: `build/qwen-spec-pin-cached-q4_K-d4-sauto.{log,json}`, `build/qwen-speed-pin-cachedauto-t8.{log,json}`, `build/patch_auto_slots.py`.
+
+### Overlap and the split, measured
+
+Trace of the best configuration, pinned LRU at 80 slots with four drafts: expert kernels are fast again at 58 to 77 us, and the largest cost is `moe_grouped_gather_decode`, the fill of missed experts, 545 us per layer per verification pass and 44% of GPU time, about 24 GB/s, so fills are bandwidth bound. The debug log shows MTP drafting folded into the verification step, about 48 ms per cycle.
+
+Two changes to let the CPU half run beside the fills:
+
+- The activation is now published inside `prepare_decode`, right after the planner kernel and before the fill kernels, through a shared helper; the later publication at the gate and up dispatch then skips once, since a second publication would be refused as unplanned and leave cold routes without CPU values. KLD unchanged, 0.008835, with no unplanned or stale packets.
+- A split policy is expressible with the existing promotion: threshold 1 and budget B fill the first B misses of a call over PCIe and send the rest to the CPU.
+
+| decide mode, 80 slots, 4 drafts | tok/s |
+| --- | --- |
+| promote 2, threshold 2 | 52.60 |
+| split, B = 2 | 55.39 |
+| split, B = 4 | 60.58 |
+| split, B = 8 | 61.22 |
+| pinned LRU, every miss filled | 65.10 |
+
+The more misses are filled, the faster it gets: even in parallel the CPU half costs more than it saves on this machine. It computes about 46 us per route, but every cold route is a hard dependency the layer cannot finish without, and the overlap available per layer is small.
+
+At 40 slots every mode gave exactly 28.01 tok/s: a five token verification pass routes 50 experts per layer, more than the slots, so the grouped path switches to its host staged strategy, which decide mode does not touch. The same collapse explains 48 slots at 28.1 earlier. That is precisely the regime where the hybrid should be worth most, little VRAM and many misses, and it is currently unreachable.
+
+Validation: KLD reproduction above; build passed. Artifacts: `build/nsys-spec-s80*`, `build/qwen-spec-b*-pin-decide-*.{log,json}`, `build/patch_early_publish.py`.
+
+### Decide mode beyond the slot count: where the hybrid wins
+
+Plan arrays hold one entry per route and per slot, each `capacity` long, and `capacity` was the slot count everywhere. `moe_grouped_plan_capacity(n_slots)` now returns `max(n_slots, 64)` when decide mode is enabled and the slot count otherwise, so the default layout and memory accounting are unchanged. Each device resource stores its `plan_capacity` and every plan reader uses it: the planner launch, five fill kernel launches, the materialization, both `remapped_ids` pointers, five early router predictor sites and the accounting queries. The strategy stays device direct when the routes fit the plan and the pass has at most 8 rows. The first run failed every decode silently; four runtime checks still required `n_routes <= n_slots`, in the planner kernel, `prepare_decode` and both graph group paths, and now check the plan capacity.
+
+KLD at 8 slots, where single token decode's 10 routes exceed the slots: 0.009109 with 97.354% same top token, against 0.008835 at 32 slots, which still reproduces exactly.
+
+Server, pinned, q4_K draft:
+
+| slots | mode | drafts | tok/s |
+| --- | --- | --- | --- |
+| 40 | LRU, host staged | 4 | 28.01 |
+| 40 | decide | 4 | 40.38 |
+| 40 | decide | 2 | 44.18 |
+| 40 | decide, split B = 4 | 4 | 45.11 |
+| 24 | LRU | none | 41.03 |
+| 24 | decide, split B = 4 | none | 41.88 |
+| 24 | LRU, host staged | 4 | 27.95 |
+| 24 | decide, split B = 4 | 4 | 41.29 |
+
+This is the regime the design is for. At small capacities the LRU cache gets slower with speculation, because verification passes overflow the slots and fall to the host staged strategy; decide mode keeps speculation usable, 1.6 times the LRU cache at 40 slots and 1.48 times at 24. At 80 slots the pinned LRU cache remains ahead, 65.1 tok/s. On this card, then, the CPU split is what lets low VRAM configurations speculate, while large caches favour filling over PCIe.
+
+Validation: Release build/relink, insertion probe, grouped-layer run, ranged runner, grouped staging runner, full MoE suite, CUDA `MUL_MAT_ID` 929/929, 3/3 MoE CTests and diff check passed. Artifacts: `build/patch_plan_capacity.py`, `build/qwen-kld-hybrid-{s8,capfinal}.log`, `build/qwen-spec-*-s{24,40}.{log,json}`.
+
+### Configuration script
+
+`scripts/moe-launch.py`, the counterpart of Strata's generated config. It reads the GGUF shards (expert bytes, layer, expert and top-k counts), separates embedding lookups that stay in host memory (`per_layer_token_embd` is 27 GiB on the Qwen model), detects free VRAM, available RAM and cores, then applies the measured rules:
+
+- pinned expert memory when experts plus lookups fit in available RAM;
+- `--moe-expert-cache-size auto`, or `--slots N` to simulate a smaller GPU;
+- an MTP sidecar next to the model (q4_K preferred) on the GPU with 4 drafts;
+- hybrid decide mode with the B = 4 split when the estimated slots are fewer than one verification pass's routes, top-k x (drafts + 1); otherwise the pinned LRU cache.
+
+The slot estimate is calibrated to `auto`: 75 against the measured 76. It prints the report, environment and command, saves JSON with `--save`, and runs it (`--run`) or times a 128 token reply (`--bench`).
+
+| script choice | tok/s |
+| --- | --- |
+| auto: LRU, 75 slots, 4 drafts | 61.06 |
+| `--slots 40`: hybrid | 44.70 |
+| `--slots 40 --hybrid off` | 27.87 |
+
+The crossover between 50 and 76 slots is not measured; the rule uses the strategy boundary, where the LRU cache falls to host staging.
+
+Next: choose between filling and the CPU per call from measured costs rather than a fixed budget, so one configuration is right for both large and small caches; then grouped planning with device resident auxiliaries and a deterministic pinned default.
 
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 

@@ -546,15 +546,18 @@ bool llama_moe_hybrid_q8_1_supported(const ggml_tensor * gate, const ggml_tensor
 
 bool llama_moe_hybrid_q8_1_experts(
         const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
-        const int32_t * experts, uint32_t count, const void * x_q8_1, float * out, size_t out_stride, bool gelu) {
+        const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
+        float * out, size_t out_stride, bool gelu) {
     if (!llama_moe_hybrid_q8_1_supported(gate, up, down) || x_q8_1 == nullptr || out == nullptr ||
             experts == nullptr || count == 0 || (size_t) down->ne[1] > out_stride) {
         return false;
     }
+    int32_t max_row = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        if (experts[i] < 0 || experts[i] >= gate->ne[2]) {
+        if (experts[i] < 0 || experts[i] >= gate->ne[2] || (rows != nullptr && rows[i] < 0)) {
             return false;
         }
+        max_row = std::max(max_row, rows != nullptr ? rows[i] : 0);
     }
     const int64_t n_embd = gate->ne[0];
     const int64_t n_ff   = gate->ne[1];
@@ -562,32 +565,66 @@ bool llama_moe_hybrid_q8_1_experts(
     const bank_kind gate_kind = kind_for(gate->type);
     const bank_kind up_kind   = kind_for(up->type);
     const bank_kind down_kind = kind_for(down->type);
-    const auto * x = static_cast<const block_q8_1 *>(x_q8_1);
+    const int64_t x_blocks  = n_embd / QK8_1;
     const int64_t ff_blocks = n_ff / QK8_1;
 
+    // Routes ordered by expert: each group shares one weight read.
+    thread_local std::vector<uint32_t> order, group_begin;
+    order.resize(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return experts[a] != experts[b] ? experts[a] < experts[b] : a < b;
+    });
+    group_begin.clear();
+    for (uint32_t k = 0; k < count; ++k) {
+        if (k == 0 || experts[order[k]] != experts[order[k - 1]]) {
+            group_begin.push_back(k);
+        }
+    }
+    group_begin.push_back(count);
+    const int64_t n_groups = (int64_t) group_begin.size() - 1;
+    // Plain pointers: the pool's threads would otherwise see their own, empty thread_local vectors.
+    const uint32_t * order_p = order.data();
+    const uint32_t * begin_p = group_begin.data();
+
+    const auto x_row = [&](uint32_t route) {
+        const int32_t row = rows != nullptr ? rows[route] : 0;
+        return reinterpret_cast<const block_q8_1 *>(static_cast<const char *>(x_q8_1) + (size_t) row * x_row_bytes);
+    };
     thread_local std::vector<block_q8_0> x0, act0;
     thread_local std::vector<float> act;
     thread_local std::vector<block_q8_1> act1;
     if (gate_kind == BANK_GGML_Q8_0 || up_kind == BANK_GGML_Q8_0) {
-        x0.resize((size_t) (n_embd / QK8_1));
-        repack_q8_0(x, x0.data(), n_embd / QK8_1);
+        x0.resize((size_t) (max_row + 1) * x_blocks);
+        for (int32_t row = 0; row <= max_row; ++row) {
+            repack_q8_0(reinterpret_cast<const block_q8_1 *>(static_cast<const char *>(x_q8_1) + (size_t) row * x_row_bytes),
+                x0.data() + (size_t) row * x_blocks, x_blocks);
+        }
     }
     act.resize((size_t) count * n_ff);
     act1.resize((size_t) count * ff_blocks);
-
     float * act_data = act.data();
     const block_q8_0 * x0_data = x0.data();
-    // Rows of every route in one job: row r belongs to route r / n_ff.
-    pool().run((int64_t) count * n_ff, 16, [&](int64_t begin, int64_t end) {
-        for (int64_t r = begin; r < end; ++r) {
-            const int64_t route = r / n_ff, row = r % n_ff;
-            const char * g_row = static_cast<const char *>(gate->data) + (size_t) experts[route] * gate->nb[2] + (size_t) row * gate->nb[1];
-            const char * u_row = static_cast<const char *>(up->data)   + (size_t) experts[route] * up->nb[2]   + (size_t) row * up->nb[1];
-            const float g = bank_dot(gate->type, gate_kind, g_row, x, x0_data, n_embd);
-            const float u = bank_dot(up->type, up_kind, u_row, x, x0_data, n_embd);
-            const float a = gelu ? 0.5f*g*(1.0f + std::tanh(0.7978845608f*(g + 0.044715f*g*g*g)))
-                                 : g / (1.0f + std::exp(-g));
-            act_data[r] = a * u;
+
+    // Job = (group, weight row): the weight row comes from DRAM once, every route of the group reuses it.
+    pool().run(n_groups * n_ff, 16, [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            const int64_t g = job / n_ff, row = job % n_ff;
+            const int32_t expert = experts[order_p[begin_p[g]]];
+            const char * g_row = static_cast<const char *>(gate->data) + (size_t) expert * gate->nb[2] + (size_t) row * gate->nb[1];
+            const char * u_row = static_cast<const char *>(up->data)   + (size_t) expert * up->nb[2]   + (size_t) row * up->nb[1];
+            for (uint32_t k = begin_p[g]; k < begin_p[g + 1]; ++k) {
+                const uint32_t route = order_p[k];
+                const int32_t r = rows != nullptr ? rows[route] : 0;
+                const block_q8_0 * x0_row = x0_data != nullptr ? x0_data + (size_t) r * x_blocks : nullptr;
+                const float gv = bank_dot(gate->type, gate_kind, g_row, x_row(route), x0_row, n_embd);
+                const float uv = bank_dot(up->type, up_kind, u_row, x_row(route), x0_row, n_embd);
+                const float a = gelu ? 0.5f*gv*(1.0f + std::tanh(0.7978845608f*(gv + 0.044715f*gv*gv*gv)))
+                                     : gv / (1.0f + std::exp(-gv));
+                act_data[(size_t) route * n_ff + row] = a * uv;
+            }
         }
     });
     for (uint32_t route = 0; route < count; ++route) {
@@ -600,12 +637,16 @@ bool llama_moe_hybrid_q8_1_experts(
 
     const block_q8_1 * act1_data = act1.data();
     const block_q8_0 * act0_data = act0.data();
-    pool().run((int64_t) count * n_out, 32, [&](int64_t begin, int64_t end) {
-        for (int64_t r = begin; r < end; ++r) {
-            const int64_t route = r / n_out, row = r % n_out;
-            const char * d_row = static_cast<const char *>(down->data) + (size_t) experts[route] * down->nb[2] + (size_t) row * down->nb[1];
-            out[(size_t) route * out_stride + row] = bank_dot(down->type, down_kind, d_row,
-                act1_data + route * ff_blocks, act0_data + route * ff_blocks, down->ne[0]);
+    pool().run(n_groups * n_out, 32, [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            const int64_t g = job / n_out, row = job % n_out;
+            const int32_t expert = experts[order_p[begin_p[g]]];
+            const char * d_row = static_cast<const char *>(down->data) + (size_t) expert * down->nb[2] + (size_t) row * down->nb[1];
+            for (uint32_t k = begin_p[g]; k < begin_p[g + 1]; ++k) {
+                const uint32_t route = order_p[k];
+                out[(size_t) route * out_stride + row] = bank_dot(down->type, down_kind, d_row,
+                    act1_data + (size_t) route * ff_blocks, act0_data + (size_t) route * ff_blocks, down->ne[0]);
+            }
         }
     });
     return true;
