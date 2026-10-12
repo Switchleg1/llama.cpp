@@ -2111,6 +2111,70 @@ Artifacts: `build/store-adapt-*.log`, `build/qwen-kld-hybrid-r24adapt{,2,3}.log`
 
 Next: skip mmap prefetch for store-owned expert ranges, complement exchanges with event-bound commits (exclude GPU-resident experts from RAM), then the prefill replacement.
 
+### Prompt processing reads store experts; no prefetch of expert ranges
+
+The per-tensor cache copy path (`moe_cache_copy_source`), used by prompt processing and other non-decide calls, now consults the expert source registry by the bank's original tensor data. It splits each requested range per expert, copies experts the store holds from its pinned memory, and sends only the rest through the previous tensor path (mmap, registered or staged). Registry changes happen only at synchronized points, so in-flight copies never see a moved position. When `LLAMA_MOE_EXPERT_STORE_MB` is set and the model is memory-mapped, the loader no longer prefetches routed expert bank ranges: it passes them to the mapping as lazy ranges, which skip `PrefetchVirtualMemory`/`MADV_WILLNEED` (and get `MADV_RANDOM` on POSIX). Expert pages are then read only for experts the store does not hold.
+
+Results (IQ3_S): ub=128 KLD harness with a 24 GiB store matched the run without a store exactly (KLD 0.012207 +- 0.002384, 97.354%, 89 tok/s prompt). A temporary counter showed about 49 GiB of prompt-processing expert copies from the store and 45 GiB from tensor data over the six chunks, matching a half-resident store. The legacy prompt path copies about 16 GB of expert weights per 128-token chunk; replacing that streaming is the remaining prefill work.
+
+Server, tuned configuration, same session: full store 44.72 tok/s against legacy pinned 46.86; 24 GiB adaptive store 24.23 tok/s with available RAM holding near 38 GiB through decode (earlier 27.89 in a faster session, with identical file-read and promotion counts).
+
+A staging-test check registers owner memory with different bytes for two of four experts. It confirms that a cache fill and a mixed staging copy take owner bytes for registered experts and tensor bytes for the others. The pinned-store unit block skips under `GGML_CUDA_NO_PINNED`, where the CUDA host buffer type is pageable.
+
+Artifacts: `build/store-prefill-*.log`, `build/qwen-kld-hybrid-ub128-{store24,nostore}.log`, `build/bench-{store,legacy}-np-bench.log`, `build/bench-store24-np-bench.log`.
+
+Next: complement exchanges with event-bound commits (exclude GPU-resident experts from RAM) and a prompt path that streams from the store without whole-bank copies.
+
+### Decode time profile, deferred fills (rejected) and promotion threshold
+
+Nsight Systems with CUDA graph node tracing on the tuned configuration (legacy pinned sources, d2, auto 77 slots, hybrid budget 64, threshold 0) shows the decide planner's synchronous promotion fills as the largest GPU cost: `moe_grouped_gather_decode` took 37.6% of kernel time (10,368 calls, 387 us average, about 9 MB, roughly 4.8 experts, per call, so about 24 GB/s). The GPU wait for CPU results (`moe_grouped_admit_wait`) took 5.7% (56 us average). With budget 4 the gather average was still 318 us, because fewer than four promotions per call was already typical. Raising the transfer grid from 4 to 16 blocks per SM did not change the gather time (365 us) or decode speed, so it was reverted. A standalone zero-copy benchmark reaches 46-48 GB/s with five 2 MiB experts at 1,120 blocks, so the real gather is not limited by grid size alone.
+
+CPU-side timing in the store kernel (temporary): 4.64 cold experts per call. With 16 threads, gate/up took 180 us, quantization 11 us and down 94 us per call, about 33 GB/s of weights. With 23 threads it was 130/11/77 us (43 GB/s) and with 8 threads 294/11/145 us (21 GB/s). End to end, 16 and 23 threads were equal within noise (49.3 and 49.7 tok/s) and 8 threads was slower (45.3).
+
+Deferred promotion fills were implemented and measured, then reverted. Each promoted miss stayed cold for the current call, so the CPU computed it, while its fill ran on a separate stream into a slot the call does not read, joined at the end of the graph (before capture ends) and committed by the next plan. Decode got slower in every variant: unlimited 46.84/46.71 against synchronous 48.63/52.71; capping the CPU's share at 6 and 8 cold misses per call gave 49.52/47.89 and 47.93 against synchronous 52.08/52.01. Deferral raised CPU work from 4.64 to 6.6-8.1 experts per call (280 to 466 us), and the CPU path became the critical path. A synchronous fill and GPU computation of a promoted expert is currently cheaper than computing it on the CPU.
+
+The promotion threshold (`LLAMA_MOE_HYBRID_PROMOTE_MIN`, the number of cold calls before an expert may evict a resident) sets the fill rate. Interleaved runs: threshold 2 at 53.9, 54.46, 54.81 against threshold 0 at 51.4, 51.98, 52.2; threshold 3 at 51.5 and 4 at 48.14 (two consecutive regressions, so the sweep stopped); threshold 1 at 51.5. With threshold 2, budgets 16 and 128 (46.98, 48.98) did not beat 64 (49.13 in the same, slower session). The launcher's hybrid default and its tuned configuration now use threshold 2 with budget 64. Session-to-session drift was several tok/s, so only interleaved comparisons are used here.
+
+Artifacts: `build/nsys-tuned2.nsys-rep`, `build/nsys-b4.nsys-rep`, `build/nsys-bps16.nsys-rep`, `build/bench-{sync,async,q6,q8,m1,m2,m3,m4,m2b16,m2b128}*-bench.log`, `build/zerocopy-bench.cu`, `build/promote-min-*.log`.
+
+Next: reduce the synchronous fill volume further (promotion policy that accounts for reuse, or slots that serve the next verification pass), make the CPU expert kernel faster, since it limits what can move off the GPU, then complement exchanges and prefill streaming.
+
+### Nsight Systems comparison: Strata against this port
+
+Both engines were traced with CUDA graph node tracing under the same workload. Each run sent four identical requests: the same chat prompt (72 tokens), 512 generated tokens, greedy, with 4 s idle gaps so the trace splits per request. The first request was treated as warm-up. Strata ran its own `strata.exe --serve` process with the owner's `strata-iq3_s.json` (spec 4, min-p 0.5, expert profile, auto cache of 3,863 slots, `--pcie-frac 0`), driven over its stdin protocol and stopped with `QUIT` (`build/profile-strata-driver.py`). llama.cpp ran the tuned launcher configuration (MTP q4_K d2, hybrid decide, budget 64, threshold 2, auto 77 slots, legacy pinned sources) with `ignore_eos` (`build/profile-llama-driver.py`). Decode windows exclude llama.cpp's prompt phase (its pageable whole-bank prompt copies; Strata reused 67 of 72 prompt tokens from its checkpoint).
+
+Untraced decode rates in the same session: Strata 63.5-74.5 tok/s (expert-cache hit rate 67-76% of lookups, 227-253 of 332-368 drafts accepted); llama.cpp 54-60 tok/s (273-292 of 437-475 drafts accepted) and 57-63 tok/s in a later, faster period. Under tracing, Strata's trace stopped after its second request even though all four completed (one steady request analysed), while llama.cpp's three measured requests were consistent.
+
+Per steady request (512 tokens; about 262 verify rounds for Strata, 229 for llama.cpp):
+
+| Measure | Strata | llama.cpp |
+| --- | --- | --- |
+| decode window | 7.78 s | 9.13-9.61 s |
+| GPU busy (kernels + copies) | 25.2% | 80-82% |
+| GPU busy excluding CPU-wait kernels | 15.2% | 68-69% |
+| kernel time per token | 3.6 ms (1.5 ms of it waiting) | 14.8-15.8 ms |
+| kernels per token | 410 | 1,880-1,980 |
+| GPU waiting for CPU experts | 776 ms (`wait_flag_ge_kernel`, 66 us avg) | 1,157 ms (`moe_grouped_admit_wait`, 110 us avg) |
+| expert transfers | 93 ms of DMA copies (4.1 GB) | 1,514 ms of zero-copy gather kernels (`moe_grouped_gather_decode`, 144 us avg, 10.5k calls) |
+| hot expert compute | ~0.41 s (`gr_*`, `native_*_multi`) | ~0.72 s (`mul_mat_vec_q_moe`) |
+| BF16 small-batch matmuls | ~0.03 s (`bf16_f32_mmvf_multi`) | ~1.07 s (`mul_mat_f` grid 10/16/320 and cuBLAS grid 4) |
+| output head | not visible as a full-vocabulary kernel | 0.27 s for one-row draft steps (620 us each over 248,320 rows) + 0.15 s for verification |
+| router/plan/publish overhead | small mapped-copy kernels | 0.41 s (`plan_decode` 25 us, `publish_activation` 14 us per call) |
+
+The two engines have different bottlenecks. Strata's GPU is idle three quarters of the time, so its rounds are bounded by host and CPU expert work. llama.cpp's GPU is busy over 80% of the time and does about four times Strata's GPU work per round.
+
+How Strata changes residency: 25 bursts per request, each exactly 96 complete expert bundles (the `--adapt-swaps` cap; bundle sizes 1.5-2.7 MB) copied host-to-device with `cudaMemcpyAsync` on a dedicated stream. A burst takes about 3.9 ms at about 48 GB/s, comes about every 107 ms (every 4 rounds, `--adapt-every 4`), and overlaps no kernels: it runs while the GPU is idle between rounds. Missed experts are never filled on demand during a round (`--pcie-frac 0`): they stay on the CPU, and residency changes only through these batched swaps chosen from decayed usage counts, starting from the profile-ranked cache. llama.cpp instead fills on demand inside the round with SM zero-copy gathers, about nine times the bytes, on the critical path.
+
+Follow-up experiment: forcing `mul_mat_vec_f` for BF16 matmuls with up to 4 columns (temporary gate) made those kernels slower in total (1,574 ms against about 1,070 ms) and decode no faster (60.22/60.14 against 61.45/61.06 tok/s). It was reverted. ggml's small-batch BF16 kernels are slower than Strata's for these shapes under both dispatch choices.
+
+Conclusions for the port, in order of measured cost:
+1. Replace on-demand promotion fills with Strata's scheme: profile-ranked initial residency, misses on the CPU for the current round, and batched swaps (bounded count, decayed usage) as DMA copies between rounds. This targets 1.5 s per request of on-path gather kernels. The earlier deferred-fill experiment differed: it still promoted per call, so it added CPU work without reducing transfer volume.
+2. Reduce dense-path GPU work: about 1,900 kernels per token against 410, and BF16 small-batch matmuls at about 35 times Strata's time. This is ggml-level fusion and kernel work, not hybrid logic.
+3. The full-vocabulary output head on every draft step (0.27 s per request); Strata does not show an equivalent kernel.
+4. CPU-expert wait (1.16 s) and plan/publish overhead (0.41 s).
+
+Artifacts: `build/nsys-strata.nsys-rep`, `build/nsys-llama.nsys-rep`, `build/nsys-llama-mmvf4.nsys-rep` (with `.sqlite` exports), `build/nsys-{strata,llama}-analysis.json`, `build/nsys-{strata,llama,llama-mmvf4}-decode.json`, `build/{strata,llama}-prof-*.json`, `build/profile-{strata,llama}-driver.py`, `build/analyze-nsys.py`, `build/analyze-nsys-decode.py`.
+
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
 ### Stream-ordered insertion without an intermediate drain

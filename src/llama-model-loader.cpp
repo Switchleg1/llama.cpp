@@ -1609,8 +1609,28 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+            // With the expert store, routed expert banks are read through the store, so do not prefetch them.
+            llama_mmap::ranges skip = lazy.for_file(idx);
+            if (use_mmap && getenv("LLAMA_MOE_EXPERT_STORE_MB") != nullptr) {
+                static const std::regex expert_bank("\\.ffn_(gate|up|down|gate_up)_(ch|)exps\\.weight$");
+                for (const auto & [name, weight] : weights_map) {
+                    if (weight.idx == idx && std::regex_search(name, expert_bank)) {
+                        skip.emplace_back(weight.offs, weight.offs + ggml_nbytes(weight.tensor));
+                    }
+                }
+                std::sort(skip.begin(), skip.end());
+                llama_mmap::ranges merged;
+                for (const auto & range : skip) {
+                    if (!merged.empty() && range.first <= merged.back().second) {
+                        merged.back().second = std::max(merged.back().second, range.second);
+                    } else {
+                        merged.push_back(range);
+                    }
+                }
+                skip = std::move(merged);
+            }
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa, skip);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

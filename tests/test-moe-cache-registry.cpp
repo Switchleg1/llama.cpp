@@ -2489,7 +2489,8 @@ void test_moe_expert_store() {
     store_type store;
     CHECK(store.init(groups, gpu, {}, 192, 256, 2, read, &source));
     CHECK(!store.pinned());
-    {
+    // GGML_CUDA_NO_PINNED makes the CUDA host buffer type pageable.
+    if (getenv("GGML_CUDA_NO_PINNED") == nullptr) {
         const size_t reads = source.reads;
         store_type pinned;
         CHECK(pinned.init(groups, gpu, {}, 192, 256, 2, read, &source, {}, ggml_backend_cuda_host_buffer_type()));

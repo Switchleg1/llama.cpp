@@ -121,7 +121,7 @@ def plan(args):
     if hybrid:
         env.update({'LLAMA_MOE_ADMIT_SHADOW': '1', 'LLAMA_MOE_ADMIT_DOORBELL': '1', 'LLAMA_MOE_HYBRID_CPU': '1',
                     'LLAMA_MOE_HYBRID_Q8_1': '1', 'LLAMA_MOE_HYBRID_DECIDE': '1',
-                    'LLAMA_MOE_HYBRID_PROMOTE': '64', 'LLAMA_MOE_HYBRID_PROMOTE_MIN': '0',
+                    'LLAMA_MOE_HYBRID_PROMOTE': '64', 'LLAMA_MOE_HYBRID_PROMOTE_MIN': '2',
                     'LLAMA_MOE_HYBRID_CPU_THREADS': str(max(4, min(16, cores - int(threads))))})
     report = {
         'gpu': gpu_name, 'vram_free_gib': round(vram_free / GiB, 1), 'ram_available_gib': round(ram_avail / GiB, 1),
@@ -243,7 +243,7 @@ def tuning_candidates(config, args):
             for budget in (16, 64):
                 candidate = copy.deepcopy(lru)
                 candidate['env'] = dict(hybrid_env, LLAMA_MOE_HYBRID_PROMOTE=str(budget))
-                candidate['report']['policy'] = f'hybrid decide, fill budget {budget}, threshold 0'
+                candidate['report']['policy'] = f'hybrid decide, fill budget {budget}, threshold 2'
                 yield f'd{drafts}-hybrid-{budget}', candidate
 
 

@@ -1585,6 +1585,42 @@ void test_pageable_cache_fallback() {
     uint64_t hits = 0, misses = 0, evictions = 0;
     ggml_cuda_moe_cache_stats(cache, &hits, &misses, &evictions);
     CHECK(hits == 1 && misses == 1 && evictions == 0);
+    {
+        // Experts an owner registered come from its pinned memory; the others keep the tensor data.
+        auto * original = const_cast<uint8_t *>(data);   // 4 experts of 0x5a in the cached buffer
+        ggml_tensor tensor = {};
+        tensor.buffer = buffer.get();
+        tensor.data = original;
+        tensor.ne[2] = 4;
+        tensor.nb[2] = 256;
+        uint8_t * owner = nullptr;
+        CUDA_OK(cudaMallocHost(&owner, 4 * 256));
+        memset(owner, 0x22, 4 * 256);
+        const void * hosts[4] = {owner, nullptr, owner + 512, nullptr};
+        CHECK(ggml_backend_cuda_moe_set_expert_sources(&tensor, hosts, 4, 256));
+        auto * owned = ggml_cuda_moe_cache_init(0, 256, 4);
+        CHECK(owned != nullptr && ggml_cuda_moe_cache_set_source_for_test(owned, &tensor));
+        const int owned_slot = ggml_cuda_moe_cache_acquire(owned, original, 256, stream, false, false, false);
+        const int tensor_slot = ggml_cuda_moe_cache_acquire(owned, original + 256, 256, stream, false, false, false);
+        CHECK(owned_slot >= 0 && tensor_slot >= 0 && owned_slot != tensor_slot);
+        void * staged = nullptr;
+        CUDA_OK(cudaMalloc(&staged, 512));
+        const void * srcs[2] = {original + 512, original + 768};
+        CHECK(ggml_cuda_moe_cache_copy_to_staging(owned, srcs, 2, 256, staged, stream, false));
+        CUDA_OK(cudaStreamSynchronize(stream));
+        CUDA_OK(cudaMemcpy(actual.data(), ggml_cuda_moe_cache_slot_ptr(owned, owned_slot), 256, cudaMemcpyDeviceToHost));
+        CHECK(std::all_of(actual.begin(), actual.end(), [](uint8_t value) { return value == 0x22; }));
+        CUDA_OK(cudaMemcpy(actual.data(), ggml_cuda_moe_cache_slot_ptr(owned, tensor_slot), 256, cudaMemcpyDeviceToHost));
+        CHECK(std::all_of(actual.begin(), actual.end(), [](uint8_t value) { return value == 0x5a; }));
+        std::array<uint8_t, 512> both;
+        CUDA_OK(cudaMemcpy(both.data(), staged, both.size(), cudaMemcpyDeviceToHost));
+        CHECK(std::all_of(both.begin(), both.begin() + 256, [](uint8_t value) { return value == 0x22; }));
+        CHECK(std::all_of(both.begin() + 256, both.end(), [](uint8_t value) { return value == 0x5a; }));
+        CHECK(ggml_backend_cuda_moe_set_expert_sources(&tensor, nullptr, 0, 0));
+        CUDA_OK(cudaFree(staged));
+        ggml_cuda_moe_cache_free(owned);
+        CUDA_OK(cudaFreeHost(owner));
+    }
     CUDA_OK(cudaStreamDestroy(stream));
     ggml_cuda_moe_cache_free(cache);
     fprintf(stderr, "test-moe-cache: pageable allocation retains CUDA cache identity and exact cache fill OK\n");

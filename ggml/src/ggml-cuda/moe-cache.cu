@@ -2727,6 +2727,7 @@ static bool moe_grouped_plan_size(uint32_t capacity, uint32_t n_experts, size_t 
 // and unregisters before freeing it; resources created afterwards copy from these instead of the tensor data.
 struct moe_expert_source_entry {
     size_t stride = 0;
+    const void * data = nullptr;   // the bank tensor's original data, which per-tensor caches key on
     std::vector<const void *> hosts;
 };
 
@@ -2793,6 +2794,7 @@ bool ggml_backend_cuda_moe_set_expert_sources(const ggml_tensor * tensor, const 
     }
     moe_expert_source_entry entry;
     entry.stride = stride;
+    entry.data = tensor->data;
     entry.hosts.assign(hosts, hosts + n_experts);
     for (const void * host : entry.hosts) {
         cudaPointerAttributes attributes = {};
@@ -15957,7 +15959,68 @@ static cudaError_t moe_cache_wait_host_tile(ggml_cuda_moe_cache * cache, uint32_
     return error;
 }
 
+static cudaError_t moe_cache_copy_source_tensor(
+        ggml_cuda_moe_cache * cache,
+        void * destination,
+        const void * source,
+        size_t bytes,
+        cudaStream_t stream,
+        bool is_decode);
+
+// Experts that an owner registered are copied from its pinned memory instead of the tensor data; the rest keep
+// the tensor path. Promotions change the registry only while no copies are in flight.
 static cudaError_t moe_cache_copy_source(
+        ggml_cuda_moe_cache * cache,
+        void * destination,
+        const void * source,
+        size_t bytes,
+        cudaStream_t stream,
+        bool is_decode) {
+    std::vector<std::pair<size_t, const void *>> owned;   // (offset, owner pointer) per copied piece
+    size_t stride = 0;
+    {
+        std::lock_guard<std::mutex> lock(moe_expert_source_mutex());
+        const moe_expert_source_entry * entry = nullptr;
+        for (const auto & candidate : moe_expert_source_entries()) {
+            if (candidate.second.data == cache->tensor_data && cache->tensor_data != nullptr) {
+                entry = &candidate.second;
+                break;
+            }
+        }
+        const uintptr_t base = reinterpret_cast<uintptr_t>(cache->tensor_data);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(source);
+        if (entry != nullptr && entry->stride != 0 && address >= base &&
+                address + bytes <= base + entry->stride * entry->hosts.size()) {
+            stride = entry->stride;
+            for (size_t offset = 0; offset < bytes;) {
+                const size_t position = address - base + offset;
+                const size_t expert = position / stride;
+                const size_t within = position % stride;
+                const size_t count = std::min(bytes - offset, stride - within);
+                const void * host = entry->hosts[expert];
+                owned.push_back({offset, host != nullptr ? static_cast<const char *>(host) + within : nullptr});
+                offset += count;
+            }
+        }
+    }
+    if (stride == 0) {
+        return moe_cache_copy_source_tensor(cache, destination, source, bytes, stream, is_decode);
+    }
+    for (size_t i = 0; i < owned.size(); ++i) {
+        const size_t offset = owned[i].first;
+        const size_t count = (i + 1 < owned.size() ? owned[i + 1].first : bytes) - offset;
+        char * dst = static_cast<char *>(destination) + offset;
+        const cudaError_t error = owned[i].second != nullptr ?
+            cudaMemcpyAsync(dst, owned[i].second, count, cudaMemcpyHostToDevice, stream) :
+            moe_cache_copy_source_tensor(cache, dst, static_cast<const char *>(source) + offset, count, stream, is_decode);
+        if (error != cudaSuccess) {
+            return error;
+        }
+    }
+    return cudaSuccess;
+}
+
+static cudaError_t moe_cache_copy_source_tensor(
         ggml_cuda_moe_cache * cache,
         void * destination,
         const void * source,
