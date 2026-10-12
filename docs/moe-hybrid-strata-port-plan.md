@@ -1840,7 +1840,7 @@ Validation: Release build/relink, insertion probe, grouped-layer run, ranged run
 - pinned expert memory when experts plus lookups fit in available RAM;
 - `--moe-expert-cache-size auto`, or `--slots N` to simulate a smaller GPU;
 - an MTP sidecar next to the model (q4_K preferred) on the GPU with 4 drafts;
-- hybrid decide mode with the B = 4 split when the estimated slots are fewer than one verification pass's routes, top-k x (drafts + 1); otherwise the pinned LRU cache.
+- hybrid decide mode with fill budget 64 and threshold 0 when the estimated slots are fewer than one verification pass's routes, top-k x (drafts + 1); otherwise the pinned LRU cache. This replaces the original B = 4 default after the larger-budget sweep.
 
 The slot estimate is calibrated to `auto`: 75 against the measured 76. It prints the report, environment and command, saves JSON with `--save`, and runs it (`--run`) or times a 128 token reply (`--bench`).
 
@@ -1852,7 +1852,79 @@ The slot estimate is calibrated to `auto`: 75 against the measured 76. It prints
 
 The crossover between 50 and 76 slots is not measured; the rule uses the strategy boundary, where the LRU cache falls to host staging.
 
-Next: choose between filling and the CPU per call from measured costs rather than a fixed budget, so one configuration is right for both large and small caches; then grouped planning with device resident auxiliaries and a deterministic pinned default.
+### Measured launcher tuning
+
+The larger-budget sweep improved the small-cache path: at 40 slots, budgets 8/16/64 with threshold 1 gave 52.82/55.93/54.42 tok/s; at 24 slots, budgets 16/64 gave 48.96/49.76. Threshold 0 with budget 64 gave 60.21/53.98/50.19 at 80/40/24 slots. These short runs do not establish a precise winner between 16 and 64. Skipping activation publication for empty packets kept KLD at 0.008835; speeds were 60.74/55.46/50.36, only a small gain. The Nsight decide trace at 80 slots showed 444 ms in `moe_grouped_admit_wait` across 3739 calls, versus 668 ms less fill-kernel time than the LRU trace. The trace totals are not directly comparable end-to-end speed measurements.
+
+`scripts/moe-launch.py --tune` now measures rather than guesses: LRU, hybrid budget 16, and hybrid budget 64, all with the same cache, draft, context and prompt. Each candidate gets one warmup and three measured replies; selection uses median decode tok/s. The saved JSON includes all timings, failures, log paths and the winning command/environment. `--tune --run` starts the winner; `--config cfg.json --run` replays it without retuning. Tuning is bounded to these policies, not a claim of a globally optimal configuration or a quality test.
+
+The benchmark applies the model's own chat template through `/apply-template`, so these numbers are not directly comparable to the earlier hand-formatted benchmark:
+
+| slots | LRU | hybrid B = 16 | hybrid B = 64 | selected |
+| --- | --- | --- | --- | --- |
+| 40 | 22.62 | 42.50 | 42.35 | hybrid B = 16 |
+| 80 | 50.37 | 32.09 | 33.41 | LRU |
+
+The stronger large-cache penalty on this prompt reinforces that policy selection is workload-dependent. The tuner retains server logs, rejects occupied ports, checks early process exit and startup timeout, and rejects empty completions. It strips inherited hybrid diagnostic gates from both benchmark and normal launch environments, so an LRU candidate cannot silently inherit decide mode. Missing explicit sidecars and invalid limits fail before launching; hybrid passes are bounded to 8 rows and 64 routes.
+
+Validation: real three-candidate tuning at 40 and 80 slots, saved-config replay, Python compilation, failure-path checks for an exited server and occupied port, environment-isolation check, and diff check passed. Artifacts: `build/moe-tuned-s{40,80}.json` and `build/moe-launch-{lru,hybrid-16,hybrid-64}.log`. Log names are reused on each tuning invocation; use `--log PREFIX` to retain distinct runs.
+
+### Draft-count tuning
+
+The tuner now tests draft counts 0, 2 and 4 by default, each with LRU and the two supported hybrid budgets. `--tune-drafts 0 2 3 4` overrides this bounded grid; duplicates are removed and values outside 0 to 7 are rejected. Count 0 removes the sidecar and all speculation flags, not just the draft-step count. Without a sidecar only count 0 is tested; unsupported hybrid geometries leave the LRU candidate available. With automatic cache sizing the server fits each configuration independently, including the changed draft memory; an explicit slot count is retained for every candidate.
+
+Early replies sometimes ended before 128 tokens. Benchmarks now set `ignore_eos` and require exactly 128 predicted tokens, so early termination cannot change the measured length. This is a fixed decode workload, not a quality or natural conversation benchmark. Every result saves its complete command, environment and report, in addition to individual timings. All nine candidates at each cache size completed one warmup and three fixed-length replies:
+
+| slots | no draft, LRU | 2 drafts, LRU | 2 drafts, hybrid B = 64 | 4 drafts, LRU | selected |
+| --- | --- | --- | --- | --- | --- |
+| 40 | 42.21 | 42.80 | 49.21 | 23.01 | 2 drafts, hybrid B = 64 |
+| 80 | 49.58 | 50.89 | 51.36 | 51.53 | 4 drafts, LRU |
+
+At 80 slots the leading candidates are too close to establish a decisive difference; the saved winner is the highest measured median, not a guarantee of a stable ordering. The substantial 40-slot gain and avoidance of the four-draft LRU cliff remain. Other hybrid runs also vary, so these short runs should not be used to claim a general crossover point.
+
+Validation: Python compilation, candidate-generation checks for no-sidecar and unsupported hybrid passes, saved-command replay, all 54 measured replies verified at exactly 128 tokens, and diff check passed. Artifacts: `build/moe-tuned-fixed-s{40,80}.json`, `build/moe-fixed-s{40,80}-d*.log`.
+
+### Cache-size tuning below the loaded fit
+
+After the policy/draft grid, the tuner reads the first-stage winner's loaded slot count from `MoE expert cache auto: N slots` in the server log. For an explicit slot limit it records that limit. It then tests 90% and 80% of that count, rounded down to multiples of 8, retaining at least one slot and removing duplicate sizes. Both sizes remain strictly below the successfully loaded baseline; the heuristic estimate is never used to increase allocations. Each smaller cache tests all supported policies at the first-stage winning draft count. This is a staged search, not a full cache/draft Cartesian product.
+
+`--no-tune-cache` skips this second stage. If the server does not report its auto slot count, the sweep is skipped with a message. Measurements record `cache_slots`; winning reports also retain the historical `measured_cache_slots`. A saved `auto` command still measures the fit again when launched and may choose a different count if available VRAM changes. Successfully loading an explicit slot limit is not proof that WDDM avoided oversubscription; the sweep only guarantees that it does not request a larger cache.
+
+Real `auto` run: nine policy/draft candidates plus six smaller-cache candidates, each with one warmup and three fixed 128-token replies. The first-stage winner's loaded fit was 77 slots, and the smaller sizes were 64 and 56:
+
+| configuration | median tok/s |
+| --- | --- |
+| no draft, auto LRU | 49.62 |
+| 2 drafts, auto LRU | 48.95 |
+| 2 drafts, auto hybrid B = 16 | 54.23 |
+| 4 drafts, auto LRU | 48.49 |
+| 2 drafts, 64 slots, hybrid B = 16 | 52.18 |
+| 2 drafts, 56 slots, hybrid B = 64 | 53.67 |
+
+The saved winner remains auto with two drafts and hybrid B = 16. The leading medians are close, and this result is workload-specific, not a replacement for the earlier large-cache LRU measurements.
+
+Validation: all 15 real candidates completed; all 45 measured replies had exactly 128 tokens. Mocked checks covered absent auto fit, disabled cache sweep, rounded lower bounds and measured-slot reporting. Python compilation, saved-config replay and diff check passed. Artifacts: `build/moe-tuned-cache-auto.json`, `build/moe-cache-auto-*.log`.
+
+### Finalist confirmation and sweep stopping
+
+The top two successful configurations now get a fresh multi-prompt confirmation run: the original prompt, a Python coding prompt, and a synthetic observation summary with 2454 input tokens on this model. Each prompt gets one warmup and three measured 128-token replies. The aggregate is the harmonic mean of per-prompt median decode tok/s, equivalent to equal-output-work comparison; prompt-processing time is retained in timings but is not part of the selection score. The configured context size stays unchanged. Prompts are tokenized before inference, and prompt plus output must fit the context.
+
+`--confirm-finalists N` bounds confirmation to at most three candidates; 0 disables it. Failed finalists are recorded, and if all fail the tuner refuses to save an unconfirmed winner. The saved artifact keeps per-prompt text, input lengths, timings, aggregate scores and complete candidate configurations.
+
+Real auto run: the primary prompt ranked no-draft LRU first, but confirmation selected two-draft hybrid B = 64:
+
+| finalist | original prompt | coding | longer input | aggregate tok/s |
+| --- | --- | --- | --- | --- |
+| no draft, auto LRU | 50.41 | 51.41 | 49.07 | 50.28 |
+| 2 drafts, auto hybrid B = 64 | 53.21 | 53.72 | 55.57 | 54.15 |
+
+The two-draft winner loaded 77 slots. This is stronger evidence than one prompt, not a claim of universal optimality; only the two primary-prompt finalists were confirmed and inputs longer than 2454 tokens remain untested here.
+
+Operator sweep rule: after two consecutive settings of one parameter regress beyond the margin from that sweep's best score, stop that sweep and move to the next parameter. `--regression-margin` defaults to 0.05. Draft-count and cache-size sweeps have independent counters and compare the best supported policy at each setting. Small differences do not count as regressions, improvements reset the counter, and failed measurements reset it rather than acting as speed evidence. Unrelated LRU/hybrid policy candidates do not share a counter. Stop reasons and margins are saved with results. Apply this rule to future manual sweeps as well.
+
+Validation: real 15-candidate run and both three-prompt confirmations completed; all 18 measured confirmation replies had exactly 128 tokens. Python compilation, harmonic-score and saved-data checks, mocked two-regression stopping and noise/failure reset checks, and diff check passed. Artifacts: `build/moe-tuned-confirm-auto.json`, `build/moe-confirm-auto-confirm-*.log`.
+
+Next: grouped planning with device resident auxiliaries and a deterministic pinned default. Longer-context and production-workload testing remains necessary before relying on a saved winner outside the benchmark suite.
 
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
