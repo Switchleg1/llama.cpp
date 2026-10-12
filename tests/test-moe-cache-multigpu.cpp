@@ -1,5 +1,7 @@
 #include "../src/llama-context.h"
 #include "../src/llama-graph.h"
+#include "../src/llama-moe-expert-store.h"
+#include "../src/llama-moe-hybrid-kernels.h"
 #include "ggml-cuda/moe-cache-host.cuh"
 #include "test-moe-cache.h"
 #include "ggml-quants.h"
@@ -1028,6 +1030,148 @@ void test_hybrid_ffn_insertion() {
 }
 
 // Frozen partition: residency is whatever is already committed, so no decode is planned and nothing is filled.
+void test_hybrid_store_consumers(ggml_cuda_moe_grouped_context * context,
+        const ggml_cuda_moe_grouped_transaction & held, cudaStream_t stream,
+        const std::array<int32_t, n_experts> & resident, const llm_graph_moe_hybrid_ffn & ffn,
+        const std::vector<float> & input, const llm_graph_moe_hybrid_routes & packet) {
+    if (packet.cold_ids().empty()) {
+        return;
+    }
+    using store_type = llama_moe_expert_store;
+    struct source {
+        const ggml_tensor * banks[3];
+        std::unique_ptr<FILE, int (*)(FILE *)> file{tmpfile(), fclose};
+        size_t offsets[3] = {};
+        std::mutex mutex;
+        bool fail = false;
+        int32_t fail_expert = -1;
+    } source = {{ffn.gate, ffn.up, ffn.down}};
+    CHECK(source.file != nullptr);
+    size_t file_bytes = 0;
+    for (uint32_t bank = 0; bank < 3; ++bank) {
+        source.offsets[bank] = file_bytes;
+        const size_t bytes = ggml_nbytes(source.banks[bank]);
+        CHECK(fwrite(source.banks[bank]->data, 1, bytes, source.file.get()) == bytes);
+        file_bytes += bytes;
+    }
+    CHECK(file_bytes <= INT32_MAX);
+    CHECK(fflush(source.file.get()) == 0);
+    const auto read = [](void * user, store_type::expert key, uint32_t bank, void * dst, size_t size) {
+        auto & src = *static_cast<struct source *>(user);
+        std::lock_guard<std::mutex> lock(src.mutex);
+        if (src.fail || (src.fail_expert >= 0 && key.id == uint32_t(src.fail_expert)) || key.group != 0 || bank >= 3 ||
+                key.id >= src.banks[bank]->ne[2] || size != src.banks[bank]->nb[2]) {
+            return false;
+        }
+        return fseek(src.file.get(), long(src.offsets[bank] + size_t(key.id) * size), SEEK_SET) == 0 &&
+            fread(dst, 1, size, src.file.get()) == size;
+    };
+    const std::vector<size_t> sizes = {ffn.gate->nb[2], ffn.up->nb[2], ffn.down->nb[2]};
+    const size_t bundle_bytes = sizes[0] + sizes[1] + sizes[2];
+    std::vector<store_type::expert> gpu;
+    for (int expert = 0; expert < n_experts; ++expert) {
+        if (resident[expert] >= 0) {
+            gpu.push_back({0, uint32_t(expert)});
+        }
+    }
+    const size_t row_bytes = n_dim / QK8_1 * sizeof(block_q8_1);
+    std::vector<block_q8_1> quantized(input.size() / QK8_1);
+    llama_moe_hybrid_quantize_q8_1(input.data(), quantized.data(), input.size());
+    const auto & ids = packet.cold_ids();
+    const auto & rows = packet.cold_rows();
+    std::vector<float> expected(ids.size() * n_dim), actual(expected.size());
+    CHECK(llama_moe_hybrid_q8_1_experts(ffn.gate, ffn.up, ffn.down, ids.data(), rows.data(), ids.size(),
+        quantized.data(), row_bytes, expected.data(), n_dim, false));
+    for (size_t budget : {size_t(0), bundle_bytes * n_experts}) {
+        store_type store;
+        CHECK(store.init({{n_experts, sizes}}, gpu, {}, budget, bundle_bytes, 1, read, &source));
+        std::fill(actual.begin(), actual.end(), NAN);
+        CHECK(llama_moe_hybrid_q8_1_store_experts(store, 0, ffn.gate, ffn.up, ffn.down, ids.data(), rows.data(), ids.size(),
+            quantized.data(), row_bytes, actual.data(), n_dim, false));
+        CHECK(actual == expected);
+        CHECK(llama_moe_hybrid_q8_1_experts(ffn.gate, ffn.up, ffn.down, ids.data(), rows.data(), ids.size(),
+            quantized.data(), row_bytes, expected.data(), n_dim, true));
+        CHECK(llama_moe_hybrid_q8_1_store_experts(store, 0, ffn.gate, ffn.up, ffn.down, ids.data(), rows.data(), ids.size(),
+            quantized.data(), row_bytes, actual.data(), n_dim, true));
+        CHECK(actual == expected);
+        CHECK(llama_moe_hybrid_q8_1_experts(ffn.gate, ffn.up, ffn.down, ids.data(), rows.data(), ids.size(),
+            quantized.data(), row_bytes, expected.data(), n_dim, false));
+        if (budget == 0) {
+            source.fail = true;
+            std::fill(actual.begin(), actual.end(), NAN);
+            CHECK(!llama_moe_hybrid_q8_1_store_experts(store, 0, ffn.gate, ffn.up, ffn.down, ids.data(), rows.data(), ids.size(),
+                quantized.data(), row_bytes, actual.data(), n_dim, false));
+            CHECK(std::all_of(actual.begin(), actual.end(), [](float value) { return std::isnan(value); }));
+            source.fail = false;
+            const auto bounds = std::minmax_element(ids.begin(), ids.end());
+            if (*bounds.first != *bounds.second) {
+                source.fail_expert = *bounds.second;
+                CHECK(!llama_moe_hybrid_q8_1_store_experts(store, 0, ffn.gate, ffn.up, ffn.down, ids.data(), rows.data(), ids.size(),
+                    quantized.data(), row_bytes, actual.data(), n_dim, false));
+                CHECK(std::all_of(actual.begin(), actual.end(), [](float value) { return std::isnan(value); }));
+                source.fail_expert = -1;
+            }
+            continue;
+        }
+        {
+            auto lease = store.acquire({0, uint32_t(ids[0])});
+            ggml_tensor view;
+            CHECK(lease.tensor_view(0, *ffn.gate, view));
+            CHECK(view.ne[2] == 1 && view.nb[3] == view.nb[2] && view.data == lease.data(0));
+            CHECK(ggml_backend_buffer_is_host(view.buffer));
+            CHECK(!lease.tensor_view(3, *ffn.gate, view));
+            CHECK(!lease.tensor_view(0, *ffn.gate, *ffn.gate));
+        }
+        if (gpu.empty()) {
+            continue;
+        }
+        auto exchange = store.begin_exchange({0, uint32_t(ids[0])}, gpu.front());
+        CHECK(exchange);
+        const uint32_t slot = resident[gpu.front().id];
+        const void * incoming[3];
+        const void * outgoing[3];
+        size_t bank_sizes[3];
+        char * arena[3];
+        const uint32_t roles[] = {GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT,
+            GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT};
+        for (uint32_t bank = 0; bank < 3; ++bank) {
+            ggml_cuda_moe_grouped_bank_descriptor descriptor;
+            CHECK(context->get_group_resource_bank(held, bank, &descriptor));
+            CHECK(descriptor.role == roles[bank]);
+            CHECK(descriptor.expert_stride == sizes[bank]);
+            arena[bank] = static_cast<char *>(context->get_group_bank_device_data(held, descriptor.tensor));
+            CHECK(arena[bank] != nullptr);
+            bank_sizes[bank] = sizes[bank];
+            incoming[bank] = exchange.incoming(bank);
+            outgoing[bank] = exchange.outgoing(bank);
+            CUDA_OK(cudaMemcpyAsync(exchange.outgoing(bank), arena[bank] + size_t(slot) * sizes[bank], sizes[bank],
+                cudaMemcpyDeviceToHost, stream));
+        }
+        CHECK(!context->upload_expert(held, UINT32_MAX, incoming, bank_sizes, 3, stream));
+        bank_sizes[2]--;
+        CHECK(!context->upload_expert(held, slot, incoming, bank_sizes, 3, stream));
+        bank_sizes[2]++;
+        CHECK(context->upload_expert(held, slot, incoming, bank_sizes, 3, stream));
+        CUDA_OK(cudaStreamSynchronize(stream));
+        for (uint32_t bank = 0; bank < 3; ++bank) {
+            std::vector<uint8_t> copied(sizes[bank]);
+            CUDA_OK(cudaMemcpy(copied.data(), arena[bank] + size_t(slot) * sizes[bank], sizes[bank], cudaMemcpyDeviceToHost));
+            CHECK(memcmp(copied.data(), incoming[bank], sizes[bank]) == 0);
+        }
+        CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        CHECK(!context->upload_expert(held, slot, incoming, bank_sizes, 3, stream));
+        cudaGraph_t graph = nullptr;
+        CUDA_OK(cudaStreamEndCapture(stream, &graph));
+        if (graph) {
+            CUDA_OK(cudaGraphDestroy(graph));
+        }
+        // Restore the original payload before returning to the frozen residency fixture.
+        CHECK(context->upload_expert(held, slot, outgoing, bank_sizes, 3, stream));
+        CUDA_OK(cudaStreamSynchronize(stream));
+        exchange.cancel();
+    }
+}
+
 void test_hybrid_frozen_partition() {
     constexpr uint32_t frozen_slots = 4;
     ggml_backend_ptr cuda(ggml_backend_cuda_init(0));
@@ -1156,6 +1300,7 @@ void test_hybrid_frozen_partition() {
             CHECK(n_resident <= frozen_slots);
             total_resident += n_resident;
             CHECK(packet.build(ids.data(), ids.size(), routed.route->nb[1], n_used, n_rows, resident.data(), resident.size()));
+            test_hybrid_store_consumers(context, held, stream, resident, host_region.hybrid_ffn, input, packet);
             CHECK(executor.begin(certificate, routed.layer, routed.semantic_group, ids.data(), ids.size(),
                 routed.route->nb[1], n_used, n_rows, resident.data(), resident.size(), input.data(), cold.data()) ==
                 llm_graph_moe_hybrid_admission::ADMITTED);

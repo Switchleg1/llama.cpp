@@ -885,6 +885,10 @@ public:
     bool get_group_resource_bank(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index, ggml_cuda_moe_grouped_bank_descriptor * descriptor) const;
     // The device slot arena of one bank. The descriptor's source_data is the host backing instead.
     void * get_group_bank_device_data(const ggml_cuda_moe_grouped_transaction & transaction, const ggml_tensor * tensor) const;
+    // Uploads one complete bundle to an existing slot, without changing residency metadata. Capture is refused.
+    // Caller holds source leases until stream completion and binds the slot's semantic expert identity before dispatch.
+    bool upload_expert(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t slot,
+            const void * const * sources, const size_t * sizes, uint32_t n_banks, ggml_cuda_moe_stream_t stream);
     // Publishes this layer's activation to the cold-route packet and announces it. Diagnostic path.
     bool publish_admit_activation(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * input,
             ggml_cuda_moe_stream_t stream);
@@ -1152,6 +1156,8 @@ bool ggml_cuda_moe_hybrid_scatter_add(
 bool ggml_cuda_moe_quantize_q8_1_for_test(const float * input, void * output, int64_t width,
         int64_t rows, ggml_cuda_moe_stream_t stream);
 void ggml_backend_cuda_moe_hybrid_set_cold_handler(ggml_backend_moe_hybrid_cold_handler_t handler, void * user);
+void ggml_backend_cuda_moe_hybrid_set_cold_strict(bool strict);
+uint64_t ggml_backend_cuda_moe_hybrid_cold_failures(void);
 ggml_cuda_moe_stream_t ggml_cuda_moe_owner_stream_for_test(ggml_backend_t backend);
 
 struct ggml_cuda_graph_capture_state_for_test {

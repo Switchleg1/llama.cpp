@@ -4294,6 +4294,18 @@ struct moe_grouped_admit_worker {
     std::atomic<uint64_t> sequences_total{0};
     ggml_backend_moe_hybrid_cold_handler_t handler = nullptr;
     void * handler_user = nullptr;
+    std::atomic<bool> strict{false};
+    std::atomic<uint64_t> failed{0};
+    uint64_t retired_timeouts = 0;
+
+    uint64_t failures() {
+        std::lock_guard<std::mutex> lock(mutex);
+        uint64_t total = failed.load(std::memory_order_relaxed) + retired_timeouts;
+        for (const auto * packet : packets) {
+            total += *static_cast<const volatile uint32_t *>(&packet->timeouts);
+        }
+        return total;
+    }
 
     // Stops watching a packet before its memory is freed. Takes the lock, so a compute in progress finishes first.
     void remove(const moe_grouped_admit_publication * packet) {
@@ -4301,6 +4313,9 @@ struct moe_grouped_admit_worker {
         stale_total.fetch_add(packet->stale, std::memory_order_relaxed);
         plans_total.fetch_add(packet->plans, std::memory_order_relaxed);
         sequences_total.fetch_add(packet->sequence, std::memory_order_relaxed);
+        if (std::find(packets.begin(), packets.end(), packet) != packets.end()) {
+            retired_timeouts += packet->timeouts;
+        }
         groups.erase(std::remove_if(groups.begin(), groups.end(),
             [&](const moe_grouped_admit_group & group) { return group.packet == packet; }), groups.end());
         packets.erase(std::remove(packets.begin(), packets.end(), packet), packets.end());
@@ -4419,6 +4434,9 @@ struct moe_grouped_admit_worker {
                             if (moe_grouped_admit_decompose_mode() != 0) {
                                 decompose(group, count);
                             }
+                        } else if (strict.load(std::memory_order_relaxed) && count != 0) {
+                            packet->computed = 0;
+                            failed.fetch_add(1, std::memory_order_relaxed);
                         } else if (getenv("LLAMA_MOE_ADMIT_OWNER_ONLY") != nullptr) {
                             packet->computed = 0;   // measure only what the owner computed
                         } else {
@@ -9894,6 +9912,62 @@ void * ggml_cuda_moe_grouped_context::get_group_bank_device_data(
         }
     }
     return nullptr;
+}
+
+bool ggml_cuda_moe_grouped_context::upload_expert(
+        const ggml_cuda_moe_grouped_transaction & transaction, uint32_t slot,
+        const void * const * sources, const size_t * sizes, uint32_t n_banks, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(transaction);
+    GGML_UNUSED(slot);
+    GGML_UNUSED(sources);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(n_banks);
+    GGML_UNUSED(stream);
+    return false;
+#else
+    if (!sources || !sizes || !stream) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto * resource = impl_->find_resource(transaction);
+    if (impl_->draining || impl_->replacement_pending || !resource || resource->legacy_dirty || !resource->device ||
+            resource->snapshot.n_slot_auxiliaries != 0 || slot >= resource->snapshot.n_slots ||
+            n_banks != resource->snapshot.banks.size() || n_banks != resource->device->bank_data.size() ||
+            (resource->active_decode_stream && resource->active_decode_stream != stream)) {
+        return false;
+    }
+    moe_grouped_device_scope device_scope(resource->device->device);
+    cudaStreamCaptureStatus capture;
+    if (!moe_grouped_cuda_success(cudaStreamIsCapturing(stream, &capture)) || capture != cudaStreamCaptureStatusNone) {
+        return false;
+    }
+    for (uint32_t bank = 0; bank < n_banks; ++bank) {
+        if (!sources[bank] || !resource->device->bank_data[bank] || sizes[bank] != resource->snapshot.banks[bank].expert_stride) {
+            return false;
+        }
+        cudaPointerAttributes attributes = {};
+        const auto error = cudaPointerGetAttributes(&attributes, sources[bank]);
+        if (error == cudaErrorInvalidValue) {
+            (void) cudaGetLastError();
+        } else if (error != cudaSuccess || (attributes.type != cudaMemoryTypeHost && attributes.type != cudaMemoryTypeUnregistered)) {
+            return false;
+        }
+    }
+    auto & device = *resource->device;
+    if (device.has_completion && device.completion_stream != stream &&
+            !moe_grouped_cuda_success(cudaStreamWaitEvent(stream, device.completion, 0))) {
+        return false;
+    }
+    resource->active_decode_stream = stream;
+    for (uint32_t bank = 0; bank < n_banks; ++bank) {
+        char * dst = static_cast<char *>(device.bank_data[bank]) + size_t(slot) * sizes[bank];
+        if (!moe_grouped_cuda_success(cudaMemcpyAsync(dst, sources[bank], sizes[bank], cudaMemcpyHostToDevice, stream))) {
+            return false;
+        }
+    }
+    return true;
+#endif
 }
 
 void * ggml_cuda_moe_grouped_context::device_bank_data_for_test(
@@ -18068,6 +18142,14 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
 
 void ggml_backend_cuda_moe_hybrid_set_cold_handler(ggml_backend_moe_hybrid_cold_handler_t handler, void * user) {
     moe_grouped_admit_worker_instance().set_handler(handler, user);
+}
+
+void ggml_backend_cuda_moe_hybrid_set_cold_strict(bool strict) {
+    moe_grouped_admit_worker_instance().strict.store(strict, std::memory_order_relaxed);
+}
+
+uint64_t ggml_backend_cuda_moe_hybrid_cold_failures(void) {
+    return moe_grouped_admit_worker_instance().failures();
 }
 
 ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats() {

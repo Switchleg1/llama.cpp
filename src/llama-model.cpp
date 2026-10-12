@@ -1181,6 +1181,30 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+struct llama_moe_file_sources {
+    struct bank {
+        std::shared_ptr<llama_file> file;
+        size_t offset;
+        size_t stride;
+        uint32_t n_experts;
+    };
+    std::vector<llama_moe_expert_store::group> geometry;
+    std::vector<std::vector<bank>> groups;
+    std::unordered_map<const ggml_tensor *, bank> by_tensor;
+
+    static bool read(void * user, llama_moe_expert_store::expert key, uint32_t index, void * dst, size_t bytes) {
+        const auto & sources = *static_cast<llama_moe_file_sources *>(user);
+        if (key.group >= sources.groups.size() || index >= sources.groups[key.group].size()) {
+            return false;
+        }
+        const auto & bank = sources.groups[key.group][index];
+        if (key.id >= bank.n_experts || bytes != bank.stride) {
+            return false;
+        }
+        return bank.file->read_at(bank.offset + size_t(key.id) * bank.stride, dst, bytes);
+    }
+};
+
 struct llama_model::impl {
     impl() = default;
     ~impl() = default;
@@ -1203,6 +1227,7 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
     std::vector<llama_moe_source_group> moe_sources;
+    std::shared_ptr<llama_moe_file_sources> moe_file_sources;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -2430,6 +2455,14 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::has_tensor_override(const ggml_tensor * tensor) const {
+    const auto resolution = pimpl->tensor_override_resolutions.find(tensor->name);
+    if (resolution == pimpl->tensor_override_resolutions.end()) {
+        return pimpl->has_tensor_overrides;
+    }
+    return resolution->second.origin == llama_model_loader::TENSOR_OVERRIDE_USER;
+}
+
 bool llama_model::is_no_alloc() const {
     return params.no_alloc;
 }
@@ -2991,6 +3024,7 @@ void llama_model::finalize_moe_expert_cache() {
 }
 
 void llama_model::build_moe_sources() {
+    pimpl->moe_file_sources.reset();
     std::vector<llama_moe_source_group> result;
     result.reserve(layers.size() * 2);
     auto append = [&](uint32_t domain, bool route_present, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * gate_up, ggml_tensor * down) -> llama_moe_source_group * {
@@ -3054,6 +3088,92 @@ void llama_model::build_moe_sources() {
 
 const std::vector<llama_moe_source_group> & llama_model::moe_sources() const {
     return pimpl->moe_sources;
+}
+
+void llama_model::retain_moe_file_sources(const llama_model_loader & ml) {
+    pimpl->moe_file_sources.reset();
+    if (ml.no_alloc || pimpl->moe_sources.empty()) {
+        return;
+    }
+    auto sources = std::make_shared<llama_moe_file_sources>();
+    std::vector<std::shared_ptr<llama_file>> files(ml.files.size());
+    for (const auto & group : pimpl->moe_sources) {
+        llama_moe_expert_store::group geometry = {};
+        std::vector<llama_moe_file_sources::bank> banks;
+        for (const auto & source : group.banks) {
+            if (source.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                continue;
+            }
+            const auto * tensor = source.tensor;
+            if (!tensor || tensor->ne[2] <= 0 || tensor->ne[2] > UINT32_MAX || tensor->ne[3] != 1 ||
+                    tensor->view_src || tensor->op != GGML_OP_NONE || !ggml_is_contiguous(tensor) || !tensor->nb[2] ||
+                    (geometry.n_experts && geometry.n_experts != tensor->ne[2])) {
+                return;
+            }
+            llama_moe_file_sources::bank bank = {};
+            if (ml.borrowed_tensors.count(tensor->name)) {
+                if (!ml.model_shared || !ml.model_shared->pimpl->moe_file_sources) {
+                    return;
+                }
+                const auto & shared = *ml.model_shared->pimpl->moe_file_sources;
+                const auto found = shared.by_tensor.find(tensor);
+                if (found == shared.by_tensor.end()) {
+                    return;
+                }
+                bank = found->second;
+            } else {
+                const auto found = ml.weights_map.find(tensor->name);
+                if (found == ml.weights_map.end() || found->second.idx >= ml.files.size()) {
+                    return;
+                }
+                const auto & weight = found->second;
+                if (weight.tensor->type != tensor->type || !ggml_is_contiguous(weight.tensor) ||
+                        !std::equal(std::begin(tensor->ne), std::end(tensor->ne), std::begin(weight.tensor->ne)) ||
+                        weight.tensor->nb[2] != tensor->nb[2]) {
+                    return;
+                }
+                if (!files[weight.idx]) {
+                    files[weight.idx] = ml.files[weight.idx]->clone_reader();
+                    if (!files[weight.idx]) {
+                        return;
+                    }
+                }
+                bank = {files[weight.idx], weight.offs, tensor->nb[2], uint32_t(tensor->ne[2])};
+            }
+            if (bank.stride != tensor->nb[2] || bank.n_experts != tensor->ne[2] ||
+                    bank.offset > bank.file->size() || bank.stride > (bank.file->size() - bank.offset) / bank.n_experts) {
+                return;
+            }
+            geometry.n_experts = bank.n_experts;
+            geometry.bank_bytes.push_back(bank.stride);
+            banks.push_back(bank);
+            sources->by_tensor.emplace(tensor, bank);
+        }
+        if (banks.empty()) {
+            return;
+        }
+        sources->geometry.push_back(std::move(geometry));
+        sources->groups.push_back(std::move(banks));
+    }
+    pimpl->moe_file_sources = std::move(sources);
+}
+
+std::unique_ptr<llama_moe_expert_store> llama_model::create_moe_expert_store(
+        const std::vector<llama_moe_expert_store::expert> & gpu,
+        const std::vector<llama_moe_expert_store::expert> & rank,
+        size_t resident_budget, size_t staging_budget, uint32_t max_staged,
+        ggml_backend_buffer_type_t host_buft) const {
+    const auto & sources = pimpl->moe_file_sources;
+    if (!sources) {
+        LLAMA_LOG_ERROR("%s: compatible retained GGUF expert sources are unavailable\n", __func__);
+        return nullptr;
+    }
+    auto store = std::make_unique<llama_moe_expert_store>();
+    if (!store->init(sources->geometry, gpu, rank, resident_budget, staging_budget, max_staged,
+                     llama_moe_file_sources::read, sources.get(), sources, host_buft)) {
+        return nullptr;
+    }
+    return store;
 }
 
 static std::string json_quote(const std::string & value) {

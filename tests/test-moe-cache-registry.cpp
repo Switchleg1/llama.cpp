@@ -3,9 +3,11 @@
 #include "../src/llama-batch.h"
 #include "../src/llama-context.h"
 #include "../src/llama-model.h"
+#include "../src/llama-moe-expert-store.h"
 #include "../src/llama-vocab.h"
 
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 void test_moe_tensor_split_rejection() {
@@ -2450,4 +2452,177 @@ void test_moe_cache_proc_api() {
     device_query.early_top_k = 0;
     CHECK(!device_size(&device_query, &device_sizing));
     fprintf(stderr, "test-moe-cache: dynamic backend procedure API OK\n");
+}
+
+void test_moe_expert_store() {
+    using store_type = llama_moe_expert_store;
+    struct source {
+        FILE * file = nullptr;
+        int failure = 0;
+        size_t reads = 0;
+        std::mutex mutex;
+    } source;
+    source.file = std::tmpfile();
+    CHECK(source.file != nullptr);
+    std::vector<uint8_t> bytes(704);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = uint8_t((i / 64) * 17 + i % 64);
+    }
+    CHECK(std::fwrite(bytes.data(), 1, bytes.size(), source.file) == bytes.size());
+    CHECK(std::fflush(source.file) == 0);
+    const auto read = [](void * user, store_type::expert key, uint32_t bank, void * dst, size_t size) {
+        auto & src = *static_cast<struct source *>(user);
+        std::lock_guard<std::mutex> lock(src.mutex);
+        ++src.reads;
+        if (src.failure == 1) {
+            return false;
+        }
+        if (src.failure == 2) {
+            throw std::runtime_error("injected expert read failure");
+        }
+        const size_t offset = key.group == 0 ? size_t(key.id) * 128 + bank * 64 : 512 + size_t(key.id) * 64;
+        return size == 64 && std::fseek(src.file, long(offset), SEEK_SET) == 0 && std::fread(dst, 1, size, src.file) == size;
+    };
+    const std::vector<store_type::group> groups = {{4, {64, 64}}, {3, {64}}};
+    const std::vector<store_type::expert> gpu = {{0, 1}, {1, 2}};
+    store_type store;
+    CHECK(store.init(groups, gpu, {}, 192, 256, 2, read, &source));
+    CHECK(!store.pinned());
+    {
+        const size_t reads = source.reads;
+        store_type pinned;
+        CHECK(pinned.init(groups, gpu, {}, 192, 256, 2, read, &source, {}, ggml_backend_cuda_host_buffer_type()));
+        CHECK(pinned.pinned());
+        auto lease = pinned.acquire({0, 0});
+        cudaPointerAttributes attributes = {};
+        CHECK(lease && cudaPointerGetAttributes(&attributes, lease.data(0)) == cudaSuccess);
+        CHECK(attributes.type == cudaMemoryTypeHost);
+        CHECK(std::memcmp(lease.data(0), bytes.data(), 64) == 0);
+        store_type empty_pinned;
+        CHECK(empty_pinned.init(groups, gpu, {}, 0, 0, 0, read, &source, {}, ggml_backend_cuda_host_buffer_type()));
+        CHECK(!empty_pinned.pinned());
+        source.reads = reads;
+    }
+    CHECK(store.resident_bytes() == 192 && store.staging_bytes() == 256);
+    CHECK(source.reads == 3);
+    CHECK(!store.acquire({0, 1}) && !store.acquire({1, 2}) && !store.acquire({3, 0}));
+    auto resident = store.acquire({0, 0});
+    CHECK(resident && resident.resident());
+    CHECK(reinterpret_cast<uintptr_t>(resident.data(0)) % 64 == 0);
+    CHECK(std::memcmp(resident.data(0), bytes.data(), 64) == 0);
+    CHECK(std::memcmp(resident.data(1), bytes.data() + 64, 64) == 0);
+    CHECK(resident.data(2) == nullptr);
+    CHECK(!store.begin_exchange({0, 0}, {0, 1}));
+    CHECK(!store.init(groups, gpu, {}, 192, 256, 2, read, &source));
+    auto first = store.acquire({0, 2});
+    auto second = store.acquire({0, 3});
+    CHECK(first && second && !first.resident() && !second.resident());
+    CHECK(std::memcmp(first.data(0), bytes.data() + 256, 64) == 0);
+    CHECK(!store.acquire({1, 1}));
+    auto moved = std::move(first);
+    CHECK(!first && moved && !store.acquire({1, 1}));
+    second = {};
+    auto small = store.acquire({1, 1});
+    CHECK(small && std::memcmp(small.data(0), bytes.data() + 576, 64) == 0);
+    moved = {};
+    small = {};
+    resident = {};
+    const size_t before_exchange = source.reads;
+    auto exchange = store.begin_exchange({0, 0}, {0, 1});
+    CHECK(exchange && !store.acquire({0, 0}) && !store.acquire({0, 1}));
+    CHECK(!store.begin_exchange({0, 0}, {0, 1}));
+    const void * ram_slot = exchange.incoming(0);
+    CHECK(std::memcmp(ram_slot, bytes.data(), 64) == 0);
+    void * gpu_data = nullptr;
+    cudaStream_t stream = nullptr;
+    CUDA_OK(cudaMalloc(&gpu_data, 128));
+    CUDA_OK(cudaStreamCreate(&stream));
+    CUDA_OK(cudaMemcpy(gpu_data, bytes.data() + 128, 128, cudaMemcpyHostToDevice));
+    for (uint32_t bank = 0; bank < 2; ++bank) {
+        CUDA_OK(cudaMemcpyAsync(exchange.outgoing(bank), static_cast<uint8_t *>(gpu_data) + bank * 64,
+            64, cudaMemcpyDeviceToHost, stream));
+    }
+    for (uint32_t bank = 0; bank < 2; ++bank) {
+        CUDA_OK(cudaMemcpyAsync(static_cast<uint8_t *>(gpu_data) + bank * 64, exchange.incoming(bank),
+            64, cudaMemcpyHostToDevice, stream));
+    }
+    CUDA_OK(cudaStreamSynchronize(stream));
+    std::array<uint8_t, 128> gpu_bytes;
+    CUDA_OK(cudaMemcpy(gpu_bytes.data(), gpu_data, 128, cudaMemcpyDeviceToHost));
+    CHECK(std::memcmp(gpu_bytes.data(), bytes.data(), 128) == 0);
+    CHECK(exchange.commit() && !exchange && !exchange.commit());
+    CUDA_OK(cudaStreamDestroy(stream));
+    CUDA_OK(cudaFree(gpu_data));
+    CHECK(source.reads == before_exchange);
+    CHECK(!store.acquire({0, 0}));
+    auto evicted = store.acquire({0, 1});
+    CHECK(evicted && evicted.resident() && evicted.data(0) == ram_slot);
+    CHECK(std::memcmp(evicted.data(0), bytes.data() + 128, 64) == 0);
+    CHECK(std::memcmp(evicted.data(1), bytes.data() + 192, 64) == 0);
+    evicted = {};
+    CHECK(!store.begin_exchange({0, 1}, {1, 2}));
+    {
+        auto pending = store.begin_exchange({0, 1}, {0, 0});
+        CHECK(pending);
+        auto cancelled = std::move(pending);
+        CHECK(!pending && cancelled);
+    }
+    CHECK(store.acquire({0, 1}).resident());
+    for (int failure : {1, 2}) {
+        source.failure = failure;
+        CHECK(!store.acquire({0, 2}));
+        source.failure = 0;
+        auto recovered = store.acquire({0, 2});
+        CHECK(recovered && std::memcmp(recovered.data(1), bytes.data() + 320, 64) == 0);
+    }
+    store_type invalid;
+    CHECK(!invalid.init(groups, {{0, 1}, {0, 1}}, {}, 192, 256, 2, read, &source));
+    CHECK(!invalid.init(groups, {}, {{0, 0}, {0, 0}}, 192, 256, 2, read, &source));
+    CHECK(!invalid.init({{1, {SIZE_MAX}}}, {}, {}, 192, 256, 2, read, &source));
+    source.failure = 1;
+    CHECK(!invalid.init(groups, gpu, {}, 192, 256, 2, read, &source));
+    source.failure = 0;
+    CHECK(invalid.init(groups, gpu, {}, 192, 256, 2, read, &source));
+    store_type ranked;
+    CHECK(ranked.init(groups, gpu, {{0, 3}, {1, 1}}, 192, 256, 2, read, &source));
+    CHECK(ranked.acquire({0, 3}).resident() && ranked.acquire({1, 1}).resident());
+    CHECK(!ranked.acquire({0, 0}).resident());
+    store_type no_room;
+    CHECK(no_room.init(groups, gpu, {}, 0, 127, 2, read, &source));
+    CHECK(no_room.resident_bytes() == 0 && no_room.staging_bytes() == 0);
+    CHECK(!no_room.acquire({0, 0}));
+    std::array<store_type::lease, 2> parallel;
+    std::thread worker0([&] { parallel[0] = store.acquire({0, 2}); });
+    std::thread worker1([&] { parallel[1] = store.acquire({0, 3}); });
+    worker0.join();
+    worker1.join();
+    CHECK(parallel[0] && parallel[1] && parallel[0].data(0) != parallel[1].data(0));
+    CHECK(std::memcmp(parallel[0].data(0), bytes.data() + 256, 64) == 0);
+    CHECK(std::memcmp(parallel[1].data(0), bytes.data() + 384, 64) == 0);
+    CHECK(!store.acquire({1, 1}));
+    parallel = {};
+    store_type::lease survivor;
+    {
+        store_type temporary;
+        CHECK(temporary.init(groups, gpu, {}, 128, 0, 0, read, &source));
+        survivor = temporary.acquire({0, 0});
+    }
+    CHECK(survivor && std::memcmp(survivor.data(0), bytes.data(), 64) == 0);
+    survivor = {};
+    std::weak_ptr<struct source> reader_lifetime;
+    {
+        auto owner = std::make_shared<struct source>();
+        owner->file = source.file;
+        reader_lifetime = owner;
+        store_type temporary;
+        CHECK(temporary.init(groups, gpu, {}, 0, 128, 1, read, owner.get(), owner));
+        owner.reset();
+        CHECK(!reader_lifetime.expired());
+        survivor = temporary.acquire({0, 0});
+    }
+    CHECK(survivor && !reader_lifetime.expired());
+    survivor = {};
+    CHECK(reader_lifetime.expired());
+    CHECK(std::fclose(source.file) == 0);
+    fprintf(stderr, "test-moe-cache: complement residency, file staging and exchanges OK\n");
 }

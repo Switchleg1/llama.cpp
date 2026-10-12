@@ -21,6 +21,7 @@ set(LLAMA_CORE_SOURCES
     llama-grammar.cpp
     llama-graph.cpp
     llama-moe-hybrid-kernels.cpp
+    llama-moe-expert-store.cpp
     llama-hparams.cpp
     llama-impl.cpp
     llama-io.cpp

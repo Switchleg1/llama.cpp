@@ -52,6 +52,7 @@ void test_speculative_grouped_intent_splits();
 int  test_grouped_multigpu();
 void test_grouped_layer_placement();
 void test_moe_hybrid_ffn_insertion();
+void test_moe_expert_store();
 void test_moe_sched_compute_range();
 
 void test_speculative_required_grouped_backend_capability(int device);

@@ -1774,9 +1774,15 @@ static int test_moe_cache_selector_precedence(const size_t seed, const float std
         tensor_data_params tensor_params = { seed, stdev };
         return llama_model_ptr(llama_model_init_from_user(metadata, set_tensor_data, &tensor_params, params));
     };
+    const auto cache_reg = ggml_backend_dev_backend_reg(cache_dev);
+    const auto is_cache_buft = reinterpret_cast<ggml_backend_moe_cache_is_buffer_type_t>(
+        ggml_backend_reg_get_proc_address(cache_reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME));
     const auto is_cached = [&](const ggml_tensor * tensor) {
-        return tensor != nullptr && tensor->buffer != nullptr &&
-               ggml_backend_buffer_get_type(tensor->buffer) == cache_buft;
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            return false;
+        }
+        const auto buft = ggml_backend_buffer_get_type(tensor->buffer);
+        return is_cache_buft != nullptr ? is_cache_buft(buft) : buft == cache_buft;
     };
     const auto uses_buft = [&](const ggml_tensor * tensor, ggml_backend_buffer_type_t buft) {
         if (tensor == nullptr || tensor->buffer == nullptr) {
@@ -2101,6 +2107,14 @@ static int test_moe_cache_selector_precedence(const size_t seed, const float std
             "target+MTP all cache", make_mtp_params(nullptr), { true, true }));
         check_target_mtp("target+MTP full-slot", run_target_mtp(
             "target+MTP full-slot", make_mtp_params(nullptr, 8), { true, true }));
+        auto pinned_params = make_mtp_params(target_ordinary);
+        pinned_params.moe_expert_cache_host_pinned_size = 64 * 1024 * 1024;
+        check_target_mtp("target ordinary/MTP pinned", run_target_mtp(
+            "target ordinary/MTP pinned", pinned_params, { false, true }));
+        pinned_params = make_mtp_params(nullptr);
+        pinned_params.moe_expert_cache_host_pinned_size = 64 * 1024 * 1024;
+        check_target_mtp("target+MTP pinned", run_target_mtp(
+            "target+MTP pinned", pinned_params, { true, true }));
     }
 
     {
@@ -2659,7 +2673,7 @@ static int test_moe_placement_report(const size_t seed, const float stdev) {
                   "zero-active owner was omitted or charged cache resources");
         }
     }
-    {
+    for (const size_t host_pin : {size_t(0), size_t(64 * 1024 * 1024)}) {
         gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
         llama_model_params source_params = llama_model_default_params();
         source_params.progress_callback = silent_model_load_progress;
@@ -2670,7 +2684,7 @@ static int test_moe_placement_report(const size_t seed, const float stdev) {
         if (source) {
             llama_model_save_to_file(source.get(), path.string().c_str());
         }
-        auto params = make_params(layer_one, 1, cpu_layer_zero);
+        auto params = make_params(layer_one, 1, cpu_layer_zero, false, host_pin);
         params.load_mode = LLAMA_LOAD_MODE_MMAP;
         llama_model_ptr model(source ? llama_model_load_from_file(path.string().c_str(), params) : nullptr);
         auto probe_params = params;
@@ -2721,7 +2735,8 @@ static int test_moe_placement_report(const size_t seed, const float stdev) {
                 for (const auto & bank : group.banks) {
                     if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
                         check(bank.reason == LLAMA_MOE_PLACEMENT_CACHE_LEGACY &&
-                                  bank.winning_override_index == 0 && !bank.winning_override_pattern.empty(),
+                                  bank.winning_override_index >= 0 &&
+                                  bank.winning_override_pattern == "\\.ffn_(up|down|gate|gate_up)_(ch|)exps",
                               "legacy cache provenance mismatch");
                     }
                 }
@@ -3128,6 +3143,8 @@ static int test_moe_joint_measurement(const size_t seed, const float stdev, cons
     const auto target_path  = temp / ("llama-joint-target-" + nonce + ".gguf");
     const auto mtp_path     = temp / ("llama-joint-mtp-" + nonce + ".gguf");
     const auto partial_path = temp / ("llama-joint-partial-" + nonce + ".gguf");
+    const auto split_path_a = temp / ("llama-joint-split-" + nonce + "-00001-of-00002.gguf");
+    const auto split_path_b = temp / ("llama-joint-split-" + nonce + "-00002-of-00002.gguf");
 
     ggml_backend_dev_t cpu_devices[] = { nullptr };
     auto               load_params   = llama_model_default_params();
@@ -3166,6 +3183,134 @@ static int test_moe_joint_measurement(const size_t seed, const float stdev, cons
     save_fixture(target_path, target_metadata.get(), target.get(), false);
     save_fixture(mtp_path, mtp_metadata.get(), mtp.get(), false);
     save_fixture(partial_path, mtp_metadata.get(), mtp.get(), true);
+    if (target) {
+        check(!target->create_moe_expert_store({}, {}, 0, 0, 0), "user tensors were treated as retained GGUF file sources");
+        llama_model_saver first(LLM_ARCH_QWEN35MOE, nullptr), second(LLM_ARCH_QWEN35MOE, nullptr);
+        llama_model_saver * savers[] = {&first, &second};
+        std::unordered_set<std::string> names;
+        for (auto * saver : savers) {
+            gguf_set_kv(saver->gguf_ctx, target_metadata.get());
+        }
+        for (const auto & entry : target->tensors_by_name) {
+            if (names.insert(entry.second->name).second) {
+                savers[(names.size() - 1) % 2]->add_tensor(entry.second);
+            }
+        }
+        for (uint16_t split = 0; split < 2; ++split) {
+            gguf_set_val_u16(savers[split]->gguf_ctx, "split.no", split);
+            gguf_set_val_u16(savers[split]->gguf_ctx, "split.count", 2);
+            gguf_set_val_i32(savers[split]->gguf_ctx, "split.tensors.count", int32_t(names.size()));
+            savers[split]->save((split == 0 ? split_path_a : split_path_b).string());
+        }
+    }
+    for (const auto & path : {target_path, mtp_path, split_path_a}) {
+        for (auto mode : {LLAMA_LOAD_MODE_NONE, LLAMA_LOAD_MODE_MMAP}) {
+            auto params = load_params;
+            params.load_mode = mode;
+            params.load_mtp = path == mtp_path;
+            std::unique_ptr<FILE, int (*)(FILE *)> file(nullptr, fclose);
+            const bool from_file = path == target_path && mode == LLAMA_LOAD_MODE_NONE;
+            if (from_file) {
+                file.reset(ggml_fopen(path.string().c_str(), "rb"));
+                check(file != nullptr, "expert FILE fixture did not open");
+                if (!file) {
+                    continue;
+                }
+            }
+            llama_model_ptr model(from_file && file ? llama_model_load_from_file_ptr(file.get(), params) :
+                llama_model_load_from_file(path.string().c_str(), params));
+            file.reset();
+            if (from_file) {
+                auto probe_params = params;
+                probe_params.no_alloc = true;
+                llama_model_ptr probe(llama_model_load_from_file(path.string().c_str(), probe_params));
+                check(probe && !probe->create_moe_expert_store({}, {}, 0, 0, 0), "no_alloc probe exposed a live expert store");
+            }
+            check(model != nullptr, "expert file-source fixture did not load");
+            if (!model) {
+                continue;
+            }
+            struct snapshot {
+                llama_moe_expert_store::expert key;
+                std::vector<ggml_tensor> prototypes;
+                std::vector<std::vector<uint8_t>> bytes;
+            };
+            std::vector<snapshot> expected;
+            size_t staging = 0;
+            const auto & groups = model->moe_sources();
+            for (uint32_t group = 0; group < groups.size(); ++group) {
+                snapshot item = {};
+                item.key.group = group;
+                size_t bundle = 0;
+                for (const auto & bank : groups[group].banks) {
+                    if (bank.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                        continue;
+                    }
+                    item.key.id = uint32_t(bank.tensor->ne[2] - 1);
+                    item.prototypes.push_back(*bank.tensor);
+                    item.bytes.emplace_back(bank.tensor->nb[2]);
+                    ggml_backend_tensor_get(bank.tensor, item.bytes.back().data(), size_t(item.key.id) * bank.tensor->nb[2], bank.tensor->nb[2]);
+                    bundle += (bank.tensor->nb[2] + 63) & ~size_t(63);
+                }
+                staging = std::max(staging, bundle);
+                if (!item.bytes.empty() && (group != 0 || item.key.id != 0)) {
+                    expected.push_back(std::move(item));
+                }
+            }
+            check(!expected.empty(), "expert fixture has no cold bundle");
+            if (expected.empty()) {
+                continue;
+            }
+            auto overflow = model->create_moe_expert_store({{0, 0}}, {}, 0, staging, 1);
+            auto resident = model->create_moe_expert_store({{0, 0}}, {expected.front().key}, staging, staging, 1);
+            check(overflow != nullptr && resident != nullptr, "retained GGUF store creation failed");
+            model.reset();
+            if (!overflow || !resident) {
+                continue;
+            }
+            check(!overflow->acquire({0, 0}), "file reader exposed a GPU-owned expert");
+            check(overflow->resident_bytes() == 0 && overflow->staging_bytes() <= staging &&
+                resident->resident_bytes() <= staging, "retained GGUF store exceeded its caps");
+            for (const auto & item : expected) {
+                auto lease = overflow->acquire(item.key);
+                check(bool(lease) && !lease.resident(), "GGUF overflow read failed after model destruction");
+                if (!lease) {
+                    continue;
+                }
+                for (uint32_t bank = 0; bank < item.bytes.size(); ++bank) {
+                    check(memcmp(lease.data(bank), item.bytes[bank].data(), item.bytes[bank].size()) == 0,
+                        "retained file offsets produced different expert bytes");
+                    ggml_tensor view;
+                    check(lease.tensor_view(bank, item.prototypes[bank], view), "retained GGUF bank view failed");
+                }
+            }
+            if (from_file) {
+                std::error_code error;
+                std::filesystem::resize_file(path, 0, error);
+                check(!error, "expert file truncation failed");
+                check(!overflow->acquire(expected.back().key), "truncated GGUF returned expert bytes");
+                save_fixture(path, target_metadata.get(), target.get(), false);
+                auto recovered = overflow->acquire(expected.back().key);
+                check(bool(recovered), "GGUF source did not recover its staging slot after a short read");
+                if (recovered) {
+                    for (uint32_t bank = 0; bank < expected.back().bytes.size(); ++bank) {
+                        check(memcmp(recovered.data(bank), expected.back().bytes[bank].data(), expected.back().bytes[bank].size()) == 0,
+                            "recovered GGUF source returned different bytes");
+                    }
+                }
+            }
+            auto held = resident->acquire(expected.front().key);
+            check(bool(held) && held.resident(), "ranked GGUF bundle was not resident");
+            resident.reset();
+            overflow.reset();
+            if (held) {
+                for (uint32_t bank = 0; bank < expected.front().bytes.size(); ++bank) {
+                    check(memcmp(held.data(bank), expected.front().bytes[bank].data(), expected.front().bytes[bank].size()) == 0,
+                        "GGUF lease did not retain bytes after store destruction");
+                }
+            }
+        }
+    }
 
     const auto make_component = [&](const std::filesystem::path & path, bool load_mtp) {
         common_joint_component_request component;
@@ -3618,7 +3763,7 @@ static int test_moe_joint_measurement(const size_t seed, const float stdev, cons
     GGML_UNUSED(fit_tool);
 #endif
 
-    for (const auto & path : { target_path, mtp_path, partial_path }) {
+    for (const auto & path : { target_path, mtp_path, partial_path, split_path_a, split_path_b }) {
         std::error_code error;
         std::filesystem::remove(path, error);
     }

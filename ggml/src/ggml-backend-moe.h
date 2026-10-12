@@ -71,6 +71,15 @@ typedef bool (*ggml_backend_moe_hybrid_cold_handler_t)(
         float * results, size_t result_stride);
 typedef void (*ggml_backend_moe_hybrid_set_cold_handler_t)(ggml_backend_moe_hybrid_cold_handler_t handler, void * user);
 
+// Strict mode: a refused or failed cold packet is not recomputed from the backend's own bank pointers.
+// The cumulative failure count covers strict refusals and device wait timeouts. Unplanned packets carry no
+// routes for the current token and are not failures.
+// Read it after the stream is synchronized; an increase means the last graph output is invalid.
+#define GGML_BACKEND_MOE_HYBRID_SET_COLD_STRICT_PROC_NAME "ggml_backend_moe_hybrid_set_cold_strict"
+#define GGML_BACKEND_MOE_HYBRID_COLD_FAILURES_PROC_NAME "ggml_backend_moe_hybrid_cold_failures"
+typedef void (*ggml_backend_moe_hybrid_set_cold_strict_t)(bool strict);
+typedef uint64_t (*ggml_backend_moe_hybrid_cold_failures_t)(void);
+
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC 0x4d4f4532u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION 2u
 

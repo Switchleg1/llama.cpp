@@ -3,6 +3,10 @@
 #include "test-moe-cache.h"
 
 int main(int argc, char ** argv) {
+    test_moe_expert_store();
+    if (argc == 2 && strcmp(argv[1], "--expert-store-only") == 0) {
+        return 0;
+    }
     test_moe_tensor_split_rejection();
     if (argc == 2 && strcmp(argv[1], "--tensor-policy-only") == 0) {
         return 0;

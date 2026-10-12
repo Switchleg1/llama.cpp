@@ -37,7 +37,11 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+    // Retain the open file identity, not its path. Direct I/O readers are not supported on POSIX.
+    std::unique_ptr<llama_file> clone_reader() const;
+    bool read_at(size_t offset, void * dst, size_t bytes) const;
 private:
+    llama_file(FILE * file, size_t known_size);
     struct impl;
     std::unique_ptr<impl> pimpl;
 };

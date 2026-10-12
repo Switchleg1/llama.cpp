@@ -1,4 +1,5 @@
 #include "llama-moe-hybrid-kernels.h"
+#include "llama-moe-expert-store.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -544,21 +545,18 @@ bool llama_moe_hybrid_q8_1_supported(const ggml_tensor * gate, const ggml_tensor
         down->ne[0] % ggml_blck_size(down->type) == 0 && gate->ne[0] % QK8_1 == 0 && down->ne[0] % QK8_1 == 0;
 }
 
-bool llama_moe_hybrid_q8_1_experts(
-        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
+// Expert e of each bank starts at base[bank][e]. Callers validate ids against their base tables.
+static void q8_1_experts_core(
+        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down, const char * const * bases[3],
         const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
         float * out, size_t out_stride, bool gelu) {
-    if (!llama_moe_hybrid_q8_1_supported(gate, up, down) || x_q8_1 == nullptr || out == nullptr ||
-            experts == nullptr || count == 0 || (size_t) down->ne[1] > out_stride) {
-        return false;
-    }
     int32_t max_row = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        if (experts[i] < 0 || experts[i] >= gate->ne[2] || (rows != nullptr && rows[i] < 0)) {
-            return false;
-        }
         max_row = std::max(max_row, rows != nullptr ? rows[i] : 0);
     }
+    const char * const * gate_base = bases[0];
+    const char * const * up_base   = bases[1];
+    const char * const * down_base = bases[2];
     const int64_t n_embd = gate->ne[0];
     const int64_t n_ff   = gate->ne[1];
     const int64_t n_out  = down->ne[1];
@@ -613,8 +611,8 @@ bool llama_moe_hybrid_q8_1_experts(
         for (int64_t job = begin; job < end; ++job) {
             const int64_t g = job / n_ff, row = job % n_ff;
             const int32_t expert = experts[order_p[begin_p[g]]];
-            const char * g_row = static_cast<const char *>(gate->data) + (size_t) expert * gate->nb[2] + (size_t) row * gate->nb[1];
-            const char * u_row = static_cast<const char *>(up->data)   + (size_t) expert * up->nb[2]   + (size_t) row * up->nb[1];
+            const char * g_row = gate_base[expert] + (size_t) row * gate->nb[1];
+            const char * u_row = up_base[expert]   + (size_t) row * up->nb[1];
             for (uint32_t k = begin_p[g]; k < begin_p[g + 1]; ++k) {
                 const uint32_t route = order_p[k];
                 const int32_t r = rows != nullptr ? rows[route] : 0;
@@ -641,7 +639,7 @@ bool llama_moe_hybrid_q8_1_experts(
         for (int64_t job = begin; job < end; ++job) {
             const int64_t g = job / n_out, row = job % n_out;
             const int32_t expert = experts[order_p[begin_p[g]]];
-            const char * d_row = static_cast<const char *>(down->data) + (size_t) expert * down->nb[2] + (size_t) row * down->nb[1];
+            const char * d_row = down_base[expert] + (size_t) row * down->nb[1];
             for (uint32_t k = begin_p[g]; k < begin_p[g + 1]; ++k) {
                 const uint32_t route = order_p[k];
                 out[(size_t) route * out_stride + row] = bank_dot(down->type, down_kind, d_row,
@@ -649,5 +647,109 @@ bool llama_moe_hybrid_q8_1_experts(
             }
         }
     });
+}
+
+bool llama_moe_hybrid_q8_1_experts(
+        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
+        const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
+        float * out, size_t out_stride, bool gelu) {
+    if (!llama_moe_hybrid_q8_1_supported(gate, up, down) || x_q8_1 == nullptr || out == nullptr ||
+            experts == nullptr || count == 0 || (size_t) down->ne[1] > out_stride) {
+        return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        if (experts[i] < 0 || experts[i] >= gate->ne[2] || (rows != nullptr && rows[i] < 0)) {
+            return false;
+        }
+    }
+    thread_local std::vector<const char *> table[3];
+    const ggml_tensor * banks[3] = {gate, up, down};
+    const char * const * bases[3];
+    for (int b = 0; b < 3; ++b) {
+        table[b].resize(banks[b]->ne[2]);
+        for (int64_t e = 0; e < banks[b]->ne[2]; ++e) {
+            table[b][e] = static_cast<const char *>(banks[b]->data) + (size_t) e * banks[b]->nb[2];
+        }
+        bases[b] = table[b].data();
+    }
+    q8_1_experts_core(gate, up, down, bases, experts, rows, count, x_q8_1, x_row_bytes, out, out_stride, gelu);
+    return true;
+}
+
+bool llama_moe_hybrid_q8_1_store_experts(
+        llama_moe_expert_store & store, uint32_t group,
+        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
+        const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
+        float * out, size_t out_stride, bool gelu) {
+    if (!llama_moe_hybrid_q8_1_supported(gate, up, down) || !experts || !x_q8_1 || !out || !count || count > 64 ||
+            gate->ne[0] <= 0 || gate->ne[1] <= 0 || down->ne[1] <= 0 || gate->ne[0] != up->ne[0] ||
+            gate->ne[1] != up->ne[1] || gate->ne[2] != up->ne[2] || gate->ne[2] != down->ne[2] ||
+            gate->ne[1] != down->ne[0] || uint64_t(down->ne[1]) > out_stride ||
+            out_stride > SIZE_MAX / sizeof(float) / count ||
+            uint64_t(gate->ne[0] / QK8_1) > x_row_bytes / sizeof(block_q8_1)) {
+        return false;
+    }
+    std::vector<int32_t> distinct(experts, experts + count);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (experts[i] < 0 || experts[i] >= gate->ne[2] ||
+                (rows && (rows[i] < 0 || rows[i] == INT32_MAX || uint64_t(rows[i]) >= SIZE_MAX / x_row_bytes))) {
+            return false;
+        }
+    }
+    std::sort(distinct.begin(), distinct.end());
+    distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+    const ggml_tensor * banks[3] = {gate, up, down};
+    const size_t n_out = size_t(down->ne[1]);
+    std::vector<float> output(size_t(count) * n_out), chunk_out(size_t(count) * n_out);
+    std::vector<llama_moe_expert_store::lease> leases;
+    std::vector<const char *> table[3];
+    std::vector<int32_t> local, local_rows;
+    std::vector<uint32_t> routes;
+    // As many bundles as staging allows are held at once; exhaustion flushes the chunk and retries.
+    for (size_t next = 0; next < distinct.size();) {
+        const size_t first = next;
+        leases.clear();
+        for (auto & t : table) {
+            t.clear();
+        }
+        while (next < distinct.size()) {
+            auto lease = store.acquire({group, uint32_t(distinct[next])});
+            if (!lease) {
+                if (next == first) {
+                    return false;
+                }
+                break;
+            }
+            for (int b = 0; b < 3; ++b) {
+                ggml_tensor view;
+                if (!lease.tensor_view(b, *banks[b], view)) {
+                    return false;
+                }
+                table[b].push_back(static_cast<const char *>(view.data));
+            }
+            leases.push_back(std::move(lease));
+            ++next;
+        }
+        local.clear();
+        local_rows.clear();
+        routes.clear();
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto it = std::lower_bound(distinct.begin() + first, distinct.begin() + next, experts[i]);
+            if (it != distinct.begin() + next && *it == experts[i]) {
+                local.push_back(int32_t(it - (distinct.begin() + first)));
+                local_rows.push_back(rows ? rows[i] : 0);
+                routes.push_back(i);
+            }
+        }
+        const char * const * bases[3] = {table[0].data(), table[1].data(), table[2].data()};
+        q8_1_experts_core(gate, up, down, bases, local.data(), local_rows.data(), uint32_t(local.size()),
+            x_q8_1, x_row_bytes, chunk_out.data(), n_out, gelu);
+        for (size_t k = 0; k < routes.size(); ++k) {
+            memcpy(output.data() + routes[k] * n_out, chunk_out.data() + k * n_out, n_out * sizeof(float));
+        }
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        memcpy(out + size_t(i) * out_stride, output.data() + size_t(i) * n_out, n_out * sizeof(float));
+    }
     return true;
 }

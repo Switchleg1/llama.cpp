@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-expert-store.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -364,9 +365,11 @@ private:
 
     // CPU half of the hybrid split, one helper per layer, on a pool the inference graph never uses.
     void moe_hybrid_register_cpu(llm_graph_result * res);
+public:
     static bool moe_hybrid_cold_handler(void * user, const ggml_tensor * down, const float * activation,
             const void * activation_q8_1, size_t q8_1_row_bytes, const int32_t * rows, const int32_t * experts,
             uint32_t count, float * results, size_t result_stride);
+private:
     struct moe_hybrid_q8_1_layer {
         const ggml_tensor * gate = nullptr;
         const ggml_tensor * up   = nullptr;
@@ -377,6 +380,12 @@ private:
     std::mutex moe_hybrid_cpu_mutex;
     std::unordered_map<const ggml_tensor *, std::unique_ptr<llm_graph_moe_hybrid_cpu>> moe_hybrid_cpu;
     std::vector<float> moe_hybrid_cpu_output;
+    // Opt-in bounded expert store for cold routes. Store errors fail the graph; no fallback to bank pointers.
+    std::unique_ptr<llama_moe_expert_store> moe_hybrid_store;
+    std::unordered_map<const ggml_tensor *, uint32_t> moe_hybrid_store_groups;
+    bool moe_hybrid_store_required = false;
+    uint64_t moe_hybrid_store_routes = 0;
+    ggml_backend_moe_hybrid_cold_failures_t moe_hybrid_cold_failures = nullptr;
     ggml_threadpool_t moe_hybrid_cpu_pool = nullptr;
     ggml_backend_moe_hybrid_set_cold_handler_t moe_hybrid_set_cold_handler = nullptr;
     ggml_status     graph_compute_certified(ggml_cgraph * gf, const ggml_graph_execution_certificate & certificate);

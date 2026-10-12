@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-moe-expert-store.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -784,6 +785,7 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+    bool has_tensor_override(const ggml_tensor * tensor) const;
     bool is_no_alloc() const;
     int32_t moe_expert_cache_slots() const;
     int32_t moe_expert_cache_slots(ggml_backend_dev_t dev) const;
@@ -795,6 +797,13 @@ struct llama_model {
     void build_moe_sources();
     void finalize_moe_expert_cache();
     const std::vector<llama_moe_source_group> & moe_sources() const;
+    void retain_moe_file_sources(const llama_model_loader & ml);
+    // Group ids follow moe_sources(); banks contain only routed base weights, in the same order.
+    std::unique_ptr<llama_moe_expert_store> create_moe_expert_store(
+        const std::vector<llama_moe_expert_store::expert> & gpu,
+        const std::vector<llama_moe_expert_store::expert> & rank,
+        size_t resident_budget, size_t staging_budget, uint32_t max_staged,
+        ggml_backend_buffer_type_t host_buft = nullptr) const;
     llama_moe_placement_report                   moe_placement() const;
     void record_tensor_override_resolution(
         std::string tensor_name, uint32_t origin, int32_t index, std::string pattern,

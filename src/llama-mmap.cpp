@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <limits>
+#include <mutex>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -35,6 +37,7 @@
         #define PATH_MAX MAX_PATH
     #endif
     #include <io.h>
+    #include <fcntl.h>
 #endif
 
 #if defined(__APPLE__)
@@ -385,6 +388,12 @@ struct llama_file::impl {
     std::string fname;
 #endif
 
+    impl(FILE * file, size_t known_size) : fp(file), size(known_size), owns_fp(false) {
+#ifdef _WIN32
+        fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
+#endif
+    }
+
     size_t read_alignment() const {
         return alignment;
     }
@@ -394,12 +403,15 @@ struct llama_file::impl {
     FILE * fp{};
     size_t size{};
     bool owns_fp = true;
+    std::mutex read_mutex;
 };
 
 llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io) :
     pimpl(std::make_unique<impl>(fname, mode, use_direct_io)) {}
 
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
+
+llama_file::llama_file(FILE * file, size_t known_size) : pimpl(std::make_unique<impl>(file, known_size)) {}
 
 llama_file::~llama_file() = default;
 
@@ -422,6 +434,89 @@ int llama_file::file_id() const {
     return ::fileno(pimpl->fp);
 #endif
 #endif
+}
+
+std::unique_ptr<llama_file> llama_file::clone_reader() const {
+#ifdef _WIN32
+    const HANDLE original = (HANDLE) _get_osfhandle(file_id());
+    const HANDLE handle = ReOpenFile(original, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    FILE_FLAG_RANDOM_ACCESS);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    const int fd = _open_osfhandle((intptr_t) handle, _O_RDONLY | _O_BINARY | _O_NOINHERIT);
+    if (fd == -1) {
+        CloseHandle(handle);
+        return nullptr;
+    }
+    FILE * fp = _fdopen(fd, "rb");
+    if (!fp) {
+        _close(fd);
+        return nullptr;
+    }
+#else
+    if (has_direct_io()) {
+        return nullptr;
+    }
+    const int fd = dup(file_id());
+    if (fd == -1) {
+        return nullptr;
+    }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+        close(fd);
+        return nullptr;
+    }
+    FILE * fp = fdopen(fd, "rb");
+    if (!fp) {
+        close(fd);
+        return nullptr;
+    }
+#endif
+    std::unique_ptr<FILE, int (*)(FILE *)> owned(fp, fclose);
+    auto result = std::unique_ptr<llama_file>(new llama_file(fp, size()));
+    result->pimpl->owns_fp = true;
+    owned.release();
+    return result;
+}
+
+bool llama_file::read_at(size_t offset, void * dst, size_t bytes) const {
+    if ((bytes && !dst) || offset > size() || bytes > size() - offset) {
+        return false;
+    }
+#ifndef _WIN32
+    if (has_direct_io()) {
+        return false;
+    }
+#endif
+    std::lock_guard<std::mutex> lock(pimpl->read_mutex);
+    auto * data = static_cast<char *>(dst);
+    while (bytes) {
+        const size_t chunk = std::min(bytes, size_t(INT32_MAX));
+#ifdef _WIN32
+        OVERLAPPED position = {};
+        position.Offset = DWORD(uint64_t(offset));
+        position.OffsetHigh = DWORD(uint64_t(offset) >> 32);
+        DWORD received = 0;
+        if (!ReadFile(pimpl->fp_win32, data, DWORD(chunk), &received, &position) || !received) {
+            return false;
+        }
+#else
+        if (uint64_t(offset) > uint64_t(std::numeric_limits<off_t>::max())) {
+            return false;
+        }
+        const ssize_t received = pread(file_id(), data, chunk, off_t(offset));
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received <= 0) {
+            return false;
+        }
+#endif
+        offset += size_t(received);
+        data += received;
+        bytes -= size_t(received);
+    }
+    return true;
 }
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }

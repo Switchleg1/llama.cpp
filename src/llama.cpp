@@ -370,22 +370,19 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 throw std::runtime_error("--moe-expert-cache-size requires a backend with MoE cache support");
             }
             ggml_backend_buffer_type_t buft = buffer_type_fn();
-            // Mapped expert weights are never auto-pinned, so a zero budget leaves every bank pageable and each cache
-            // fill is a synchronous staged copy (measured 59.8 ms against 16.3 ms per decode pass). Opt-in sizing to
-            // what can be locked now; not the default until the bounded path passes the selector and placement tests.
-            if (params.moe_expert_cache_host_pinned_size == 0 && !params.no_alloc &&
-                    getenv("LLAMA_MOE_AUTO_PIN") != nullptr) {
+            // Use the same opt-in budget for real loads and allocation-free probes.
+            if (params.moe_expert_cache_host_pinned_size == 0 && getenv("LLAMA_MOE_AUTO_PIN") != nullptr) {
                 ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                 size_t free_mem = 0, total_mem = 0;
                 if (cpu != nullptr) {
                     ggml_backend_dev_memory(cpu, &free_mem, &total_mem);
                 }
-                const size_t keep_free = std::max<size_t>(size_t(2) << 30, total_mem / 50);
-                const size_t budget = free_mem > keep_free ? free_mem - keep_free : 0;
+                const size_t keep_free = std::max<size_t>(size_t(2) << 30, total_mem / 5);
+                const size_t budget = total_mem > keep_free ? total_mem - keep_free : 0;
                 if (budget >= (size_t(4) << 30)) {
                     params.moe_expert_cache_host_pinned_size = budget;
-                    LLAMA_LOG_INFO("%s: MoE expert cache host-pinned budget = %.0f MiB (automatic, %.0f MiB available)\n",
-                        __func__, budget / 1048576.0, free_mem / 1048576.0);
+                    LLAMA_LOG_INFO("%s: MoE expert cache host-pinned budget = %.0f MiB (automatic, %.0f MiB total RAM)\n",
+                        __func__, budget / 1048576.0, total_mem / 1048576.0);
                 }
             }
             // Zero-sized placeholder buffers do not retain a bounded buffer type.
@@ -410,7 +407,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             static const char * MOE_AUX_PATTERN = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps\\.(?!weight)";
             ggml_backend_buffer_type_t aux_buft = nullptr;
 #if defined(_WIN32)
-            if (moe_buffer_type.type != nullptr) {
+            if (params.moe_expert_cache_host_pinned_size > 0) {
                 ggml_backend_dev_t cache_dev = ggml_backend_buft_get_device(buffer_type_fn());
                 aux_buft = cache_dev != nullptr ? ggml_backend_dev_buffer_type(cache_dev) : nullptr;
             }
@@ -578,6 +575,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
         model->record_resolved_load_strategy(
             ml.use_mmap, ml.resolved_direct_io_state(), uses_mlock, ml.lazy.any_resolved());
+        model->retain_moe_file_sources(ml);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
