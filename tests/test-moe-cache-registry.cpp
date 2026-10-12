@@ -6,6 +6,7 @@
 #include "../src/llama-moe-expert-store.h"
 #include "../src/llama-vocab.h"
 
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -2520,6 +2521,10 @@ void test_moe_expert_store() {
         CHECK(ggml_backend_cuda_moe_set_expert_sources(&bank, partial.data(), 4, 64));
         partial.fill(nullptr);
         CHECK(ggml_backend_cuda_moe_set_expert_sources(&bank, partial.data(), 4, 64));
+        CHECK(ggml_backend_cuda_moe_update_expert_source(&bank, 1, hosts[1]));
+        CHECK(ggml_backend_cuda_moe_update_expert_source(&bank, 1, nullptr));
+        CHECK(!ggml_backend_cuda_moe_update_expert_source(&bank, 4, hosts[1]));
+        CHECK(!ggml_backend_cuda_moe_update_expert_source(&bank, 1, bytes.data()));
         CHECK(ggml_backend_cuda_moe_set_expert_sources(&bank, nullptr, 0, 0));
         store_type empty_pinned;
         CHECK(empty_pinned.init(groups, gpu, {}, 0, 0, 0, read, &source, {}, ggml_backend_cuda_host_buffer_type()));
@@ -2632,6 +2637,55 @@ void test_moe_expert_store() {
     }
     CHECK(survivor && std::memcmp(survivor.data(0), bytes.data(), 64) == 0);
     survivor = {};
+    {
+        ggml_tensor banks[2] = {};
+        banks[0].ne[2] = 3;
+        banks[1].ne[2] = 2;
+        std::vector<llama_moe_source_group> source_groups(2);
+        for (int g = 0; g < 2; ++g) {
+            source_groups[g].banks.push_back({&banks[g], GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
+                GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE});
+        }
+        const std::string path = (std::filesystem::temp_directory_path() / "llama-moe-profile-test.txt").string();
+        const std::vector<std::vector<uint64_t>> counts = {{5, 0, 7}, {1, 9}};
+        CHECK(llama_moe_write_expert_profile(path.c_str(), counts));
+        CHECK(llama_moe_read_expert_profile(path.c_str(), source_groups) == counts);
+        banks[1].ne[2] = 4;
+        CHECK(llama_moe_read_expert_profile(path.c_str(), source_groups).empty());
+        source_groups.pop_back();
+        CHECK(llama_moe_read_expert_profile(path.c_str(), source_groups).empty());
+        CHECK(llama_moe_read_expert_profile(nullptr, source_groups).empty());
+        std::filesystem::remove(path);
+    }
+    {
+        store_type adaptive;
+        CHECK(adaptive.init(groups, {}, {{0, 0}, {1, 0}}, 192, 256, 2, read, &source));
+        CHECK(adaptive.resident_data({0, 0}, 0) && !adaptive.resident_data({0, 2}, 0));
+        for (int i = 0; i < 2; ++i) {
+            CHECK(adaptive.acquire({0, 2}) && adaptive.acquire({0, 3}));
+        }
+        CHECK(adaptive.acquire({0, 2}));
+        const auto hot = adaptive.file_hot(2);
+        CHECK(hot.size() == 2 && hot[0].first.id == 2 && hot[0].second == 3 && hot[1].first.id == 3);
+        CHECK(!adaptive.promote({0, 2}, {1, 0}));   // larger bundle than the outgoing position
+        {
+            auto held = adaptive.acquire({0, 0});
+            CHECK(!adaptive.promote({0, 2}, {0, 0}));
+        }
+        source.failure = 1;
+        CHECK(!adaptive.promote({0, 2}, {0, 0}));
+        source.failure = 0;
+        CHECK(std::memcmp(adaptive.resident_data({0, 0}, 0), bytes.data(), 64) == 0);
+        const void * position = adaptive.resident_data({0, 0}, 0);
+        CHECK(adaptive.promote({0, 2}, {0, 0}));
+        CHECK(adaptive.resident_data({0, 2}, 0) == position && !adaptive.resident_data({0, 0}, 0));
+        CHECK(std::memcmp(adaptive.resident_data({0, 2}, 1), bytes.data() + 2 * 128 + 64, 64) == 0);
+        auto moved_out = adaptive.acquire({0, 0});
+        CHECK(moved_out && !moved_out.resident() && std::memcmp(moved_out.data(1), bytes.data() + 64, 64) == 0);
+        CHECK(adaptive.acquire({0, 2}).resident());
+        CHECK(adaptive.file_hot(2).size() == 1 && adaptive.file_hot(2)[0].first.id == 3);
+        CHECK(!adaptive.promote({0, 2}, {0, 3}));   // incoming already resident
+    }
     std::weak_ptr<struct source> reader_lifetime;
     {
         auto owner = std::make_shared<struct source>();

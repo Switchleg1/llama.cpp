@@ -13,7 +13,7 @@ The rules come from measurements on this fork (see docs/moe-hybrid-strata-port-p
 Tuning tests policies and draft counts, then smaller caches below the loaded fit.
 The saved winner is specific to the benchmark prompt and current hardware.
 """
-import argparse, copy, ctypes, glob, itertools, json, os, re, shlex, socket, statistics, subprocess, sys, time, urllib.request
+import argparse, copy, ctypes, glob, itertools, json, os, re, shlex, signal, socket, statistics, subprocess, sys, time, urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -172,7 +172,10 @@ def bench(config, args, label='bench', prompts=None):
             return json.loads(response.read())
 
     with log_path.open('wb') as log:
-        proc = subprocess.Popen(config['command'], env=launch_env(config), stdout=log, stderr=subprocess.STDOUT)
+        # Own process group on Windows, so Ctrl+Break can stop the server gracefully (end-of-run logs, profiles).
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+        proc = subprocess.Popen(config['command'], env=launch_env(config), stdout=log, stderr=subprocess.STDOUT,
+                                creationflags=flags)
         try:
             deadline = time.monotonic() + args.startup_timeout
             while time.monotonic() < deadline:
@@ -215,9 +218,9 @@ def bench(config, args, label='bench', prompts=None):
                     'timings': workloads[0]['timings'], 'log': str(log_path), 'cache_slots': actual_slots}
         finally:
             if proc.poll() is None:
-                proc.terminate()
+                proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == 'nt' else signal.SIGINT)
             try:
-                proc.wait(timeout=60)
+                proc.wait(timeout=120)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()

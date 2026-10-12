@@ -6482,6 +6482,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         std::vector<uint32_t> bank_source_paths;
         std::vector<const char **> expert_source_tables;
         uint8_t * fillable = nullptr;   // per expert; null means every expert can be filled
+        // Per bank: device table and its host mirror, when owner sources are per-expert; empty otherwise.
+        std::vector<const char **> bank_tables;
+        std::vector<std::vector<const char *>> bank_table_hosts;
         std::array<float *, 3> auxiliary_data = {};
         std::array<size_t, 3> auxiliary_n_values = {};
         std::array<float *, 3> prefill_auxiliary_data = {};
@@ -8194,6 +8197,10 @@ struct ggml_cuda_moe_grouped_context::impl {
                     device_banks[i].source_stride = step;
                 } else {
                     device_banks[i].expert_sources = table;
+                    result->bank_tables.resize(snapshot.banks.size(), nullptr);
+                    result->bank_table_hosts.resize(snapshot.banks.size());
+                    result->bank_tables[i] = table;
+                    result->bank_table_hosts[i] = expert_sources;
                 }
                 device_banks[i].source_path = MOE_GROUPED_SOURCE_MAPPED;
                 alias_data = expert_sources[0];
@@ -10151,6 +10158,70 @@ bool ggml_cuda_moe_grouped_context::upload_expert(
     }
     return true;
 #endif
+}
+
+bool ggml_cuda_moe_grouped_context::update_expert_source(const ggml_tensor * tensor, uint32_t expert, const void * host) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    bool ok = true;
+    for (const auto & resource : impl_->resources) {
+        if (resource == nullptr || resource->device == nullptr) {
+            continue;
+        }
+        auto & device = *resource->device;
+        for (uint32_t i = 0; i < resource->snapshot.banks.size(); ++i) {
+            if (resource->snapshot.banks[i].tensor != tensor) {
+                continue;
+            }
+            if (device.fillable == nullptr || i >= device.bank_tables.size() || device.bank_tables[i] == nullptr ||
+                    expert >= device.n_experts) {
+                ok = false;
+                continue;
+            }
+            moe_grouped_device_scope device_scope(device.device);
+            void * alias = nullptr;
+            if (host != nullptr && cudaHostGetDevicePointer(&alias, const_cast<void *>(host), 0) != cudaSuccess) {
+                (void) cudaGetLastError();
+                ok = false;
+                continue;
+            }
+            device.bank_table_hosts[i][expert] = static_cast<const char *>(alias);
+            uint8_t fill = 1;
+            for (uint32_t b = 0; b < device.bank_tables.size(); ++b) {
+                fill &= device.bank_tables[b] != nullptr && device.bank_table_hosts[b][expert] != nullptr;
+            }
+            const char * entry = static_cast<const char *>(alias);
+            ok = ok && moe_grouped_cuda_success(cudaMemcpy(device.bank_tables[i] + expert, &entry, sizeof(entry), cudaMemcpyHostToDevice)) &&
+                moe_grouped_cuda_success(cudaMemcpy(device.fillable + expert, &fill, 1, cudaMemcpyHostToDevice));
+        }
+    }
+    return ok;
+}
+
+bool ggml_backend_cuda_moe_update_expert_source(const ggml_tensor * tensor, uint32_t expert, const void * host) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(moe_expert_source_mutex());
+        auto found = moe_expert_source_entries().find(tensor);
+        if (found == moe_expert_source_entries().end() || expert >= found->second.hosts.size()) {
+            return false;
+        }
+        cudaPointerAttributes attributes = {};
+        if (host != nullptr && (reinterpret_cast<uintptr_t>(host) % alignof(uint4) != 0 ||
+                cudaPointerGetAttributes(&attributes, host) != cudaSuccess || attributes.type != cudaMemoryTypeHost)) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        found->second.hosts[expert] = host;
+    }
+    auto & owners = moe_cache_owner_telemetry_state();
+    std::lock_guard<std::mutex> lock(owners.mutex);
+    bool ok = true;
+    for (auto * owner : owners.active) {
+        ok = owner->update_expert_source(tensor, expert, host) && ok;
+    }
+    return ok;
 }
 
 bool ggml_cuda_moe_grouped_context::read_expert_usage(const ggml_tensor * tensor, uint32_t * counts, uint32_t n) const {

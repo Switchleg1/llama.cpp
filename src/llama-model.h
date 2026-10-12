@@ -34,6 +34,11 @@ struct llama_moe_source_group {
     int32_t                            layer = -1;
 };
 
+// Expert usage profiles for residency ranking (LLAMA_MOE_EXPERT_PROFILE). Counts follow moe_sources() order.
+std::vector<std::vector<uint64_t>> llama_moe_read_expert_profile(const char * path,
+    const std::vector<llama_moe_source_group> & groups);
+bool llama_moe_write_expert_profile(const char * path, const std::vector<std::vector<uint64_t>> & counts);
+
 struct llama_moe_cache_memory {
     size_t fixed_device_bytes = 0;
     size_t per_slot_device_bytes = 0;
@@ -801,6 +806,9 @@ struct llama_model {
     // One store shared by every context of this model, built on first use. Fully resident banks become the GPU
     // fill sources of grouped resources created afterwards. Returns null when the store cannot be built.
     llama_moe_expert_store * moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft) const;
+    // Promotes a file-backed expert into a resident expert's RAM position and repoints the GPU fill sources.
+    // Call only while no grouped work or cold-expert computation of this model is in flight.
+    bool moe_expert_store_promote(llama_moe_expert_store::expert in, llama_moe_expert_store::expert out) const;
     // Group ids follow moe_sources(); banks contain only routed base weights, in the same order.
     std::unique_ptr<llama_moe_expert_store> create_moe_expert_store(
         const std::vector<llama_moe_expert_store::expert> & gpu,

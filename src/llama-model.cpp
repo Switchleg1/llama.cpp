@@ -28,6 +28,7 @@
 #include "ggml-cpp.h"
 #include "../ggml/src/ggml-backend-moe.h"
 
+#include <fstream>
 #include <mutex>
 
 #include <algorithm>
@@ -1235,6 +1236,7 @@ struct llama_model::impl {
     std::unique_ptr<llama_moe_expert_store> moe_store;
     std::vector<const ggml_tensor *> moe_store_registered;
     ggml_backend_moe_set_expert_sources_t moe_set_expert_sources = nullptr;
+    ggml_backend_moe_update_expert_source_t moe_update_expert_source = nullptr;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -3169,6 +3171,102 @@ void llama_model::retain_moe_file_sources(const llama_model_loader & ml) {
     pimpl->moe_file_sources = std::move(sources);
 }
 
+bool llama_model::moe_expert_store_promote(llama_moe_expert_store::expert in, llama_moe_expert_store::expert out) const {
+    std::lock_guard<std::mutex> lock(pimpl->moe_store_mutex);
+    auto * store = pimpl->moe_store.get();
+    if (!store || in.group >= pimpl->moe_sources.size() || out.group >= pimpl->moe_sources.size()) {
+        return false;
+    }
+    const auto banks = [&](uint32_t group) {
+        std::vector<const ggml_tensor *> result;
+        for (const auto & bank : pimpl->moe_sources[group].banks) {
+            if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor) {
+                result.push_back(bank.tensor);
+            }
+        }
+        return result;
+    };
+    const auto registered = [&](const ggml_tensor * tensor) {
+        return std::find(pimpl->moe_store_registered.begin(), pimpl->moe_store_registered.end(), tensor) !=
+            pimpl->moe_store_registered.end();
+    };
+    const auto out_banks = banks(out.group), in_banks = banks(in.group);
+    const bool gpu = pimpl->moe_update_expert_source != nullptr;
+    // Stop GPU fills from the outgoing position before its bytes change.
+    for (const auto * tensor : out_banks) {
+        if (gpu && registered(tensor) && !pimpl->moe_update_expert_source(tensor, out.id, nullptr)) {
+            return false;
+        }
+    }
+    if (!store->promote(in, out)) {
+        for (uint32_t b = 0; b < out_banks.size(); ++b) {
+            if (gpu && registered(out_banks[b])) {
+                pimpl->moe_update_expert_source(out_banks[b], out.id, store->resident_data(out, b));
+            }
+        }
+        return false;
+    }
+    bool ok = true;
+    for (uint32_t b = 0; b < in_banks.size(); ++b) {
+        if (gpu && registered(in_banks[b])) {
+            ok = pimpl->moe_update_expert_source(in_banks[b], in.id, store->resident_data(in, b)) && ok;
+        }
+    }
+    return ok;
+}
+
+static uint32_t llama_moe_source_experts(const llama_moe_source_group & group) {
+    for (const auto & bank : group.banks) {
+        if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor) {
+            return uint32_t(bank.tensor->ne[2]);
+        }
+    }
+    return 0;
+}
+
+// Text profile: a header, the group count, then one line per group with its expert count and counts.
+// Returns empty when the file is missing or its geometry does not match these groups.
+std::vector<std::vector<uint64_t>> llama_moe_read_expert_profile(const char * path,
+        const std::vector<llama_moe_source_group> & groups) {
+    std::vector<std::vector<uint64_t>> result;
+    std::ifstream in(path ? path : "");
+    std::string magic;
+    int version = 0;
+    size_t n_groups = 0;
+    std::string word;
+    if (!(in >> magic >> version >> word >> n_groups) || magic != "llama-moe-expert-profile" || version != 1 ||
+            word != "groups" || n_groups != groups.size()) {
+        return {};
+    }
+    result.resize(n_groups);
+    for (size_t g = 0; g < n_groups; ++g) {
+        uint32_t n = 0;
+        if (!(in >> n) || n != llama_moe_source_experts(groups[g])) {
+            return {};
+        }
+        result[g].resize(n);
+        for (auto & count : result[g]) {
+            if (!(in >> count)) {
+                return {};
+            }
+        }
+    }
+    return result;
+}
+
+bool llama_moe_write_expert_profile(const char * path, const std::vector<std::vector<uint64_t>> & counts) {
+    std::ofstream out(path);
+    out << "llama-moe-expert-profile 1\ngroups " << counts.size() << "\n";
+    for (const auto & group : counts) {
+        out << group.size();
+        for (auto count : group) {
+            out << ' ' << count;
+        }
+        out << "\n";
+    }
+    return bool(out);
+}
+
 llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft) const {
     std::lock_guard<std::mutex> lock(pimpl->moe_store_mutex);
     if (pimpl->moe_store_attempted) {
@@ -3208,6 +3306,14 @@ llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, g
             }
         }
     }
+    // A usage profile from earlier runs ranks the most used experts first, across layers; ties keep the even order.
+    const auto profile = llama_moe_read_expert_profile(getenv("LLAMA_MOE_EXPERT_PROFILE"), pimpl->moe_sources);
+    if (!profile.empty()) {
+        std::stable_sort(rank.begin(), rank.end(), [&](const auto & a, const auto & b) {
+            return profile[a.group][a.id] > profile[b.group][b.id];
+        });
+    }
+    LLAMA_LOG_INFO("%s: residency ranking: %s\n", __func__, profile.empty() ? "even across layers" : "usage profile");
     pimpl->moe_store = create_moe_expert_store({}, rank, resident_budget, 16 * bundle, 16, host_buft);
     if (!pimpl->moe_store) {
         return nullptr;
@@ -3216,6 +3322,10 @@ llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, g
     for (size_t i = 0; i < ggml_backend_reg_count() && !pimpl->moe_set_expert_sources; ++i) {
         pimpl->moe_set_expert_sources = (ggml_backend_moe_set_expert_sources_t) ggml_backend_reg_get_proc_address(
             ggml_backend_reg_get(i), GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME);
+    }
+    for (size_t i = 0; i < ggml_backend_reg_count() && !pimpl->moe_update_expert_source; ++i) {
+        pimpl->moe_update_expert_source = (ggml_backend_moe_update_expert_source_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_reg_get(i), GGML_BACKEND_MOE_UPDATE_EXPERT_SOURCE_PROC_NAME);
     }
     size_t registered_bytes = 0;
     if (pimpl->moe_set_expert_sources && store.pinned()) {

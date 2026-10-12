@@ -502,7 +502,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
         sigaction(SIGTERM, &sigint_action, NULL);
 #elif defined (_WIN32)
         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-            return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
+            // Ctrl+Break reaches a server started in its own process group, where Ctrl+C is disabled.
+            return (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT) ? (signal_handler(SIGINT), true) : false;
         };
         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif

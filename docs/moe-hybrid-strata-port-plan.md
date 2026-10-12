@@ -2062,6 +2062,55 @@ Artifacts: `build/store-partial-*.log`, `build/qwen-kld-hybrid-partial{8g,0}.log
 
 Still open: prefill and other non-decide calls fall back to the ordinary path, which reads the mmap'd tensors, so RAM is bounded only for decide-mode decode; mmap prefetch of expert ranges is unchanged; usage-ranked residency, complement exchanges with event-bound commits, and the prefill replacement remain.
 
+### Usage-ranked residency (expert profiles)
+
+Each grouped resource now keeps a non-decaying per-expert count of planned calls (every distinct expert of each plan, hot or cold); the existing frequency counter halves every 16 steps, so it is a recency signal, not a profile. `GGML_BACKEND_MOE_EXPERT_USAGE` reads the counts for the resource holding a bank. With `LLAMA_MOE_EXPERT_PROFILE=<file>` (diagnostic), a target-model context adds its counts to the file when it is destroyed, and the model's store ranks residency by the file's counts (most used first, across layers; ties keep the even round-robin order). The file is plain text, keyed only by group and expert counts; a geometry mismatch (for example the MTP sidecar) is ignored and that model keeps the even order. Counts restart when a grouped resource is recreated. Store `file_reads()` now reports bundles read from the file tier.
+
+To collect profiles through the server, the launcher now starts it in its own process group and stops it with Ctrl+Break, which the server now treats like Ctrl+C, so end-of-run logs and profiles are written. Previously it was terminated without shutdown.
+
+Results (IQ3_S, decide):
+
+| Workload | Store | Ranking | File reads | Result |
+| --- | --- | --- | --- | --- |
+| KLD harness | 24 GiB | even | 171,640 | 107 s, KLD 0.008291 |
+| KLD harness | 24 GiB | profile from the same text | 3,205 | 51 s, KLD 0.009473 +- 0.001888 |
+| server bench | 24 GiB | even | 109,767 | 10.77 tok/s |
+| server bench | 24 GiB | KLD-text profile | n/a | 11.30 tok/s |
+| server bench | 24 GiB | server-bench profile | 3,944 | 39.9 tok/s |
+| server bench | 12 GiB | server-bench profile | 32,632 | 30.98 tok/s |
+
+For comparison, the full store ran at about 50-55 tok/s at this configuration. The KLD-harness profile (README text, ub=1) barely helped the chat workload, while a profile from the same kind of workload removed almost all file reads; the speeds with a self-collected profile are therefore optimistic for other workloads. On the README text the top 25% of experts covered 88.9% of uses and the top 50% covered 99.0%.
+
+A unit check covers profile write/read and rejection of mismatched geometry and missing files.
+
+Artifacts: `build/store-profile-*.log`, `build/qwen-kld-hybrid-r24{even,prof}.log`, `build/bench-store{24s1,24s2,12s,24p}-bench.log`, `build/qwen-srv.profile`.
+
+Next: adaptive in-run promotion of file-backed experts into RAM (Strata exchanges), skip mmap prefetch for store-owned expert ranges, complement exchanges with event-bound commits, then the prefill replacement.
+
+### Adaptive promotion of file-backed experts
+
+Without a profile, the store now adapts during the run. Each store entry counts file-tier reads since it last moved. Every 16 graphs, after the store-mode synchronization (graph done, cold packets acknowledged, leases released), the context takes file-backed experts read at least twice, reads the grouped resources' usage counts, and promotes up to 256 of them, most read first. Each one replaces the least used resident expert, only if that resident's usage is less than half the incoming expert's (`2 * out + 2 <= in`). `llama_moe_expert_store::promote()` reads the incoming bundle into staging first, so a failed read leaves the outgoing bytes intact. It then copies the bundle into the outgoing RAM position and swaps ownership; held leases, an exchange in progress, or a larger incoming bundle refuse it. Before the copy, the model sets the outgoing expert's GPU source to null (unfillable); afterwards it points the incoming expert's source at the new position. `GGML_BACKEND_MOE_UPDATE_EXPERT_SOURCE` updates the registry and every existing grouped resource's device table and fillable mask synchronously. The GPU slot of an evicted expert keeps its copied weights until the planner replaces it. `LLAMA_MOE_EXPERT_STORE_ADAPT=0` disables adaptation.
+
+Results (IQ3_S, decide, 24 GiB store, even initial ranking):
+
+| Setting | File reads | Promotions | Result |
+| --- | --- | --- | --- |
+| KLD harness, no adaptation | 171,640 | 0 | 107 s |
+| KLD, 8 per 32 graphs, 4 reads | 151,021 | 192 | 108 s |
+| KLD, 64 per 16 graphs, 2 reads | 71,197 | 3,072 | 75 s |
+| KLD, 256 per 16 graphs, 2 reads | 47,054 | 5,949 | 69 s, KLD 0.006612 +- 0.001272 |
+| server bench, no adaptation | 109,767 | 0 | 10.77 tok/s |
+| server bench, adaptive | 51,929 | 3,584 | 27.89 tok/s |
+| server bench, full store, same session | n/a | n/a | 44.05 tok/s |
+
+Promotion caps were swept until the per-round cap stopped binding; the round interval and thresholds were not swept further. The KLD values across these runs stay within noise of each other.
+
+Unit checks cover hot-list order, refusal with a held lease or a larger incoming bundle, read failure leaving the outgoing bytes intact, position reuse, file-tier reads of the evicted expert, refusal of an already resident incoming expert, and the CUDA source update API (pinned pointer, null, out-of-range expert, pageable pointer).
+
+Artifacts: `build/store-adapt-*.log`, `build/qwen-kld-hybrid-r24adapt{,2,3}.log`, `build/bench-store24a-bench.log`.
+
+Next: skip mmap prefetch for store-owned expert ranges, complement exchanges with event-bound commits (exclude GPU-resident experts from RAM), then the prefill replacement.
+
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
 ### Stream-ordered insertion without an intermediate drain

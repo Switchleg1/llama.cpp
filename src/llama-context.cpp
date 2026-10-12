@@ -1169,6 +1169,51 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // Accumulate this run's expert usage into the residency profile of the target model.
+    static const char * profile_path = getenv("LLAMA_MOE_EXPERT_PROFILE");
+    if (profile_path != nullptr && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.hparams.no_alloc &&
+            !model.moe_sources().empty()) {
+        ggml_backend_moe_expert_usage_t usage = nullptr;
+        for (size_t i = 0; i < ggml_backend_reg_count() && usage == nullptr; ++i) {
+            usage = (ggml_backend_moe_expert_usage_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_reg_get(i), GGML_BACKEND_MOE_EXPERT_USAGE_PROC_NAME);
+        }
+        const auto & groups = model.moe_sources();
+        auto profile = llama_moe_read_expert_profile(profile_path, groups);
+        bool recorded = false;
+        if (profile.empty()) {
+            profile.resize(groups.size());
+        }
+        std::vector<uint32_t> counts;
+        for (size_t g = 0; usage != nullptr && g < groups.size(); ++g) {
+            const ggml_tensor * tensor = nullptr;
+            for (const auto & bank : groups[g].banks) {
+                if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor) {
+                    tensor = bank.tensor;
+                    break;
+                }
+            }
+            if (tensor == nullptr) {
+                continue;
+            }
+            const uint32_t n = uint32_t(tensor->ne[2]);
+            profile[g].resize(n, 0);
+            counts.assign(n, 0);
+            for (const auto & backend : backends) {
+                if (usage(backend.get(), tensor, counts.data(), n)) {
+                    for (uint32_t e = 0; e < n; ++e) {
+                        profile[g][e] += counts[e];
+                    }
+                    recorded = true;
+                    break;
+                }
+            }
+        }
+        if (recorded && !llama_moe_write_expert_profile(profile_path, profile)) {
+            LLAMA_LOG_WARN("%s: failed to write expert profile %s\n", __func__, profile_path);
+        }
+    }
+
     if (moe_hybrid_set_cold_handler != nullptr) {
         auto & registry = llama_moe_hybrid_owners();
         std::lock_guard<std::mutex> handler_lock(registry.handler_mutex);
@@ -1188,7 +1233,10 @@ llama_context::~llama_context() {
         }
     }
     if (moe_hybrid_store_required) {
-        LLAMA_LOG_WARN("moe-expert-store: cold routes=%llu\n", (unsigned long long) moe_hybrid_store_routes);
+        LLAMA_LOG_WARN("moe-expert-store: cold routes=%llu file reads=%llu promotions=%llu\n",
+            (unsigned long long) moe_hybrid_store_routes,
+            (unsigned long long) (moe_hybrid_store ? moe_hybrid_store->file_reads() : 0),
+            (unsigned long long) moe_hybrid_store_promotions);
     }
     moe_hybrid_cpu.clear();
     if (moe_hybrid_cpu_pool != nullptr) {
@@ -2176,6 +2224,81 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
         }
         moe_hybrid_set_cold_handler(llama_moe_hybrid_dispatch, nullptr);
     }
+}
+
+void llama_context::moe_hybrid_store_adapt() {
+    static const bool enabled = getenv("LLAMA_MOE_EXPERT_STORE_ADAPT") == nullptr ||
+        atoi(getenv("LLAMA_MOE_EXPERT_STORE_ADAPT")) != 0;
+    if (!enabled || moe_hybrid_store == nullptr) {
+        return;
+    }
+    const auto hot = moe_hybrid_store->file_hot(2);
+    if (hot.empty()) {
+        return;
+    }
+    ggml_backend_moe_expert_usage_t usage = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_count() && usage == nullptr; ++i) {
+        usage = (ggml_backend_moe_expert_usage_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_reg_get(i), GGML_BACKEND_MOE_EXPERT_USAGE_PROC_NAME);
+    }
+    if (usage == nullptr) {
+        return;
+    }
+    const auto & groups = model.moe_sources();
+    std::vector<std::vector<uint32_t>> counts(groups.size());
+    struct resident { llama_moe_expert_store::expert key; uint32_t uses; };
+    std::vector<resident> residents;
+    for (uint32_t g = 0; g < groups.size(); ++g) {
+        const ggml_tensor * tensor = nullptr;
+        for (const auto & bank : groups[g].banks) {
+            if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor) {
+                tensor = bank.tensor;
+                break;
+            }
+        }
+        if (tensor == nullptr) {
+            continue;
+        }
+        const uint32_t n = uint32_t(tensor->ne[2]);
+        counts[g].assign(n, 0);
+        bool read = false;
+        for (const auto & backend : backends) {
+            if (usage(backend.get(), tensor, counts[g].data(), n)) {
+                read = true;
+                break;
+            }
+        }
+        if (!read) {
+            counts[g].clear();
+            continue;
+        }
+        for (uint32_t e = 0; e < n; ++e) {
+            if (moe_hybrid_store->resident_data({g, e}, 0) != nullptr) {
+                residents.push_back({{g, e}, counts[g][e]});
+            }
+        }
+    }
+    std::sort(residents.begin(), residents.end(), [](const resident & a, const resident & b) { return a.uses < b.uses; });
+    // Bounded work per round; the outgoing expert must be clearly colder than the incoming one.
+    size_t victim = 0, promoted = 0;
+    for (const auto & entry : hot) {
+        const auto key = entry.first;
+        if (promoted == 256 || victim == residents.size()) {
+            break;
+        }
+        if (key.group >= counts.size() || key.id >= counts[key.group].size()) {
+            continue;
+        }
+        const uint32_t uses = counts[key.group][key.id];
+        if (residents[victim].uses * 2 + 2 > uses) {
+            continue;
+        }
+        if (model.moe_expert_store_promote(key, residents[victim].key)) {
+            ++promoted;
+        }
+        ++victim;
+    }
+    moe_hybrid_store_promotions += promoted;
 }
 
 // Reports whether real graphs expose hybrid spans. Diagnostic only, it does not change execution.
@@ -4742,6 +4865,8 @@ ggml_status llama_context::graph_compute(
             LLAMA_LOG_ERROR("%s: %llu cold expert packets failed; graph output is invalid\n", __func__,
                             (unsigned long long) failed);
             status = GGML_STATUS_FAILED;
+        } else if (++moe_hybrid_store_graphs % 16 == 0) {
+            moe_hybrid_store_adapt();
         }
     }
     if (status != GGML_STATUS_SUCCESS) {

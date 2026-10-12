@@ -384,6 +384,11 @@ private:
     llama_moe_expert_store * moe_hybrid_store = nullptr;   // owned by the model
     std::unordered_map<const ggml_tensor *, uint32_t> moe_hybrid_store_groups;
     bool moe_hybrid_store_required = false;
+    uint64_t moe_hybrid_store_graphs = 0;
+    uint64_t moe_hybrid_store_promotions = 0;
+    // Moves the most-read file-backed experts into RAM, evicting the least used residents. Store mode only,
+    // at a point where the graph and the cold worker are idle.
+    void moe_hybrid_store_adapt();
     uint64_t moe_hybrid_store_routes = 0;
     ggml_backend_moe_hybrid_cold_failures_t moe_hybrid_cold_failures = nullptr;
     ggml_threadpool_t moe_hybrid_cpu_pool = nullptr;

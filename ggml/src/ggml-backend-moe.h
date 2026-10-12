@@ -88,6 +88,11 @@ typedef uint64_t (*ggml_backend_moe_hybrid_cold_failures_t)(void);
 typedef bool (*ggml_backend_moe_expert_usage_t)(
         ggml_backend_t backend, const struct ggml_tensor * tensor, uint32_t * counts, uint32_t n);
 
+// Repoints one registered expert (null: stop filling it) in the registry and in existing grouped resources.
+// The caller guarantees no grouped work reading this bank is in flight.
+#define GGML_BACKEND_MOE_UPDATE_EXPERT_SOURCE_PROC_NAME "ggml_backend_moe_update_expert_source"
+typedef bool (*ggml_backend_moe_update_expert_source_t)(const struct ggml_tensor * tensor, uint32_t expert, const void * host);
+
 #define GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME "ggml_backend_moe_set_expert_sources"
 typedef bool (*ggml_backend_moe_set_expert_sources_t)(
         const struct ggml_tensor * tensor, const void * const * hosts, uint32_t n_experts, size_t stride);

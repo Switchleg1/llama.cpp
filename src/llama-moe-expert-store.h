@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 struct ggml_tensor;
@@ -74,10 +75,18 @@ public:
     // File-backed experts are copied into bounded staging. Exhaustion and read failures return an empty lease.
     lease acquire(expert key);
     exchange begin_exchange(expert in, expert out);
+    // File-backed experts read at least min_hits times since they last moved, most read first.
+    std::vector<std::pair<expert, uint32_t>> file_hot(uint32_t min_hits) const;
+    // Reads a file-backed expert into the RAM position of a resident one, which becomes file-backed.
+    // Fails without changes when either is in use or the incoming bundle is larger. Callers must stop GPU
+    // reads of the outgoing position first.
+    bool promote(expert in, expert out);
     size_t resident_bytes() const;
     size_t staging_bytes() const;
     // True when both buffers came from host_buft rather than the pageable CPU fallback.
     bool pinned() const;
+    // Bundles read from the file tier since init.
+    uint64_t file_reads() const;
     // Resident bank bytes without a lease, or null. Valid until the store is destroyed; callers must not use
     // this while exchanges can run, since commit moves bundles.
     const void * resident_data(expert key, uint32_t bank) const;

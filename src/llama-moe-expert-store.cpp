@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -42,6 +43,7 @@ struct llama_moe_expert_store::impl {
         expert key;
         size_t offset = SIZE_MAX;
         uint32_t readers = 0;
+        uint32_t file_hits = 0;   // file-tier reads since the expert last moved
         bool gpu = false;
         bool exchanging = false;
         bool ranked = false;
@@ -57,6 +59,7 @@ struct llama_moe_expert_store::impl {
     reader read;
     void * user;
     std::shared_ptr<void> reader_owner;
+    std::atomic<uint64_t> file_reads{0};
     std::mutex mutex;
 
     uint32_t index(expert key) const {
@@ -224,11 +227,15 @@ llama_moe_expert_store::lease llama_moe_expert_store::acquire(expert key) {
             if (staged == UINT32_MAX) {
                 return result;
             }
+            entry.file_hits += entry.file_hits < UINT32_MAX;
         }
         ++entry.readers;
         result.state = state;
         result.index = index;
         result.staged = staged;
+    }
+    if (result.staged != UINT32_MAX) {
+        result.state->file_reads.fetch_add(1, std::memory_order_relaxed);
     }
     if (result.staged != UINT32_MAX && !result.state->fetch(result.index,
             result.state->staging_data() + size_t(result.staged) * result.state->stride)) {
@@ -290,6 +297,63 @@ bool llama_moe_expert_store::lease::tensor_view(uint32_t bank, const ggml_tensor
     view.ne[2] = 1;
     view.nb[3] = view.nb[2];
     return true;
+}
+
+std::vector<std::pair<llama_moe_expert_store::expert, uint32_t>> llama_moe_expert_store::file_hot(uint32_t min_hits) const {
+    std::vector<std::pair<expert, uint32_t>> result;
+    if (!state) {
+        return result;
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    for (const auto & entry : state->entries) {
+        if (!entry.gpu && entry.offset == SIZE_MAX && entry.file_hits >= min_hits) {
+            result.push_back({entry.key, entry.file_hits});
+        }
+    }
+    std::stable_sort(result.begin(), result.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+    return result;
+}
+
+bool llama_moe_expert_store::promote(expert in, expert out) {
+    if (!state) {
+        return false;
+    }
+    uint32_t i = UINT32_MAX, o = UINT32_MAX, staged = UINT32_MAX;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        i = state->index(in);
+        o = state->index(out);
+        if (i == UINT32_MAX || o == UINT32_MAX || i == o) {
+            return false;
+        }
+        auto & incoming = state->entries[i];
+        auto & outgoing = state->entries[o];
+        if (incoming.gpu || incoming.offset != SIZE_MAX || incoming.readers || incoming.exchanging ||
+                outgoing.gpu || outgoing.offset == SIZE_MAX || outgoing.readers || outgoing.exchanging ||
+                state->layouts[in.group].bytes > state->layouts[out.group].bytes) {
+            return false;
+        }
+        staged = state->stage();
+        if (staged == UINT32_MAX) {
+            return false;
+        }
+        incoming.exchanging = outgoing.exchanging = true;
+    }
+    // Read into staging first: a failed read must not damage the outgoing resident bytes.
+    uint8_t * stage = state->staging_data() + size_t(staged) * state->stride;
+    const bool fetched = state->fetch(i, stage);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    auto & incoming = state->entries[i];
+    auto & outgoing = state->entries[o];
+    if (fetched) {
+        memcpy(state->resident_data() + outgoing.offset, stage, state->layouts[in.group].bytes);
+        incoming.offset = outgoing.offset;
+        outgoing.offset = SIZE_MAX;
+        incoming.file_hits = outgoing.file_hits = 0;
+    }
+    incoming.exchanging = outgoing.exchanging = false;
+    state->busy[staged] = false;
+    return fetched;
 }
 
 llama_moe_expert_store::exchange llama_moe_expert_store::begin_exchange(expert in, expert out) {
@@ -392,6 +456,10 @@ const void * llama_moe_expert_store::resident_data(expert key, uint32_t bank) co
         return nullptr;
     }
     return state->resident_data() + entry.offset + layout.offsets[bank];
+}
+
+uint64_t llama_moe_expert_store::file_reads() const {
+    return state ? state->file_reads.load(std::memory_order_relaxed) : 0;
 }
 
 bool llama_moe_expert_store::pinned() const {
