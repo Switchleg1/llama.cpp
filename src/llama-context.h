@@ -391,6 +391,10 @@ private:
     void moe_hybrid_store_adapt();
     uint64_t moe_hybrid_store_routes = 0;
     ggml_backend_moe_hybrid_cold_failures_t moe_hybrid_cold_failures = nullptr;
+    // Strata-style batched residency swaps between target graphs (LLAMA_MOE_HYBRID_ADAPT_EVERY).
+    void moe_adapt_residency();
+    ggml_backend_moe_adapt_residency_t moe_adapt_residency_fn = nullptr;
+    bool moe_adapt_resolved = false;
     ggml_threadpool_t moe_hybrid_cpu_pool = nullptr;
     ggml_backend_moe_hybrid_set_cold_handler_t moe_hybrid_set_cold_handler = nullptr;
     ggml_status     graph_compute_certified(ggml_cgraph * gf, const ggml_graph_execution_certificate & certificate);

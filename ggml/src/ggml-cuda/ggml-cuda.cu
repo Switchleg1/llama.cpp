@@ -8947,6 +8947,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_SET_COLD_STRICT_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_hybrid_set_cold_strict;
     }
+    if (strcmp(name, GGML_BACKEND_MOE_ADAPT_RESIDENCY_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_adapt_residency;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_SET_EXPERT_PRIOR_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_set_expert_prior;
+    }
     if (strcmp(name, GGML_BACKEND_MOE_UPDATE_EXPERT_SOURCE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_update_expert_source;
     }

@@ -122,7 +122,7 @@ def plan(args):
         env.update({'LLAMA_MOE_ADMIT_SHADOW': '1', 'LLAMA_MOE_ADMIT_DOORBELL': '1', 'LLAMA_MOE_HYBRID_CPU': '1',
                     'LLAMA_MOE_HYBRID_Q8_1': '1', 'LLAMA_MOE_HYBRID_DECIDE': '1',
                     'LLAMA_MOE_HYBRID_PROMOTE': '64', 'LLAMA_MOE_HYBRID_PROMOTE_MIN': '2',
-                    'LLAMA_MOE_HYBRID_CPU_THREADS': str(max(4, min(16, cores - int(threads))))})
+                    'LLAMA_MOE_HYBRID_CPU_THREADS': str(max(4, cores - 1))})
     report = {
         'gpu': gpu_name, 'vram_free_gib': round(vram_free / GiB, 1), 'ram_available_gib': round(ram_avail / GiB, 1),
         'cores': cores, 'arch': facts['arch'], 'layers': facts['n_layer'], 'experts': facts['n_expert'],

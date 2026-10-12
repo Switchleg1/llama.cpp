@@ -858,6 +858,10 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
+                    // Few output rows over a long row: mul_mat_f would launch only a handful of blocks.
+                    if (cc >= GGML_CUDA_CC_BLACKWELL && src0_ne[0] >= 8192 && src0_ne[1] <= 1024 && src0_ne[2]*src0_ne[3] == 1) {
+                        return ne11 <= 4;
+                    }
                     return src0_small && ne11 == 1;
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {

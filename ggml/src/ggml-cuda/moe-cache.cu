@@ -2741,6 +2741,17 @@ static std::unordered_map<const ggml_tensor *, moe_expert_source_entry> & moe_ex
     return entries;
 }
 
+// Usage priors (for example an expert profile) that seed adaptive residency scores, keyed by bank tensor.
+static std::mutex & moe_expert_prior_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<const ggml_tensor *, std::vector<float>> & moe_expert_priors() {
+    static std::unordered_map<const ggml_tensor *, std::vector<float>> priors;
+    return priors;
+}
+
 // Device aliases per expert; null marks an expert the owner does not hold. Call on the resource's device.
 static bool moe_expert_source_lookup(const ggml_tensor * tensor, uint32_t n_experts, size_t stride,
         std::vector<const char *> * device_sources) {
@@ -6633,6 +6644,16 @@ struct ggml_cuda_moe_grouped_context::impl {
     legacy_record_map legacy_records;
     graph_coverage_map graph_coverages;
     resource_slots resources;
+    // Strata-style residency: decayed usage per group, batched swaps between graphs (adapt_residency).
+    struct adapt_group {
+        uint64_t serial = 0;
+        std::vector<uint32_t> last_usage;
+        std::vector<float> score;
+    };
+    std::vector<adapt_group> adapt_groups;
+    uint64_t adapt_calls = 0;
+    uint64_t adapt_swaps_total = 0;
+    uint64_t adapt_steps = 0;
     std::vector<std::shared_ptr<grouped_resource>> prepack_resources;
     std::array<uint8_t, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> refreshing = {};
     std::array<group_authority_record, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> group_authorities = {};
@@ -10160,6 +10181,186 @@ bool ggml_cuda_moe_grouped_context::upload_expert(
     }
     return true;
 #endif
+}
+
+// Batched residency swaps between graphs, after Strata's adaptive exchanges: every `every` calls, read each
+// group's usage counts, decay the scores, and swap up to `swaps` of the highest-scoring non-resident experts into
+// the slots of the lowest-scoring residents with DMA copies on the stream. Only full, idle decide groups take
+// part; the device maps are updated in stream order, so the next plan sees the new residency.
+bool ggml_cuda_moe_grouped_context::adapt_residency(cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(stream);
+    return false;
+#else
+    static const uint32_t every = []() {
+        const char * value = getenv("LLAMA_MOE_HYBRID_ADAPT_EVERY");
+        return value != nullptr ? (uint32_t) std::max(0, atoi(value)) : 0u;
+    }();
+    static const uint32_t max_swaps = []() {
+        const char * value = getenv("LLAMA_MOE_HYBRID_ADAPT_SWAPS");
+        return value != nullptr ? (uint32_t) std::max(0, atoi(value)) : 96u;
+    }();
+    static const float decay = []() {
+        const char * value = getenv("LLAMA_MOE_HYBRID_ADAPT_DECAY");
+        return value != nullptr ? (float) atof(value) : 0.7f;
+    }();
+    if (every == 0 || stream == nullptr || ++impl_->adapt_calls % every != 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    struct candidate { float score; uint32_t group; int32_t expert; };
+    std::vector<candidate> incoming;
+    std::vector<std::vector<std::pair<float, int32_t>>> residents(impl_->resources.size());   // (score, slot)
+    std::vector<std::vector<int32_t>> expert_for_slot(impl_->resources.size());
+    if (impl_->adapt_groups.size() < impl_->resources.size()) {
+        impl_->adapt_groups.resize(impl_->resources.size());
+    }
+    if (!moe_grouped_cuda_success(cudaStreamSynchronize(stream))) {
+        return false;
+    }
+    std::vector<uint32_t> usage;
+    for (uint32_t g = 0; g < impl_->resources.size(); ++g) {
+        const auto & resource = impl_->resources[g];
+        if (resource == nullptr || resource->device == nullptr || resource->active_transaction_token != 0 ||
+                resource->snapshot.n_slot_auxiliaries != 0) {
+            continue;
+        }
+        auto & device = *resource->device;
+        if (device.expert_usage == nullptr || device.slot_for_expert == nullptr || device.expert_for_slot == nullptr ||
+                device.plan == nullptr || device.admit_publication_device == nullptr) {
+            continue;
+        }
+        moe_grouped_device_scope device_scope(device.device);
+        const uint32_t n = device.n_experts, n_slots = resource->snapshot.n_slots;
+        moe_grouped_decode_plan header = {};
+        usage.assign(n, 0);
+        expert_for_slot[g].assign(n_slots, -1);
+        if (!moe_grouped_cuda_success(cudaMemcpy(usage.data(), device.expert_usage, n * sizeof(uint32_t), cudaMemcpyDeviceToHost)) ||
+                !moe_grouped_cuda_success(cudaMemcpy(expert_for_slot[g].data(), device.expert_for_slot, n_slots * sizeof(int32_t), cudaMemcpyDeviceToHost)) ||
+                !moe_grouped_cuda_success(cudaMemcpy(&header, device.plan, sizeof(header), cudaMemcpyDeviceToHost))) {
+            continue;
+        }
+        auto & state = impl_->adapt_groups[g];
+        if (state.serial != device.serial || state.score.size() != n) {
+            state.serial = device.serial;
+            state.last_usage = usage;
+            state.score.assign(n, 0.0f);
+            std::lock_guard<std::mutex> prior_lock(moe_expert_prior_mutex());
+            const auto prior = moe_expert_priors().find(resource->snapshot.banks.empty() ? nullptr : resource->snapshot.banks[0].tensor);
+            if (prior != moe_expert_priors().end() && prior->second.size() == n) {
+                state.score = prior->second;
+            }
+            continue;
+        }
+        for (uint32_t e = 0; e < n; ++e) {
+            const uint32_t delta = usage[e] >= state.last_usage[e] ? usage[e] - state.last_usage[e] : usage[e];
+            state.score[e] = state.score[e] * decay + (float) delta;
+        }
+        state.last_usage = usage;
+        // A group still filling vacant slots, or with a plan whose fills are not yet committed, is left alone.
+        if (header.n_misses != 0 || std::find(expert_for_slot[g].begin(), expert_for_slot[g].end(), -1) != expert_for_slot[g].end()) {
+            expert_for_slot[g].clear();
+            continue;
+        }
+        std::vector<bool> resident(n, false);
+        for (uint32_t slot = 0; slot < n_slots; ++slot) {
+            const int32_t e = expert_for_slot[g][slot];
+            if (e >= 0 && (uint32_t) e < n) {
+                resident[e] = true;
+                residents[g].push_back({state.score[e], (int32_t) slot});
+            }
+        }
+        std::sort(residents[g].begin(), residents[g].end());
+        const bool tables = !device.bank_tables.empty();
+        for (uint32_t e = 0; e < n; ++e) {
+            if (resident[e] || state.score[e] <= 0.0f) {
+                continue;
+            }
+            bool fillable = true;
+            for (uint32_t b = 0; tables && b < device.bank_table_hosts.size(); ++b) {
+                fillable = fillable && device.bank_tables[b] != nullptr && device.bank_table_hosts[b][e] != nullptr;
+            }
+            if (fillable) {
+                incoming.push_back({state.score[e], g, (int32_t) e});
+            }
+        }
+    }
+    std::sort(incoming.begin(), incoming.end(), [](const candidate & a, const candidate & b) { return a.score > b.score; });
+    std::vector<size_t> next_victim(impl_->resources.size(), 0);
+    uint32_t swaps = 0;
+    std::vector<int32_t> map_values;   // kept alive until the stream reaches the small map copies
+    map_values.reserve(3 * std::min<size_t>(incoming.size(), max_swaps));
+    for (const auto & c : incoming) {
+        if (swaps >= max_swaps) {
+            break;
+        }
+        auto & victims = residents[c.group];
+        size_t & v = next_victim[c.group];
+        // Swap only when the incoming expert is clearly more used than the coldest remaining resident.
+        if (v >= victims.size() || c.score <= victims[v].first * 1.25f + 1.0f) {
+            continue;
+        }
+        const int32_t slot = victims[v].second;
+        const int32_t out = expert_for_slot[c.group][slot];
+        ++v;
+        const auto & resource = impl_->resources[c.group];
+        auto & device = *resource->device;
+        moe_grouped_device_scope device_scope(device.device);
+        bool ok = true;
+        for (uint32_t b = 0; ok && b < resource->snapshot.banks.size(); ++b) {
+            const auto & bank = resource->snapshot.banks[b];
+            const char * src = !device.bank_tables.empty() && b < device.bank_table_hosts.size() && device.bank_tables[b] != nullptr ?
+                device.bank_table_hosts[b][c.expert] :
+                static_cast<const char *>(bank.source_data) + (size_t) c.expert * bank.expert_stride;
+            char * dst = static_cast<char *>(device.bank_data[b]) + (size_t) slot * bank.expert_stride;
+            ok = src != nullptr && moe_grouped_cuda_success(cudaMemcpyAsync(dst, src, bank.expert_stride, cudaMemcpyDefault, stream));
+        }
+        if (!ok) {
+            break;
+        }
+        map_values.push_back(c.expert);
+        map_values.push_back(slot);
+        map_values.push_back(-1);
+        const int32_t * values = map_values.data() + map_values.size() - 3;
+        if (!moe_grouped_cuda_success(cudaMemcpyAsync(device.expert_for_slot + slot, values, sizeof(int32_t), cudaMemcpyHostToDevice, stream)) ||
+                !moe_grouped_cuda_success(cudaMemcpyAsync(device.slot_for_expert + c.expert, values + 1, sizeof(int32_t), cudaMemcpyHostToDevice, stream)) ||
+                (out >= 0 && !moe_grouped_cuda_success(cudaMemcpyAsync(device.slot_for_expert + out, values + 2, sizeof(int32_t), cudaMemcpyHostToDevice, stream)))) {
+            break;
+        }
+        ++swaps;
+    }
+    // The map values live on this stack frame: finish the copies before returning.
+    if (swaps != 0 && !moe_grouped_cuda_success(cudaStreamSynchronize(stream))) {
+        return false;
+    }
+    impl_->adapt_swaps_total += swaps;
+    ++impl_->adapt_steps;
+    static const bool trace = getenv("LLAMA_MOE_HYBRID_ADAPT_TRACE") != nullptr;
+    if (trace && impl_->adapt_steps % 16 == 0) {
+        GGML_LOG_INFO("moe-adapt: steps=%llu swaps=%llu last=%u candidates=%zu\n",
+            (unsigned long long) impl_->adapt_steps, (unsigned long long) impl_->adapt_swaps_total, swaps, incoming.size());
+    }
+    return swaps != 0;
+#endif
+}
+
+void ggml_backend_cuda_moe_set_expert_prior(const ggml_tensor * tensor, const float * scores, uint32_t n) {
+    std::lock_guard<std::mutex> lock(moe_expert_prior_mutex());
+    if (tensor == nullptr) {
+        return;
+    }
+    if (scores == nullptr) {
+        moe_expert_priors().erase(tensor);
+        return;
+    }
+    moe_expert_priors()[tensor].assign(scores, scores + n);
+}
+
+void ggml_backend_cuda_moe_adapt_residency(ggml_backend_t backend) {
+    auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
+    if (context != nullptr) {
+        context->adapt_residency(static_cast<ggml_backend_cuda_context *>(backend->context)->stream());
+    }
 }
 
 bool ggml_cuda_moe_grouped_context::update_expert_source(const ggml_tensor * tensor, uint32_t expert, const void * host) {

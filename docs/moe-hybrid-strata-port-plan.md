@@ -2175,6 +2175,41 @@ Conclusions for the port, in order of measured cost:
 
 Artifacts: `build/nsys-strata.nsys-rep`, `build/nsys-llama.nsys-rep`, `build/nsys-llama-mmvf4.nsys-rep` (with `.sqlite` exports), `build/nsys-{strata,llama}-analysis.json`, `build/nsys-{strata,llama,llama-mmvf4}-decode.json`, `build/{strata,llama}-prof-*.json`, `build/profile-{strata,llama}-driver.py`, `build/analyze-nsys.py`, `build/analyze-nsys-decode.py`.
 
+### Follow-up on the comparison: residency, dense path, draft head, CPU path
+
+All speed figures below come from `build/profile-llama-driver.py` (four 512-token requests, mean of the last three), alternating configurations; `build/ab.sh` runs them.
+
+**1. Strata-style residency (implemented, opt-in, not faster here).** With `LLAMA_MOE_HYBRID_ADAPT_EVERY=N` the target context calls `GGML_BACKEND_MOE_ADAPT_RESIDENCY` before each graph. Every N calls the CUDA grouped context synchronizes the stream and reads each decide group's usage counts. It decays per-expert scores (`LLAMA_MOE_HYBRID_ADAPT_DECAY`, default 0.7), then swaps up to `LLAMA_MOE_HYBRID_ADAPT_SWAPS` (default 96) of the highest-scoring non-resident, fillable experts into the slots of the lowest-scoring residents. Each swap needs the incoming score above 1.25x the victim's plus 1. Copies are DMA `cudaMemcpyAsync` from the pinned source (store table or registered mapping) into the slot, followed by stream-ordered updates of `expert_for_slot`/`slot_for_expert`. Groups still filling vacant slots, with uncommitted plan misses, with slot auxiliaries, or inside a transaction are skipped, so the planner's own state stays consistent. `LLAMA_MOE_EXPERT_PROFILE` seeds the scores through `GGML_BACKEND_MOE_SET_EXPERT_PRIOR`. KLD with swaps only (ub=1, 32 slots): 0.010404 +- 0.002397, within noise of 0.008835.
+
+Measured in the server (tuned configuration, `--experimental-logs` hit counters):
+
+| Configuration | Hit rate | Decode tok/s |
+| --- | --- | --- |
+| on-demand promotions (budget 64, threshold 2), 16 CPU threads | 83-85% (promoted counted as hot) | 61.45, 61.06 |
+| swaps only, every 4 calls, 96 swaps, 16 threads | 71-76% (Strata: 67-76%) | 47.62, 48.04 |
+| swaps plus on-demand promotions, 16 threads | n/a | 58.56 |
+| swaps only, 23 CPU threads | n/a | 53.99 |
+| on-demand promotions, 23 CPU threads | n/a | 64.97 |
+| swaps plus promotions, 23 CPU threads | n/a | 62.33 |
+
+Swaps reproduce Strata's hit rate but are slower here. The roughly 30% of misses then cost CPU time that our CPU path and a GPU busy over 80% cannot absorb, while Strata's GPU has slack. A synchronous fill and GPU compute still beats a CPU expert on this machine. Swaps stay opt-in, off by default.
+
+Correction to the threshold sweep above: `LLAMA_MOE_HYBRID_PROMOTE_MIN` is clamped to at least 1, so "threshold 0" and "threshold 1" were the same setting. The threshold-2 result stands.
+
+**2. Dense path.** The hyper-connection projections (`hc_*_down` 320x10240, `hc_*_inject` 4x10240, BF16) ran in `mul_mat_f` with 10 or 4 blocks (cuBLAS for the injects) when three verification rows were present. Per shape, `mul_mat_vec_f` is faster for these long-row, few-output-row matrices (15.1 against 24.2 us; 6.2 against 14.0 us) and slower for the 10240x320 up projections (29.2 against 10.7 us). `ggml_cuda_should_use_mmvf` now picks `mul_mat_vec_f` for BF16 with up to 4 columns on Blackwell when the row length is at least 8192 and there are at most 1024 output rows. BF16 matmul time per request went from 1,208 to 1,119 ms (12.2 to 10.5 us per call). The generated text changed slightly (draft acceptance 274/265/268/270 instead of 273/280/283/292), so end-to-end comparisons straddling this change are not like for like. KLD at ub=4: 0.008721 +- 0.001874 (97.619%). CUDA `MUL_MAT` backend-op tests: 1,297/1,297 passed, 151/151 for BF16. Forcing `mul_mat_vec_f` for every BF16 shape with up to 4 columns was rejected earlier. Kernel count (about 1,900 per token against Strata's 410) and the small elementwise kernels around the hyper-connections remain; that is fusion work in the model graph and ggml.
+
+A replacement plain gather kernel (one block row per miss, contiguous chunks, four loads in flight per thread) produced byte-identical results (KLD 0.009220 with either kernel) but was slower: 61.39/61.48 against 63.32/63.32 tok/s. It was reverted.
+
+**3. Draft head.** Strata's MTP folder has `draft_vocab.bin`, a list of 106,299 token ids (about 43% of 248,320). Its draft logits cover only that subset, while our draft steps run the full Q6_K head (620 us per step, about 0.27 s per request). A subset head would save roughly 0.15 s per request (about 1.6%). It needs a reduced output tensor in the MTP graph plus index mapping in the draft sampler and output buffers. Not implemented.
+
+**4. CPU expert path.** CPU pool threads: 16 gave 60.11/60.55 tok/s, 20 gave 62.63, 23 gave 63.38/63.39/63.35, 24 gave 63.41, and 23 with 4 main threads gave 63.33. The launcher now uses `cores - 1` CPU expert threads (23 here), and `build/moe-tuned-confirm-auto.json` is updated. Earlier 128-token runs showed no difference between 16 and 23 threads; these longer runs do. Experts per cold call are about 1.14 routes each, so batching rows inside the IQ dot kernels would gain little.
+
+Current best measured on this machine (tuned configuration, 23 CPU threads, threshold 2, BF16 dispatch): about 63.4 tok/s on the 512-token driver workload, against Strata's 63.5-74.5 on the same workload in the same session.
+
+Artifacts: `build/ab-*.json`/`.server.log`, `build/nsys-llama-bf16.nsys-rep`, `build/qwen-kld-hybrid-{adapt,ub4-bf16,fastgather0,fastgather1}.log`, `build/bf16-mmvf-ops.log`, `build/all-final-*.log`, `build/patch_adapt_residency.py`, `build/patch_adapt_llama.py`.
+
+Next: kernel fusion around the hyper-connections, a draft-vocabulary subset head, planner kernel cost (25 us per call), and the remaining CPU-expert throughput before swaps-only residency can pay off.
+
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
 ### Stream-ordered insertion without an intermediate drain

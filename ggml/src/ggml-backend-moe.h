@@ -93,6 +93,13 @@ typedef bool (*ggml_backend_moe_expert_usage_t)(
 #define GGML_BACKEND_MOE_UPDATE_EXPERT_SOURCE_PROC_NAME "ggml_backend_moe_update_expert_source"
 typedef bool (*ggml_backend_moe_update_expert_source_t)(const struct ggml_tensor * tensor, uint32_t expert, const void * host);
 
+// Strata-style adaptive residency: call between graphs on the backend's thread; every N calls it swaps the most
+// used non-resident experts into the slots of the least used residents. Seeds come from per-bank priors.
+#define GGML_BACKEND_MOE_ADAPT_RESIDENCY_PROC_NAME "ggml_backend_moe_adapt_residency"
+#define GGML_BACKEND_MOE_SET_EXPERT_PRIOR_PROC_NAME "ggml_backend_moe_set_expert_prior"
+typedef void (*ggml_backend_moe_adapt_residency_t)(ggml_backend_t backend);
+typedef void (*ggml_backend_moe_set_expert_prior_t)(const struct ggml_tensor * tensor, const float * scores, uint32_t n);
+
 #define GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME "ggml_backend_moe_set_expert_sources"
 typedef bool (*ggml_backend_moe_set_expert_sources_t)(
         const struct ggml_tensor * tensor, const void * const * hosts, uint32_t n_experts, size_t stride);

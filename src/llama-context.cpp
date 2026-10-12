@@ -2301,6 +2301,61 @@ void llama_context::moe_hybrid_store_adapt() {
     moe_hybrid_store_promotions += promoted;
 }
 
+void llama_context::moe_adapt_residency() {
+    static const bool enabled = getenv("LLAMA_MOE_HYBRID_ADAPT_EVERY") != nullptr &&
+        atoi(getenv("LLAMA_MOE_HYBRID_ADAPT_EVERY")) > 0;
+    if (!enabled || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model.hparams.no_alloc) {
+        return;
+    }
+    if (!moe_adapt_resolved) {
+        moe_adapt_resolved = true;
+        ggml_backend_moe_set_expert_prior_t set_prior = nullptr;
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            auto * reg = ggml_backend_reg_get(i);
+            if (moe_adapt_residency_fn == nullptr) {
+                moe_adapt_residency_fn = (ggml_backend_moe_adapt_residency_t) ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_MOE_ADAPT_RESIDENCY_PROC_NAME);
+            }
+            if (set_prior == nullptr) {
+                set_prior = (ggml_backend_moe_set_expert_prior_t) ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_MOE_SET_EXPERT_PRIOR_PROC_NAME);
+            }
+        }
+        // An expert profile seeds the scores, so the first swaps already move toward the profiled hot set.
+        const auto & groups = model.moe_sources();
+        const auto profile = llama_moe_read_expert_profile(getenv("LLAMA_MOE_EXPERT_PROFILE"), groups);
+        size_t seeded = 0;
+        for (size_t g = 0; set_prior != nullptr && g < profile.size(); ++g) {
+            uint64_t max_count = 0;
+            for (auto count : profile[g]) {
+                max_count = std::max(max_count, count);
+            }
+            if (max_count == 0) {
+                continue;
+            }
+            std::vector<float> scores(profile[g].size());
+            for (size_t e = 0; e < scores.size(); ++e) {
+                scores[e] = 8.0f * float(profile[g][e]) / float(max_count);
+            }
+            for (const auto & bank : groups[g].banks) {
+                if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor) {
+                    set_prior(bank.tensor, scores.data(), uint32_t(scores.size()));
+                    ++seeded;
+                    break;
+                }
+            }
+        }
+        LLAMA_LOG_INFO("%s: adaptive residency %s, %zu groups seeded from a profile\n", __func__,
+            moe_adapt_residency_fn != nullptr ? "on" : "unavailable", seeded);
+    }
+    if (moe_adapt_residency_fn == nullptr) {
+        return;
+    }
+    for (const auto & backend : backends) {
+        moe_adapt_residency_fn(backend.get());
+    }
+}
+
 // Reports whether real graphs expose hybrid spans. Diagnostic only, it does not change execution.
 void llama_context::moe_hybrid_probe_spans(llm_graph_result * res, ggml_cgraph * gf) {
     static const bool probe = getenv("LLAMA_MOE_HYBRID_PROBE") != nullptr;
@@ -4780,6 +4835,7 @@ ggml_status llama_context::graph_compute(
     }
 
     // Store mode trades overlap with the next host step for a checked cold-route result.
+    moe_adapt_residency();
     const bool check_cold = moe_hybrid_store_required && moe_hybrid_cold_failures != nullptr;
     const uint64_t cold_failures = check_cold ? moe_hybrid_cold_failures() : 0;
     ggml_status status;
