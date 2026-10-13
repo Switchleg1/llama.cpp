@@ -344,6 +344,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (byte_budget_mode && params.moe_expert_cache_slots > 0) {
             throw std::runtime_error("MoE cache byte budgets conflict with a nonzero slot count");
         }
+        // Pinned expert sources are the default; pageable sources only on request.
+        const bool host_pinned_off = params.moe_expert_cache_host_pinned_size == LLAMA_MOE_HOST_PINNED_OFF;
+        if (host_pinned_off) {
+            params.moe_expert_cache_host_pinned_size = 0;
+        }
         if (params.moe_expert_cache_host_pinned_size > 0 && !cache_enabled) {
             throw std::runtime_error("--moe-expert-cache-host-pinned-mb requires an enabled MoE expert cache");
         }
@@ -370,8 +375,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 throw std::runtime_error("--moe-expert-cache-size requires a backend with MoE cache support");
             }
             ggml_backend_buffer_type_t buft = buffer_type_fn();
-            // Use the same opt-in budget for real loads and allocation-free probes.
-            if (params.moe_expert_cache_host_pinned_size == 0 && getenv("LLAMA_MOE_AUTO_PIN") != nullptr) {
+            // Automatic budget, the same for real loads and allocation-free probes. A RAM expert store pins its own
+            // copies, so the mapped sources stay pageable then.
+            if (params.moe_expert_cache_host_pinned_size == 0 && !host_pinned_off && !params.moe_expert_store) {
                 ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                 size_t free_mem = 0, total_mem = 0;
                 if (cpu != nullptr) {

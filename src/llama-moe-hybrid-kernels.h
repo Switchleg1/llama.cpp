@@ -18,7 +18,7 @@ bool llama_moe_hybrid_q8_1_supported(const ggml_tensor * gate, const ggml_tensor
 bool llama_moe_hybrid_q8_1_experts(
         const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
         const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
-        float * out, size_t out_stride, bool gelu);
+        float * out, size_t out_stride, bool gelu, const float * x_f32 = nullptr, size_t x_f32_stride = 0);
 
 // Same arithmetic for up to 64 routes, with bounded store leases. Holds as many bundles as staging allows, then flushes and retries.
 // A false result leaves output unchanged. Fail the batch; do not fall back to original bank pointers.
@@ -26,7 +26,7 @@ bool llama_moe_hybrid_q8_1_store_experts(
         llama_moe_expert_store & store, uint32_t group,
         const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
         const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
-        float * out, size_t out_stride, bool gelu);
+        float * out, size_t out_stride, bool gelu, const float * x_f32 = nullptr, size_t x_f32_stride = 0);
 
 // Threads of the CPU expert pool. Takes effect only before the first expert computation.
 void llama_moe_hybrid_set_threads(int n_threads);

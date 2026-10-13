@@ -291,6 +291,49 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-host-pinned-mb", "0"};
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.moe_expert_cache_host_pinned_size == 0);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-host-pinned-mb", "off"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_expert_cache_host_pinned_size == LLAMA_MOE_HOST_PINNED_OFF);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-host-pinned-mb", "auto"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_expert_cache_host_pinned_size == 0);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-split", "auto", "--moe-expert-split-threads", "6",
+            "--moe-expert-promote", "16:3", "--moe-expert-store-mb", "auto", "--moe-expert-store-adapt", "off",
+            "--moe-expert-profile", "p.txt", "--moe-expert-store-gpu-cache", "12"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    {
+        const auto cparams = common_context_params_to_llama(params);
+        assert(cparams.moe_expert_store_gpu_cache == 12);
+        assert(cparams.moe_expert_split == LLAMA_MOE_EXPERT_SPLIT_AUTO && cparams.moe_expert_split_threads == 6);
+        assert(cparams.moe_expert_promote_budget == 16 && cparams.moe_expert_promote_misses == 3);
+        assert(cparams.moe_expert_store_mib == LLAMA_MOE_EXPERT_STORE_AUTO && !cparams.moe_expert_store_adapt);
+        assert(std::string(cparams.moe_expert_profile) == "p.txt");
+        assert(common_model_params_to_llama(params).moe_expert_store);
+    }
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-store-mb", "1024"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_expert_store_mib == 1024);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-split", "maybe"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-store-gpu-cache", "-1"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(common_context_params_to_llama(params).moe_expert_split == LLAMA_MOE_EXPERT_SPLIT_OFF);
+    assert(common_context_params_to_llama(params).moe_expert_store_gpu_cache == LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-store-gpu-cache", "0"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_expert_store_gpu_cache == 0);
+    assert(!common_model_params_to_llama(params).moe_expert_store);
 
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--moe-early-router"};

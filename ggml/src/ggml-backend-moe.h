@@ -125,6 +125,16 @@ typedef void (*ggml_backend_moe_set_expert_prior_t)(const struct ggml_tensor * t
 typedef bool (*ggml_backend_moe_set_expert_sources_t)(
         const struct ggml_tensor * tensor, const void * const * hosts, uint32_t n_experts, size_t stride);
 
+// Exchange residency for a bank registered above: RAM need not hold the experts that GPU slots hold. locations
+// (pinned host memory, one value per expert) is -1 for a file-backed expert, -2 - slot for an expert that only GPU
+// slot `slot` holds, or else a byte offset into resident_base in the low 40 bits, with slot + 1 above them when a
+// GPU slot also holds the expert. Resources seed the slots from the tensor data. A fill that evicts an expert
+// without a RAM copy swaps its bytes into the incoming expert's RAM position; either way locations are updated in
+// place. bank_offset is this bank's offset inside an expert bundle. Register after the sources; null unregisters.
+#define GGML_BACKEND_MOE_SET_EXPERT_EXCHANGE_PROC_NAME "ggml_backend_moe_set_expert_exchange"
+typedef bool (*ggml_backend_moe_set_expert_exchange_t)(
+        const struct ggml_tensor * tensor, int64_t * locations, const void * resident_base, size_t bank_offset);
+
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC 0x4d4f4532u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION 2u
 

@@ -1,3 +1,4 @@
+#include "../../ggml/src/ggml-backend-moe.h"
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -962,6 +963,55 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    // Small batches attend over the selected cells only: gather their K/V rows and mask entries instead of
+    // reading every cell under a mask. The softmax covers the same cells; only the summation order differs.
+    {
+        ggml_tensor * k4 = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v4 = mctx_cur->get_v(ctx0, il);
+        const int64_t n_tokens  = q_cur->ne[2];
+        const int64_t width     = top_k->ne[0];
+        const int64_t n_kv      = k4->ne[2];
+        const int64_t d         = q_cur->ne[0];
+        const int64_t n_head    = q_cur->ne[1];
+        const int64_t n_head_kv = k4->ne[1];
+        static const bool dense = ggml_moe_debug_getenv("LLAMA_QSA_DENSE") != nullptr;
+        const bool sparse = !dense && n_tokens <= 8 && top_k->ne[1] == n_tokens && top_k->ne[2] == 1 &&
+            top_k->ne[3] == 1 && k4->ne[3] == 1 && width < n_kv && ggml_is_contiguous(top_k) &&
+            k4->ne[0] == d && v4->ne[0] == hparams.n_embd_head_v(il) && v4->nb[1] < v4->nb[2] &&
+            kq_mask->ne[0] == n_kv && kq_mask->ne[1] >= n_tokens && kq_mask->ne[3] == 1;
+        if (sparse) {
+            const int64_t dv = v4->ne[0];
+            ggml_tensor * ids = ggml_reshape_1d(ctx0, top_k, width * n_tokens);
+            ggml_tensor * k_sel = ggml_get_rows(ctx0, ggml_view_2d(ctx0, k4, d * n_head_kv, n_kv, k4->nb[2], 0), ids);
+            ggml_tensor * v_sel = ggml_get_rows(ctx0, ggml_view_2d(ctx0, v4, dv * n_head_kv, n_kv, v4->nb[2], 0), ids);
+            k_sel = ggml_reshape_4d(ctx0, k_sel, d, n_head_kv, width, n_tokens);
+            v_sel = ggml_reshape_4d(ctx0, v_sel, dv, n_head_kv, width, n_tokens);
+
+            // causal mask entries of the selected cells, per query token: [1, width, n_tokens]
+            ggml_tensor * mask_rows = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_tokens,
+                ggml_element_size(kq_mask), kq_mask->nb[1], 0);
+            ggml_tensor * mask_sel = ggml_get_rows(ctx0, mask_rows, ggml_reshape_2d(ctx0, top_k, width, n_tokens));
+            mask_sel = ggml_reshape_4d(ctx0, mask_sel, width, 1, 1, n_tokens);
+
+            // scores [width, 1, n_head, n_tokens]; query heads broadcast over their KV head
+            ggml_tensor * kp = ggml_cont(ctx0, ggml_permute(ctx0, k_sel, 0, 2, 1, 3));
+            ggml_tensor * qp = ggml_view_4d(ctx0, q_cur, d, 1, n_head, n_tokens, q_cur->nb[1], q_cur->nb[1], q_cur->nb[2], 0);
+            ggml_tensor * kq = ggml_mul_mat(ctx0, kp, qp);
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            kq = ggml_soft_max_ext(ctx0, kq, mask_sel, kq_scale, 0.0f);
+
+            ggml_tensor * vt = ggml_cont(ctx0, ggml_permute(ctx0, v_sel, 1, 2, 0, 3));   // [width, dv, n_head_kv, n_tokens]
+            ggml_tensor * cur = ggml_mul_mat(ctx0, vt, kq);                               // [dv, 1, n_head, n_tokens]
+            cur = ggml_reshape_2d(ctx0, cur, dv * n_head, n_tokens);
+            cb(cur, "kqv_out", il);
+
+            if (inp->self_v_rot) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            }
+            return cur;
+        }
+    }
 
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);

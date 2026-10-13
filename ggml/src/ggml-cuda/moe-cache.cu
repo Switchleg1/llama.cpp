@@ -2754,6 +2754,13 @@ struct moe_expert_source_entry {
     size_t stride = 0;
     const void * data = nullptr;   // the bank tensor's original data, which per-tensor caches key on
     std::vector<const void *> hosts;
+    // Exchange residency (ggml_backend_moe_set_expert_exchange): current per-expert locations, and the slots of
+    // the grouped resource that last seeded them.
+    int64_t * locations = nullptr;
+    const char * resident_base = nullptr;
+    size_t bank_offset = 0;
+    const char * slot_data = nullptr;
+    const void * slot_owner = nullptr;
 };
 
 static std::mutex & moe_expert_source_mutex() {
@@ -2775,6 +2782,27 @@ static std::mutex & moe_expert_prior_mutex() {
 static std::unordered_map<const ggml_tensor *, std::vector<float>> & moe_expert_priors() {
     static std::unordered_map<const ggml_tensor *, std::vector<float>> priors;
     return priors;
+}
+
+static int64_t * moe_expert_exchange_locations(const ggml_tensor * tensor) {
+    std::lock_guard<std::mutex> lock(moe_expert_source_mutex());
+    const auto found = moe_expert_source_entries().find(tensor);
+    return found != moe_expert_source_entries().end() ? found->second.locations : nullptr;
+}
+
+static void moe_expert_exchange_bind_slots(const ggml_tensor * tensor, const void * owner, const char * slot_data, bool bind) {
+    std::lock_guard<std::mutex> lock(moe_expert_source_mutex());
+    const auto found = moe_expert_source_entries().find(tensor);
+    if (found == moe_expert_source_entries().end()) {
+        return;
+    }
+    if (bind) {
+        found->second.slot_owner = owner;
+        found->second.slot_data = slot_data;
+    } else if (found->second.slot_owner == owner) {
+        found->second.slot_owner = nullptr;
+        found->second.slot_data = nullptr;
+    }
 }
 
 // Device aliases per expert; null marks an expert the owner does not hold. Call on the resource's device.
@@ -2847,7 +2875,42 @@ bool ggml_backend_cuda_moe_set_expert_sources(const ggml_tensor * tensor, const 
     return true;
 }
 
+bool ggml_backend_cuda_moe_set_expert_exchange(const ggml_tensor * tensor, int64_t * locations,
+        const void * resident_base, size_t bank_offset) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(moe_expert_source_mutex());
+    auto found = moe_expert_source_entries().find(tensor);
+    if (found == moe_expert_source_entries().end()) {
+        return locations == nullptr;
+    }
+    if (locations != nullptr) {
+        cudaPointerAttributes attributes = {};
+        if (cudaPointerGetAttributes(&attributes, locations) != cudaSuccess || attributes.type != cudaMemoryTypeHost) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    found->second.locations = locations;
+    found->second.resident_base = static_cast<const char *>(resident_base);
+    found->second.bank_offset = bank_offset;
+    return true;
+}
+
+bool ggml_backend_cuda_moe_is_exchange_tensor(const ggml_tensor * tensor) {
+    return tensor != nullptr && moe_expert_exchange_locations(tensor) != nullptr;
+}
+
 namespace {
+
+// Exchange locations, see ggml_backend_moe_set_expert_exchange.
+static constexpr int MOE_EXCHANGE_OFFSET_BITS = 40;
+static constexpr int64_t MOE_EXCHANGE_OFFSET_MASK = (int64_t(1) << MOE_EXCHANGE_OFFSET_BITS) - 1;
+
+static __host__ __device__ int64_t moe_exchange_slot(int64_t location) {
+    return location <= -2 ? -2 - location : location >= 0 ? (location >> MOE_EXCHANGE_OFFSET_BITS) - 1 : -1;
+}
 
 struct moe_grouped_device_bank {
     const char * source;
@@ -2855,6 +2918,7 @@ struct moe_grouped_device_bank {
     size_t expert_stride;
     uint32_t source_path = MOE_GROUPED_SOURCE_DEVICE;
     bool staged = false;
+    bool exchange = false;                            // a fill swaps the slot's resident into the source position
     const char * const * expert_sources = nullptr;   // when set, expert e starts at expert_sources[e]
     size_t source_stride = 0;                         // source distance between experts; 0 means expert_stride
 };
@@ -4716,8 +4780,11 @@ static __global__ void moe_grouped_plan_decode(
         uint32_t * admit_cold_score = nullptr,
         uint32_t admit_promote_budget = 0,
         uint32_t admit_promote_min = 2,
-        const uint8_t * fillable = nullptr,
-        uint32_t * expert_usage = nullptr) {
+        uint8_t * fillable = nullptr,
+        uint32_t * expert_usage = nullptr,
+        const moe_grouped_device_bank * exchange_banks = nullptr,
+        uint32_t n_exchange_banks = 0,
+        int64_t * exchange_locations = nullptr) {
     if (blockIdx.x != 0) {
         return;
     }
@@ -5036,8 +5103,12 @@ static __global__ void moe_grouped_plan_decode(
                 if (stored_epoch > frequency_epoch) {
                     moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
                 }
-                const uint32_t candidate_frequency = !frequency_aware || resident < 0 ? 0 : moe_grouped_effective_frequency(
+                uint32_t candidate_frequency = !frequency_aware || resident < 0 ? 0 : moe_grouped_effective_frequency(
                     expert_frequency[resident], stored_epoch, frequency_epoch);
+                if (exchange_locations != nullptr && fillable != nullptr && resident >= 0) {
+                    // Exchange residency: evicting a resident with a RAM copy writes nothing back.
+                    candidate_frequency = min(candidate_frequency, UINT32_MAX / 2 - 1) * 2 + (fillable[resident] == 0);
+                }
                 if (candidate_frequency < frequency ||
                         (candidate_frequency == frequency && (candidate_age < age ||
                             (candidate_age == age && candidate < slot)))) {
@@ -5091,6 +5162,29 @@ static __global__ void moe_grouped_plan_decode(
                     ++admit_cold_score[miss_expert];
                 }
             } else {
+                if (exchange_locations != nullptr && fillable != nullptr && selected_slot < n_slots && miss_expert >= 0) {
+                    const int32_t victim = expert_for_slot[selected_slot];
+                    const int64_t incoming = exchange_locations[miss_expert] & MOE_EXCHANGE_OFFSET_MASK;
+                    if (victim >= 0 && fillable[victim] == 0) {
+                        // Only the slot holds the resident: the gather swaps it into the incoming expert's RAM
+                        // position, so repoint it there.
+                        for (uint32_t bank = 0; bank < n_exchange_banks; ++bank) {
+                            auto * table = const_cast<const char **>(exchange_banks[bank].expert_sources);
+                            table[victim] = table[miss_expert];
+                        }
+                        exchange_locations[victim] = incoming;
+                        fillable[victim] = 1;
+                        fillable[miss_expert] = 0;
+                        exchange_locations[miss_expert] = -2 - (int64_t) selected_slot;
+                    } else {
+                        // The resident keeps its RAM copy, or the slot was empty: nothing moves back, and the
+                        // incoming expert keeps its own copy.
+                        if (victim >= 0) {
+                            exchange_locations[victim] &= MOE_EXCHANGE_OFFSET_MASK;
+                        }
+                        exchange_locations[miss_expert] = incoming | ((int64_t) (selected_slot + 1) << MOE_EXCHANGE_OFFSET_BITS);
+                    }
+                }
                 if (admit_decide && selected_slot < n_slots) {
                     if (expert_for_slot[selected_slot] < 0 && vacant != 0) {
                         --vacant;
@@ -6090,7 +6184,8 @@ static __global__ void moe_grouped_gather_decode(
         bool device_prefetch = false,
         const int32_t * prefetch_positions = nullptr,
         const char * prefetch_payload = nullptr,
-        size_t prefetch_expert_bytes = 0) {
+        size_t prefetch_expert_bytes = 0,
+        const int32_t * expert_for_slot = nullptr) {
     if (plan->status != MOE_GROUPED_PLAN_READY) {
         return;
     }
@@ -6188,13 +6283,41 @@ static __global__ void moe_grouped_gather_decode(
         }
     }
     const int32_t * miss_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
+    // Source of each (miss, bank), resolved once per block: the word loop then issues its host read directly.
+    constexpr uint32_t shared_capacity = 256;
+    __shared__ const char * shared_sources[shared_capacity];
+    __shared__ bool shared_writeback[shared_capacity];
+    const bool shared_table = n_misses * n_banks <= shared_capacity && control == nullptr && !device_prefetch;
+    // Exchange residency: the planner pointed an evicted expert without a RAM copy at the incoming expert's source;
+    // only those victims move back. Without the slot map, every fill swaps.
+    const auto writes_back = [&](uint32_t miss) {
+        if (expert_for_slot == nullptr) {
+            return true;
+        }
+        const int32_t victim = expert_for_slot[miss_slots[miss]];
+        return victim >= 0 && banks[0].expert_sources[victim] == banks[0].expert_sources[miss_experts[miss]];
+    };
+    if (shared_table) {
+        for (uint32_t i = threadIdx.x; i < n_misses * n_banks; i += blockDim.x) {
+            const uint32_t local_miss = i / n_banks;
+            const auto & descriptor = banks[i % n_banks];
+            const int32_t expert = miss_experts[first_miss + local_miss];
+            shared_sources[i] = descriptor.expert_sources != nullptr ? descriptor.expert_sources[expert] :
+                descriptor.source + (descriptor.staged ? local_miss : (size_t) expert) *
+                    (descriptor.source_stride != 0 ? descriptor.source_stride : descriptor.expert_stride);
+            if (i % n_banks == 0) {
+                shared_writeback[local_miss] = descriptor.exchange && writes_back(first_miss + local_miss);
+            }
+        }
+        __syncthreads();
+    }
     const size_t total_words = words_per_miss * n_misses;
     const size_t first = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = (size_t) gridDim.x * blockDim.x;
     for (size_t word = first; word < total_words; word += stride) {
         const uint32_t miss = first_miss + word / words_per_miss;
-        const int32_t expert = miss_experts[miss];
-        const int32_t prefetch_rank = prefetch_positions != nullptr ? prefetch_positions[expert] : -1;
+        const int32_t expert = shared_table ? -1 : miss_experts[miss];
+        const int32_t prefetch_rank = !shared_table && prefetch_positions != nullptr ? prefetch_positions[expert] : -1;
         size_t bank_word = word % words_per_miss;
         for (uint32_t bank = 0; bank < n_banks; ++bank) {
             const auto descriptor = banks[bank];
@@ -6204,7 +6327,8 @@ static __global__ void moe_grouped_gather_decode(
                 continue;
             }
             const int32_t slot = miss_slots[miss];
-            const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.expert_sources != nullptr ?
+            const uint4 * source = reinterpret_cast<const uint4 *>(shared_table ?
+                shared_sources[(miss - first_miss) * n_banks + bank] : descriptor.expert_sources != nullptr ?
                 descriptor.expert_sources[expert] :
                 descriptor.source + (descriptor.staged ? miss - first_miss : (size_t) expert) *
                     (descriptor.source_stride != 0 ? descriptor.source_stride : descriptor.expert_stride));
@@ -6214,7 +6338,11 @@ static __global__ void moe_grouped_gather_decode(
                 source = reinterpret_cast<const uint4 *>(prefetch_payload + size_t(prefetch_rank) * prefetch_expert_bytes) + word % words_per_miss - bank_word;
             }
             uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
-            destination[bank_word] = source[bank_word];
+            const uint4 value = source[bank_word];
+            if (descriptor.exchange && (shared_table ? shared_writeback[miss - first_miss] : writes_back(miss))) {
+                const_cast<uint4 *>(source)[bank_word] = destination[bank_word];
+            }
+            destination[bank_word] = value;
             break;
         }
     }
@@ -6245,6 +6373,46 @@ static bool moe_grouped_cuda_success(cudaError_t error) {
     }
     (void) cudaGetLastError();
     return false;
+}
+
+// Exchange residency between graphs: swap a RAM expert with a slot's resident, then repoint both.
+static __global__ void moe_grouped_exchange_swap(const moe_grouped_device_bank * banks, uint32_t n_banks,
+        int32_t expert, int32_t slot, bool write_back) {
+    for (uint32_t bank = 0; bank < n_banks; ++bank) {
+        const auto descriptor = banks[bank];
+        uint4 * source = const_cast<uint4 *>(reinterpret_cast<const uint4 *>(descriptor.expert_sources[expert]));
+        uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
+        const size_t words = descriptor.expert_stride / sizeof(uint4);
+        for (size_t word = (size_t) blockIdx.x * blockDim.x + threadIdx.x; word < words; word += (size_t) gridDim.x * blockDim.x) {
+            const uint4 value = source[word];
+            if (write_back) {
+                source[word] = destination[word];
+            }
+            destination[word] = value;
+        }
+    }
+}
+
+static __global__ void moe_grouped_exchange_commit(const moe_grouped_device_bank * banks, uint32_t n_banks,
+        int32_t expert, int32_t victim, int32_t slot, int64_t * locations, uint8_t * fillable,
+        int32_t * expert_for_slot, int32_t * slot_for_expert, bool write_back) {
+    const int64_t incoming = locations[expert] & MOE_EXCHANGE_OFFSET_MASK;
+    if (write_back) {
+        for (uint32_t bank = 0; bank < n_banks; ++bank) {
+            auto * table = const_cast<const char **>(banks[bank].expert_sources);
+            table[victim] = table[expert];
+        }
+        locations[victim] = incoming;
+        locations[expert] = -2 - (int64_t) slot;
+        fillable[victim] = 1;
+        fillable[expert] = 0;
+    } else {
+        locations[victim] &= MOE_EXCHANGE_OFFSET_MASK;
+        locations[expert] = incoming | ((int64_t) (slot + 1) << MOE_EXCHANGE_OFFSET_BITS);
+    }
+    expert_for_slot[slot] = expert;
+    slot_for_expert[expert] = slot;
+    slot_for_expert[victim] = -1;
 }
 
 } // namespace
@@ -6547,10 +6715,17 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (source_owner != nullptr) {
                 source_owner->release();
             }
+            for (const ggml_tensor * tensor : exchange_tensors) {
+                moe_expert_exchange_bind_slots(tensor, this, nullptr, false);
+            }
         }
 
         int device;
         moe_host_budget * source_owner = nullptr;
+        // Exchange residency: host and device views of the owner's per-expert locations, and the bank tensors.
+        const int64_t * exchange_host = nullptr;
+        int64_t * exchange_device = nullptr;
+        std::vector<const ggml_tensor *> exchange_tensors;
         std::unique_ptr<moe_grouped_materialization> materialization;
         uint32_t n_experts = 0;
         size_t words_per_miss = 0;
@@ -8167,6 +8342,19 @@ struct ggml_cuda_moe_grouped_context::impl {
             use_owner_sources = moe_expert_source_lookup(snapshot.banks[i].tensor, n_experts,
                 snapshot.banks[i].expert_stride, &owner_sources[i]);
         }
+        // Exchange residency needs one location table for all banks, the decide planner and plain slot banks.
+        int64_t * exchange_locations = use_owner_sources && !snapshot.banks.empty() ?
+            moe_expert_exchange_locations(snapshot.banks[0].tensor) : nullptr;
+        for (uint32_t i = 1; exchange_locations != nullptr && i < snapshot.banks.size(); ++i) {
+            if (moe_expert_exchange_locations(snapshot.banks[i].tensor) != exchange_locations) {
+                exchange_locations = nullptr;
+            }
+        }
+        if (exchange_locations != nullptr && (snapshot.n_slot_auxiliaries != 0 || moe_early_router_enabled() ||
+                !moe_grouped_admit_decide_enabled() || !moe_grouped_admit_doorbell_enabled())) {
+            GGML_LOG_ERROR("moe-cache: exchange residency needs the decide planner, no slot auxiliaries and no early router\n");
+            return nullptr;
+        }
         std::vector<uint8_t> fillable;
         if (use_owner_sources) {
             fillable.assign(n_experts, 1);
@@ -8176,7 +8364,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 }
             }
             const bool partial = std::find(fillable.begin(), fillable.end(), 0) != fillable.end();
-            if (!partial) {
+            if (!partial && exchange_locations == nullptr) {
                 fillable.clear();
             } else if (!moe_grouped_admit_decide_enabled() || !moe_grouped_admit_doorbell_enabled()) {
                 use_owner_sources = false;
@@ -8274,9 +8462,11 @@ struct ggml_cuda_moe_grouped_context::impl {
                         !moe_grouped_cuda_success(cudaStreamSynchronize(compute_stream))) {
                     return nullptr;
                 }
-                // Evenly spaced sources (one store bundle stride) skip the per-word table load.
+                // Evenly spaced sources (one store bundle stride) skip the per-word table load. Exchanges rewrite
+                // the table, so they keep it.
                 const size_t step = expert_sources.size() > 1 ? size_t(expert_sources[1] - expert_sources[0]) : 0;
-                bool affine = expert_sources.size() > 1 && expert_sources[1] > expert_sources[0] && step % alignof(uint4) == 0;
+                bool affine = exchange_locations == nullptr && expert_sources.size() > 1 &&
+                    expert_sources[1] > expert_sources[0] && step % alignof(uint4) == 0;
                 for (size_t e = 2; affine && e < expert_sources.size(); ++e) {
                     affine = expert_sources[e] == expert_sources[0] + e * step;
                 }
@@ -8290,6 +8480,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                     result->bank_table_hosts[i] = expert_sources;
                 }
                 device_banks[i].source_path = MOE_GROUPED_SOURCE_MAPPED;
+                device_banks[i].exchange = exchange_locations != nullptr;
                 alias_data = expert_sources[0];
             } else if (source != nullptr && source->device_alias == nullptr) {
                 auto & materialization = *result->materialization;
@@ -8465,6 +8656,25 @@ struct ggml_cuda_moe_grouped_context::impl {
             (void) cudaStreamSynchronize(compute_stream);
             return nullptr;
         }
+        if (exchange_locations != nullptr) {
+            void * alias = nullptr;
+            if (!moe_grouped_cuda_success(cudaHostGetDevicePointer(&alias, exchange_locations, 0))) {
+                (void) cudaStreamSynchronize(compute_stream);
+                return nullptr;
+            }
+            result->exchange_host = exchange_locations;
+            result->exchange_device = static_cast<int64_t *>(alias);
+            if (!seed_exchange_slots(*result, snapshot, compute_stream, true)) {
+                GGML_LOG_ERROR("moe-cache: exchange residency seeding failed for %s\n",
+                    snapshot.banks.empty() ? "?" : snapshot.banks[0].tensor->name);
+                return nullptr;
+            }
+            for (uint32_t i = 0; i < snapshot.banks.size(); ++i) {
+                result->exchange_tensors.push_back(snapshot.banks[i].tensor);
+                moe_expert_exchange_bind_slots(snapshot.banks[i].tensor, result.get(),
+                    static_cast<const char *>(result->bank_data[i]), true);
+            }
+        }
         bool resident_copied = prefill_resident;
         for (uint32_t i = 0; resident_copied && i < snapshot.n_slot_auxiliaries; ++i) {
             resident_copied = moe_grouped_cuda_success(cudaMemcpyAsync(
@@ -8490,6 +8700,49 @@ struct ggml_cuda_moe_grouped_context::impl {
 #endif
     } catch (const std::bad_alloc &) {
         return nullptr;
+    }
+
+    // Rebuilds the slot maps from the exchange locations; with copy, also reloads the slot bytes from the tensor
+    // data. Synchronizes, so no grouped work may be in flight.
+    static bool seed_exchange_slots(grouped_device_resource & device, const grouped_snapshot & snapshot,
+            cudaStream_t stream, bool copy) {
+        const uint32_t n_slots = snapshot.n_slots;
+        const uint32_t n_experts = device.n_experts;
+        if (device.exchange_host == nullptr || device.slot_for_expert == nullptr || device.expert_for_slot == nullptr ||
+                device.last_used == nullptr || !moe_grouped_cuda_success(cudaStreamSynchronize(stream))) {
+            return false;
+        }
+        std::vector<int32_t> expert_for_slot(n_slots, -1), slot_for_expert(n_experts, -1);
+        std::vector<uint64_t> last_used(n_slots, 0);
+        const volatile int64_t * locations = device.exchange_host;
+        for (uint32_t expert = 0; expert < n_experts; ++expert) {
+            const int64_t slot = moe_exchange_slot(locations[expert]);
+            if (slot < 0) {
+                continue;
+            }
+            if (slot >= n_slots || expert_for_slot[slot] >= 0) {
+                return false;
+            }
+            expert_for_slot[slot] = (int32_t) expert;
+            slot_for_expert[expert] = (int32_t) slot;
+            last_used[slot] = 1;
+            for (uint32_t bank = 0; copy && bank < snapshot.banks.size(); ++bank) {
+                const auto & descriptor = snapshot.banks[bank];
+                if (!moe_grouped_cuda_success(cudaMemcpyAsync(
+                        static_cast<char *>(device.bank_data[bank]) + (size_t) slot * descriptor.expert_stride,
+                        static_cast<const char *>(descriptor.source_data) + (size_t) expert * descriptor.expert_stride,
+                        descriptor.expert_stride, cudaMemcpyHostToDevice, stream))) {
+                    return false;
+                }
+            }
+        }
+        return moe_grouped_cuda_success(cudaMemcpyAsync(device.expert_for_slot, expert_for_slot.data(),
+                n_slots * sizeof(int32_t), cudaMemcpyHostToDevice, stream)) &&
+            moe_grouped_cuda_success(cudaMemcpyAsync(device.slot_for_expert, slot_for_expert.data(),
+                n_experts * sizeof(int32_t), cudaMemcpyHostToDevice, stream)) &&
+            moe_grouped_cuda_success(cudaMemcpyAsync(device.last_used, last_used.data(),
+                n_slots * sizeof(uint64_t), cudaMemcpyHostToDevice, stream)) &&
+            moe_grouped_cuda_success(cudaStreamSynchronize(stream));
     }
 
     bool cold_reset_grouped_resource(
@@ -8546,6 +8799,13 @@ struct ggml_cuda_moe_grouped_context::impl {
                 !moe_grouped_cuda_success(cudaMemsetAsync(
                     device_resource.plan, 0, device_resource.plan_bytes, compute_stream)) ||
                 !moe_grouped_cuda_success(cudaEventRecord(device_resource.completion, compute_stream))) {
+            return false;
+        }
+        // Exchange residency: only the slots hold their experts, so restore the maps instead of dropping them.
+        // Per-tensor caches leave exchange slots untouched; the host-staged path does not, so reload the bytes.
+        if (device_resource.exchange_host != nullptr && !seed_exchange_slots(device_resource, resource.snapshot,
+                compute_stream, reason == MOE_GROUPED_RESET_HOST_STAGED_HANDOFF)) {
+            GGML_LOG_ERROR("moe-cache: exchange residency restore failed after reset %d\n", (int) reason);
             return false;
         }
         device_resource.clock_bound = 0;
@@ -10338,13 +10598,24 @@ bool ggml_cuda_moe_grouped_context::adapt_residency(cudaStream_t stream) {
         }
         std::sort(residents[g].begin(), residents[g].end());
         const bool tables = !device.bank_tables.empty();
+        // Exchanges rewrite the device tables, so read the device's fillable flags instead of the host mirror.
+        std::vector<uint8_t> device_fillable;
+        if (device.exchange_device != nullptr && device.fillable != nullptr) {
+            device_fillable.resize(n);
+            if (!moe_grouped_cuda_success(cudaMemcpy(device_fillable.data(), device.fillable, n, cudaMemcpyDeviceToHost))) {
+                continue;
+            }
+        }
         for (uint32_t e = 0; e < n; ++e) {
             if (resident[e] || state.score[e] <= 0.0f) {
                 continue;
             }
             bool fillable = true;
-            for (uint32_t b = 0; tables && b < device.bank_table_hosts.size(); ++b) {
+            for (uint32_t b = 0; tables && device_fillable.empty() && b < device.bank_table_hosts.size(); ++b) {
                 fillable = fillable && device.bank_tables[b] != nullptr && device.bank_table_hosts[b][e] != nullptr;
+            }
+            if (!device_fillable.empty()) {
+                fillable = device_fillable[e] != 0;
             }
             if (fillable) {
                 incoming.push_back({state.score[e], g, (int32_t) e});
@@ -10372,6 +10643,26 @@ bool ggml_cuda_moe_grouped_context::adapt_residency(cudaStream_t stream) {
         const auto & resource = impl_->resources[c.group];
         auto & device = *resource->device;
         moe_grouped_device_scope device_scope(device.device);
+        if (device.exchange_device != nullptr) {
+            if (out < 0) {
+                break;
+            }
+            const uint32_t n_banks = (uint32_t) resource->snapshot.banks.size();
+            // A resident with a RAM copy is just overwritten; otherwise it moves into the incoming expert's place.
+            uint8_t victim_copy = 0;
+            if (!moe_grouped_cuda_success(cudaMemcpyAsync(&victim_copy, device.fillable + out, 1, cudaMemcpyDeviceToHost, stream)) ||
+                    !moe_grouped_cuda_success(cudaStreamSynchronize(stream))) {
+                break;
+            }
+            moe_grouped_exchange_swap<<<64, 256, 0, stream>>>(device.device_banks, n_banks, c.expert, slot, victim_copy == 0);
+            moe_grouped_exchange_commit<<<1, 1, 0, stream>>>(device.device_banks, n_banks, c.expert, out, slot,
+                device.exchange_device, device.fillable, device.expert_for_slot, device.slot_for_expert, victim_copy == 0);
+            if (!moe_grouped_cuda_success(cudaGetLastError())) {
+                break;
+            }
+            ++swaps;
+            continue;
+        }
         bool ok = true;
         for (uint32_t b = 0; ok && b < resource->snapshot.banks.size(); ++b) {
             const auto & bank = resource->snapshot.banks[b];
@@ -12738,7 +13029,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.admit_slot_for_expert, n_rows <= MOE_GROUPED_ADMIT_MAX_ROWS, device.admit_publication_device,
             moe_grouped_admit_quota(resource->snapshot.n_slots), decide,
             device.admit_cold_score, moe_grouped_admit_promote_budget(), moe_grouped_admit_promote_min(), device.fillable,
-            device.expert_usage);
+            device.expert_usage, device.device_banks, (uint32_t) resource->snapshot.banks.size(), device.exchange_device);
         CUDA_CHECK(cudaGetLastError());
         // The CPU half starts now, while the fills below run, instead of after them.
         device.admit_published_early = impl_->admit_early_input != nullptr && moe_grouped_admit_doorbell_enabled() &&
@@ -12791,7 +13082,8 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 nullptr, 0, UINT32_MAX, device_prefetch_job != nullptr,
                 device_prefetch_job != nullptr ? impl_->early[0]->positions[lane] : nullptr,
                 device_prefetch_job != nullptr ? impl_->device_prefetch->payload + size_t(lane) * impl_->device_prefetch->tile_bytes : nullptr,
-                device_prefetch_job != nullptr ? device_prefetch_job->expert_bytes : 0);
+                device_prefetch_job != nullptr ? device_prefetch_job->expert_bytes : 0,
+                device.exchange_device != nullptr ? device.expert_for_slot : nullptr);
         } else {
             const uint32_t lane = device_prefetch_job != nullptr ? device_prefetch_job->lane : 0;
             if (device_prefetch_job != nullptr) {
@@ -12808,7 +13100,8 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                     device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                     device.auxiliary_values_per_miss, device.plan_capacity, device.plan, nullptr,
                     key.candidate.group_index,
-                    nullptr, nullptr);
+                    nullptr, nullptr, nullptr, 0, UINT32_MAX, false, nullptr, nullptr, 0,
+                    device.exchange_device != nullptr ? device.expert_for_slot : nullptr);
             }
         }
         CUDA_CHECK(cudaGetLastError());
@@ -16244,6 +16537,7 @@ static cudaError_t moe_cache_copy_source(
         cudaStream_t stream,
         bool is_decode) {
     std::vector<std::pair<size_t, const void *>> owned;   // (offset, owner pointer) per copied piece
+    std::vector<bool> on_device;                          // exchange residency: the piece is in a GPU slot
     size_t stride = 0;
     {
         std::lock_guard<std::mutex> lock(moe_expert_source_mutex());
@@ -16265,7 +16559,20 @@ static cudaError_t moe_cache_copy_source(
                 const size_t within = position % stride;
                 const size_t count = std::min(bytes - offset, stride - within);
                 const void * host = entry->hosts[expert];
+                bool device = false;
+                if (entry->locations != nullptr) {
+                    // Current position: exchanges move experts between RAM and the slots.
+                    const int64_t location = static_cast<const volatile int64_t *>(entry->locations)[expert];
+                    const int64_t slot = moe_exchange_slot(location);
+                    host = location >= 0 && entry->resident_base != nullptr ?
+                        entry->resident_base + (location & MOE_EXCHANGE_OFFSET_MASK) + entry->bank_offset : nullptr;
+                    if (slot >= 0 && entry->slot_data != nullptr) {
+                        host = entry->slot_data + (size_t) slot * stride;
+                        device = true;
+                    }
+                }
                 owned.push_back({offset, host != nullptr ? static_cast<const char *>(host) + within : nullptr});
+                on_device.push_back(device);
                 offset += count;
             }
         }
@@ -16278,7 +16585,7 @@ static cudaError_t moe_cache_copy_source(
         const size_t count = (i + 1 < owned.size() ? owned[i + 1].first : bytes) - offset;
         char * dst = static_cast<char *>(destination) + offset;
         const cudaError_t error = owned[i].second != nullptr ?
-            cudaMemcpyAsync(dst, owned[i].second, count, cudaMemcpyHostToDevice, stream) :
+            cudaMemcpyAsync(dst, owned[i].second, count, on_device[i] ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, stream) :
             moe_cache_copy_source_tensor(cache, dst, static_cast<const char *>(source) + offset, count, stream, is_decode);
         if (error != cudaSuccess) {
             return error;

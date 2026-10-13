@@ -23,6 +23,19 @@ public:
     };
     using reader = bool (*)(void *, expert, uint32_t bank, void * dst, size_t bytes);
 
+    // Per-expert location: LOC_FILE, loc_gpu(slot) for an expert that only GPU slot `slot` holds, or loc_ram():
+    // a byte offset in the resident buffer, with (slot + 1) above LOC_OFFSET_BITS when a GPU slot also holds the
+    // expert. A device that exchanges experts writes these values in place.
+    static constexpr int64_t LOC_FILE = -1;
+    static constexpr int LOC_OFFSET_BITS = 40;
+    static constexpr int64_t loc_gpu(uint32_t slot) { return -2 - int64_t(slot); }
+    static constexpr int64_t loc_ram(size_t offset, int64_t slot = -1) {
+        return int64_t(offset) | ((slot + 1) << LOC_OFFSET_BITS);
+    }
+    static constexpr bool gpu_only(int64_t loc) { return loc <= -2; }
+    static constexpr int64_t loc_offset(int64_t loc) { return loc >= 0 ? loc & ((int64_t(1) << LOC_OFFSET_BITS) - 1) : -1; }
+    static constexpr int64_t loc_slot(int64_t loc) { return loc <= -2 ? -2 - loc : loc >= 0 ? (loc >> LOC_OFFSET_BITS) - 1 : -1; }
+
     class lease {
     public:
         lease() = default;
@@ -42,6 +55,7 @@ public:
         std::shared_ptr<impl> state;
         uint32_t index = UINT32_MAX;
         uint32_t staged = UINT32_MAX;
+        size_t offset = SIZE_MAX;
     };
 
     class exchange {
@@ -67,11 +81,14 @@ public:
     };
 
     // Initialize once. host_buft (e.g. pinned CUDA host memory) is tried first, then pageable CPU memory.
-    // GPU experts are excluded; unranked experts stay file-backed when rank is given.
+    // The k-th GPU expert of a group owns GPU slot k. The last gpu_copies of each group's GPU experts also keep a
+    // RAM copy while the budget allows; the others are excluded. When host_buft is given but its memory is
+    // unavailable, GPU experts are placed like the rest, since pageable memory cannot take device exchanges.
+    // Unranked experts stay file-backed when rank is given.
     bool init(const std::vector<group> & groups, const std::vector<expert> & gpu,
               const std::vector<expert> & rank, size_t resident_budget, size_t staging_budget,
               uint32_t max_staged, reader read, void * user, std::shared_ptr<void> reader_owner = {},
-              ggml_backend_buffer_type_t host_buft = nullptr);
+              ggml_backend_buffer_type_t host_buft = nullptr, uint32_t gpu_copies = 0);
     // File-backed experts are copied into bounded staging. Exhaustion and read failures return an empty lease.
     lease acquire(expert key);
     exchange begin_exchange(expert in, expert out);
@@ -90,6 +107,15 @@ public:
     // Resident bank bytes without a lease, or null. Valid until the store is destroyed; callers must not use
     // this while exchanges can run, since commit moves bundles.
     const void * resident_data(expert key, uint32_t bank) const;
+    int64_t location(expert key) const;
+    // Debug check: rereads every resident expert and compares its bytes. Counts experts per tier and mismatches.
+    struct tiers { size_t ram = 0, gpu = 0, gpu_copies = 0, file = 0, mismatched = 0, gpu_moved = 0; };
+    tiers verify() const;
+    // Device-writable view for exchanges: the group's locations (pinned host memory), the resident buffer and the
+    // offset of each bank in a bundle. Null when the store is not pinned or holds no GPU experts.
+    int64_t * locations(uint32_t group) const;
+    const void * resident_base() const;
+    size_t bank_offset(uint32_t group, uint32_t bank) const;
 private:
     std::shared_ptr<impl> state;
 };

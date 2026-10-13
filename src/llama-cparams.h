@@ -13,6 +13,7 @@ struct llama_cparams {
     int32_t     moe_expert_split_threads  = 0;
     int64_t     moe_expert_store_mib      = -1;
     bool        moe_expert_store_adapt    = true;
+    int32_t     moe_expert_store_gpu_cache = LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL;
 
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence

@@ -41,10 +41,8 @@ struct llama_moe_expert_store::impl {
     };
     struct entry {
         expert key;
-        size_t offset = SIZE_MAX;
         uint32_t readers = 0;
         uint32_t file_hits = 0;   // file-tier reads since the expert last moved
-        bool gpu = false;
         bool exchanging = false;
         bool ranked = false;
     };
@@ -52,6 +50,15 @@ struct llama_moe_expert_store::impl {
     std::vector<entry> entries;
     ggml_backend_buffer_ptr resident;
     ggml_backend_buffer_ptr staging;
+    ggml_backend_buffer_ptr location_buffer;
+    std::vector<int64_t> location_fallback;
+    volatile int64_t * locations = nullptr;   // per entry, see LOC_FILE; a device may write it during exchanges
+    bool exchangeable = false;
+
+    int64_t loc(uint32_t index) const { return locations[index]; }
+    void set_loc(uint32_t index, int64_t value) { locations[index] = value; }
+    bool resident_at(uint32_t index) const { return loc(index) >= 0; }
+    int64_t offset(uint32_t index) const { return loc_offset(loc(index)); }
     std::vector<bool> busy;
     size_t resident_size = 0;
     size_t staging_size = 0;
@@ -107,7 +114,7 @@ struct llama_moe_expert_store::impl {
 bool llama_moe_expert_store::init(const std::vector<group> & groups, const std::vector<expert> & gpu,
         const std::vector<expert> & rank, size_t resident_budget, size_t staging_budget,
         uint32_t max_staged, reader read, void * user, std::shared_ptr<void> reader_owner,
-        ggml_backend_buffer_type_t host_buft) {
+        ggml_backend_buffer_type_t host_buft, uint32_t gpu_copies) {
     if (!read || groups.empty() || groups.size() > UINT32_MAX || state) {
         return false;
     }
@@ -147,18 +154,39 @@ bool llama_moe_expert_store::init(const std::vector<group> & groups, const std::
                 next->entries.push_back({{i, id}});
             }
         }
+        if (host_buft) {
+            next->location_buffer.reset(ggml_backend_buft_alloc_buffer(host_buft, next->entries.size() * sizeof(int64_t)));
+        }
+        if (next->location_buffer) {
+            next->locations = static_cast<int64_t *>(ggml_backend_buffer_get_base(next->location_buffer.get()));
+        } else {
+            next->location_fallback.resize(next->entries.size());
+            next->locations = next->location_fallback.data();
+        }
+        for (uint32_t i = 0; i < next->entries.size(); ++i) {
+            next->set_loc(i, LOC_FILE);
+        }
+        std::vector<uint32_t> gpu_slots(next->layouts.size(), 0);
         for (expert key : gpu) {
             const uint32_t index = next->index(key);
-            if (index == UINT32_MAX || next->entries[index].gpu) {
+            if (index == UINT32_MAX || next->loc(index) != LOC_FILE) {
                 return false;
             }
-            next->entries[index].gpu = true;
+            next->set_loc(index, loc_gpu(gpu_slots[key.group]++));
+        }
+        // GPU experts that keep a RAM copy, by entry: their slot, or -1.
+        std::vector<int64_t> copy_slot(next->entries.size(), -1);
+        for (uint32_t i = 0; i < next->entries.size(); ++i) {
+            const int64_t slot = loc_slot(next->loc(i));
+            const uint32_t n_gpu = gpu_slots[next->entries[i].key.group];
+            if (slot >= 0 && uint64_t(slot) + gpu_copies >= n_gpu) {
+                copy_slot[i] = slot;
+            }
         }
         auto admit = [&](uint32_t index) {
-            auto & entry = next->entries[index];
-            const size_t bytes = next->layouts[entry.key.group].bytes;
-            if (!entry.gpu && bytes <= resident_budget - next->resident_size) {
-                entry.offset = next->resident_size;
+            const size_t bytes = next->layouts[next->entries[index].key.group].bytes;
+            if ((next->loc(index) == LOC_FILE || copy_slot[index] >= 0) && bytes <= resident_budget - next->resident_size) {
+                next->set_loc(index, loc_ram(next->resident_size, copy_slot[index]));
                 next->resident_size += bytes;
             }
         };
@@ -191,9 +219,16 @@ bool llama_moe_expert_store::init(const std::vector<group> & groups, const std::
                 return false;
             }
         }
+        // Pageable memory cannot take device exchanges: GPU experts then lose their slots.
+        next->exchangeable = !gpu.empty() && host_buft && next->pinned && next->location_buffer;
+        if (host_buft && !next->exchangeable) {
+            for (uint32_t i = 0; i < next->entries.size(); ++i) {
+                next->set_loc(i, gpu_only(next->loc(i)) ? LOC_FILE :
+                    next->resident_at(i) ? loc_ram(size_t(next->offset(i))) : next->loc(i));
+            }
+        }
         for (uint32_t i = 0; i < next->entries.size(); ++i) {
-            const auto & entry = next->entries[i];
-            if (entry.offset != SIZE_MAX && !next->fetch(i, next->resident_data() + entry.offset)) {
+            if (next->resident_at(i) && !next->fetch(i, next->resident_data() + next->offset(i))) {
                 return false;
             }
         }
@@ -218,11 +253,12 @@ llama_moe_expert_store::lease llama_moe_expert_store::acquire(expert key) {
             return result;
         }
         auto & entry = state->entries[index];
-        if (entry.gpu || entry.exchanging || entry.readers == UINT32_MAX) {
+        const int64_t location = state->loc(index);
+        if (gpu_only(location) || entry.exchanging || entry.readers == UINT32_MAX) {
             return result;
         }
         uint32_t staged = UINT32_MAX;
-        if (entry.offset == SIZE_MAX) {
+        if (location == LOC_FILE) {
             staged = state->stage();
             if (staged == UINT32_MAX) {
                 return result;
@@ -233,6 +269,7 @@ llama_moe_expert_store::lease llama_moe_expert_store::acquire(expert key) {
         result.state = state;
         result.index = index;
         result.staged = staged;
+        result.offset = location >= 0 ? size_t(loc_offset(location)) : SIZE_MAX;
     }
     if (result.staged != UINT32_MAX) {
         result.state->file_reads.fetch_add(1, std::memory_order_relaxed);
@@ -264,6 +301,7 @@ llama_moe_expert_store::lease & llama_moe_expert_store::lease::operator=(lease &
         state = std::move(other.state);
         index = other.index;
         staged = other.staged;
+        offset = other.offset;
     }
     return *this;
 }
@@ -276,7 +314,7 @@ const void * llama_moe_expert_store::lease::data(uint32_t bank) const {
     if (bank >= layout.offsets.size()) {
         return nullptr;
     }
-    const uint8_t * base = staged == UINT32_MAX ? state->resident_data() + entry.offset :
+    const uint8_t * base = staged == UINT32_MAX ? state->resident_data() + offset :
         state->staging_data() + size_t(staged) * state->stride;
     return base + layout.offsets[bank];
 }
@@ -305,8 +343,9 @@ std::vector<std::pair<llama_moe_expert_store::expert, uint32_t>> llama_moe_exper
         return result;
     }
     std::lock_guard<std::mutex> lock(state->mutex);
-    for (const auto & entry : state->entries) {
-        if (!entry.gpu && entry.offset == SIZE_MAX && entry.file_hits >= min_hits) {
+    for (uint32_t i = 0; i < state->entries.size(); ++i) {
+        const auto & entry = state->entries[i];
+        if (state->loc(i) == LOC_FILE && entry.file_hits >= min_hits) {
             result.push_back({entry.key, entry.file_hits});
         }
     }
@@ -328,8 +367,8 @@ bool llama_moe_expert_store::promote(expert in, expert out) {
         }
         auto & incoming = state->entries[i];
         auto & outgoing = state->entries[o];
-        if (incoming.gpu || incoming.offset != SIZE_MAX || incoming.readers || incoming.exchanging ||
-                outgoing.gpu || outgoing.offset == SIZE_MAX || outgoing.readers || outgoing.exchanging ||
+        if (state->loc(i) != LOC_FILE || incoming.readers || incoming.exchanging ||
+                !state->resident_at(o) || outgoing.readers || outgoing.exchanging ||
                 state->layouts[in.group].bytes > state->layouts[out.group].bytes) {
             return false;
         }
@@ -346,9 +385,11 @@ bool llama_moe_expert_store::promote(expert in, expert out) {
     auto & incoming = state->entries[i];
     auto & outgoing = state->entries[o];
     if (fetched) {
-        memcpy(state->resident_data() + outgoing.offset, stage, state->layouts[in.group].bytes);
-        incoming.offset = outgoing.offset;
-        outgoing.offset = SIZE_MAX;
+        // An outgoing expert that a GPU slot also holds stays there, now without a RAM copy.
+        const int64_t slot = loc_slot(state->loc(o));
+        memcpy(state->resident_data() + state->offset(o), stage, state->layouts[in.group].bytes);
+        state->set_loc(i, loc_ram(size_t(state->offset(o))));
+        state->set_loc(o, slot >= 0 ? loc_gpu(uint32_t(slot)) : LOC_FILE);
         incoming.file_hits = outgoing.file_hits = 0;
     }
     incoming.exchanging = outgoing.exchanging = false;
@@ -368,8 +409,8 @@ llama_moe_expert_store::exchange llama_moe_expert_store::begin_exchange(expert i
     }
     auto & incoming = state->entries[i];
     auto & outgoing = state->entries[o];
-    if (incoming.gpu || incoming.offset == SIZE_MAX || incoming.readers || incoming.exchanging ||
-            !outgoing.gpu || outgoing.readers || outgoing.exchanging) {
+    if (!state->resident_at(i) || loc_slot(state->loc(i)) >= 0 || incoming.readers || incoming.exchanging ||
+            !gpu_only(state->loc(o)) || outgoing.readers || outgoing.exchanging) {
         return result;
     }
     const uint32_t staged = state->stage();
@@ -389,7 +430,7 @@ const void * llama_moe_expert_store::exchange::incoming(uint32_t bank) const {
     }
     const auto & entry = state->entries[in];
     const auto & layout = state->layouts[entry.key.group];
-    return bank < layout.offsets.size() ? state->resident_data() + entry.offset + layout.offsets[bank] : nullptr;
+    return bank < layout.offsets.size() ? state->resident_data() + state->offset(in) + layout.offsets[bank] : nullptr;
 }
 void * llama_moe_expert_store::exchange::outgoing(uint32_t bank) const {
     if (!state) {
@@ -407,11 +448,10 @@ bool llama_moe_expert_store::exchange::commit() {
         auto & incoming = state->entries[in];
         auto & outgoing = state->entries[out];
         const size_t bytes = state->layouts[incoming.key.group].bytes;
-        std::memcpy(state->resident_data() + incoming.offset, state->staging_data() + size_t(staged) * state->stride, bytes);
-        outgoing.offset = incoming.offset;
-        incoming.offset = SIZE_MAX;
-        incoming.gpu = true;
-        outgoing.gpu = false;
+        const int64_t position = state->offset(in);
+        std::memcpy(state->resident_data() + position, state->staging_data() + size_t(staged) * state->stride, bytes);
+        state->set_loc(in, state->loc(out));
+        state->set_loc(out, loc_ram(size_t(position)));
         incoming.exchanging = outgoing.exchanging = false;
         state->busy[staged] = false;
     }
@@ -450,12 +490,70 @@ const void * llama_moe_expert_store::resident_data(expert key, uint32_t bank) co
     if (index == UINT32_MAX) {
         return nullptr;
     }
-    const auto & entry = state->entries[index];
     const auto & layout = state->layouts[key.group];
-    if (entry.gpu || entry.offset == SIZE_MAX || bank >= layout.offsets.size()) {
+    const int64_t location = state->offset(index);
+    if (location < 0 || bank >= layout.offsets.size()) {
         return nullptr;
     }
-    return state->resident_data() + entry.offset + layout.offsets[bank];
+    return state->resident_data() + location + layout.offsets[bank];
+}
+
+int64_t llama_moe_expert_store::location(expert key) const {
+    if (!state) {
+        return LOC_FILE;
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const uint32_t index = state->index(key);
+    return index == UINT32_MAX ? LOC_FILE : state->loc(index);
+}
+
+llama_moe_expert_store::tiers llama_moe_expert_store::verify() const {
+    tiers result;
+    if (!state) {
+        return result;
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    std::vector<uint8_t> expected(state->stride);
+    for (uint32_t i = 0; i < state->entries.size(); ++i) {
+        const int64_t location = state->loc(i);
+        const int64_t slot = loc_slot(location);
+        if (slot >= 0) {
+            ++result.gpu;
+            // with even ranking, expert k of a group starts in slot k
+            result.gpu_moved += uint64_t(slot) != state->entries[i].key.id;
+        }
+        if (location == LOC_FILE) {
+            ++result.file;
+        } else if (location >= 0) {
+            ++(slot >= 0 ? result.gpu_copies : result.ram);
+            const auto & layout = state->layouts[state->entries[i].key.group];
+            const uint8_t * held = state->resident_data() + loc_offset(location);
+            bool same = state->fetch(i, expected.data());
+            for (size_t bank = 0; same && bank < layout.sizes.size(); ++bank) {
+                same = std::memcmp(held + layout.offsets[bank], expected.data() + layout.offsets[bank], layout.sizes[bank]) == 0;
+            }
+            result.mismatched += !same;
+        }
+    }
+    return result;
+}
+
+int64_t * llama_moe_expert_store::locations(uint32_t group) const {
+    if (!state || !state->exchangeable || group >= state->layouts.size()) {
+        return nullptr;
+    }
+    return const_cast<int64_t *>(state->locations) + state->layouts[group].first;
+}
+
+const void * llama_moe_expert_store::resident_base() const {
+    return state && state->resident ? state->resident_data() : nullptr;
+}
+
+size_t llama_moe_expert_store::bank_offset(uint32_t group, uint32_t bank) const {
+    if (!state || group >= state->layouts.size() || bank >= state->layouts[group].offsets.size()) {
+        return SIZE_MAX;
+    }
+    return state->layouts[group].offsets[bank];
 }
 
 uint64_t llama_moe_expert_store::file_reads() const {

@@ -2907,6 +2907,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
         if (!draft_cache_enabled) {
             result.moe_expert_cache_host_pinned_size = 0;
         }
+        // The RAM expert store is sized for the target model; a draft keeps the pinned cache path.
+        result.moe_expert_store_mib = LLAMA_MOE_EXPERT_STORE_OFF;
 
         // a draft pinned to a single device doesn't need the meta wrapper an inherited -sm tensor would give it
         // (the device list is null-terminated, so a single device means size 2)

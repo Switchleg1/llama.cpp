@@ -761,6 +761,7 @@ llama_context::llama_context(
     cparams.moe_expert_split_threads = params.moe_expert_split_threads;
     cparams.moe_expert_store_mib     = params.moe_expert_store_mib;
     cparams.moe_expert_store_adapt   = params.moe_expert_store_adapt;
+    cparams.moe_expert_store_gpu_cache = params.moe_expert_store_gpu_cache;
     moe_expert_profile       = params.moe_expert_profile ? params.moe_expert_profile : "";
     if (cparams.moe_expert_split) {
         ggml_backend_moe_hybrid_configure_t configure = nullptr;
@@ -1264,6 +1265,11 @@ llama_context::~llama_context() {
             (unsigned long long) moe_hybrid_store_routes,
             (unsigned long long) (moe_hybrid_store ? moe_hybrid_store->file_reads() : 0),
             (unsigned long long) moe_hybrid_store_promotions);
+        if (moe_hybrid_store != nullptr && ggml_moe_debug_getenv("LLAMA_MOE_EXPERT_STORE_VERIFY") != nullptr) {
+            const auto tiers = moe_hybrid_store->verify();
+            LLAMA_LOG_WARN("moe-expert-store: verify ram=%zu gpu=%zu (copies %zu, moved %zu) file=%zu mismatched=%zu\n",
+                tiers.ram, tiers.gpu, tiers.gpu_copies, tiers.gpu_moved, tiers.file, tiers.mismatched);
+        }
     }
     moe_hybrid_cpu.clear();
     if (moe_hybrid_cpu_pool != nullptr) {
@@ -2099,7 +2105,7 @@ bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * dow
                 activation_q8_1 == nullptr ||
                 !llama_moe_hybrid_q8_1_store_experts(*ctx->moe_hybrid_store, group->second, layer->second.gate,
                     layer->second.up, down, experts, rows, count, activation_q8_1, q8_1_row_bytes, results,
-                    result_stride, layer->second.gelu)) {
+                    result_stride, layer->second.gelu, activation, activation_stride)) {
             return false;
         }
         ctx->moe_hybrid_store_routes += count;
@@ -2113,7 +2119,7 @@ bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * dow
     if (use_q8_1 && activation_q8_1 != nullptr && layer != ctx->moe_hybrid_q8_1_layers.end() && down != nullptr &&
             (size_t) down->ne[1] <= result_stride) {
         if (llama_moe_hybrid_q8_1_experts(layer->second.gate, layer->second.up, down, experts, rows, count,
-                activation_q8_1, q8_1_row_bytes, results, result_stride, layer->second.gelu)) {
+                activation_q8_1, q8_1_row_bytes, results, result_stride, layer->second.gelu, activation, activation_stride)) {
             ctx->moe_hybrid_q8_1_routes += count;
             return true;
         }
@@ -2238,7 +2244,8 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
         ggml_backend_buffer_type_t host_buft = model.devices.empty() ? nullptr :
             ggml_backend_dev_host_buffer_type(model.devices[0].dev);
         moe_hybrid_store = model.moe_expert_store(budget, host_buft,
-            moe_expert_profile.empty() ? ggml_moe_debug_getenv("LLAMA_MOE_EXPERT_PROFILE") : moe_expert_profile.c_str());
+            moe_expert_profile.empty() ? ggml_moe_debug_getenv("LLAMA_MOE_EXPERT_PROFILE") : moe_expert_profile.c_str(),
+            cparams.moe_expert_store_gpu_cache);
         if (!moe_hybrid_store) {
             LLAMA_LOG_ERROR("moe-expert-store: creation failed; cold routes will fail\n");
         } else {
@@ -6172,6 +6179,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_expert_promote_misses   =*/ 0,
         /*.moe_expert_store_mib        =*/ LLAMA_MOE_EXPERT_STORE_OFF,
         /*.moe_expert_store_adapt      =*/ true,
+        /*.moe_expert_store_gpu_cache  =*/ LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL,
         /*.moe_expert_profile          =*/ nullptr,
     };
 

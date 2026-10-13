@@ -405,8 +405,9 @@ static dot_fn custom_dot_for(ggml_type type) {
     }
 }
 
-// How one bank consumes the shared Q8_1 activation.
-enum bank_kind { BANK_NONE, BANK_GGML_Q8_1, BANK_GGML_Q8_0, BANK_CUSTOM };
+// How one bank consumes the shared Q8_1 activation. Q8_K banks (k-quants) take the fp32 activation quantized on
+// the CPU instead, as ggml's CPU path does.
+enum bank_kind { BANK_NONE, BANK_GGML_Q8_1, BANK_GGML_Q8_0, BANK_GGML_Q8_K, BANK_CUSTOM };
 
 static bank_kind kind_for(ggml_type type) {
     // Types that already pair with Q8_1 or Q8_0 on the CPU: ggml's SIMD kernels take the GPU's bytes,
@@ -417,7 +418,15 @@ static bank_kind kind_for(ggml_type type) {
         if (traits->vec_dot_type == GGML_TYPE_Q8_1) return BANK_GGML_Q8_1;
         if (traits->vec_dot_type == GGML_TYPE_Q8_0) return BANK_GGML_Q8_0;
     }
-    return custom_dot_for(type) != nullptr ? BANK_CUSTOM : BANK_NONE;
+    // Custom kernels take the GPU's Q8_1 bytes, so they win over a Q8_K requantization.
+    if (custom_dot_for(type) != nullptr) {
+        return BANK_CUSTOM;
+    }
+    if (traits != nullptr && traits->vec_dot != nullptr && traits->vec_dot_type == GGML_TYPE_Q8_K &&
+            ggml_blck_size(type) == QK_K) {
+        return BANK_GGML_Q8_K;
+    }
+    return BANK_NONE;
 }
 
 static void repack_q8_0(const block_q8_1 * x, block_q8_0 * y, int64_t n_blocks) {
@@ -429,11 +438,12 @@ static void repack_q8_0(const block_q8_1 * x, block_q8_0 * y, int64_t n_blocks) 
 
 // One row of a bank against the shared activation, in whichever form that bank consumes.
 static float bank_dot(ggml_type type, bank_kind kind, const char * row, const block_q8_1 * x1,
-        const block_q8_0 * x0, int64_t n) {
+        const block_q8_0 * x0, int64_t n, const void * xk = nullptr) {
     float s = 0.0f;
     switch (kind) {
         case BANK_GGML_Q8_1: ggml_get_type_traits_cpu(type)->vec_dot((int) n, &s, 0, row, 0, x1, 0, 1); return s;
         case BANK_GGML_Q8_0: ggml_get_type_traits_cpu(type)->vec_dot((int) n, &s, 0, row, 0, x0, 0, 1); return s;
+        case BANK_GGML_Q8_K: ggml_get_type_traits_cpu(type)->vec_dot((int) n, &s, 0, row, 0, xk, 0, 1); return s;
         case BANK_CUSTOM:    return custom_dot_for(type)(row, x1, n);
         default:             return 0.0f;
     }
@@ -560,11 +570,17 @@ bool llama_moe_hybrid_q8_1_supported(const ggml_tensor * gate, const ggml_tensor
         down->ne[0] % ggml_blck_size(down->type) == 0 && gate->ne[0] % QK8_1 == 0 && down->ne[0] % QK8_1 == 0;
 }
 
+// Q8_K banks quantize the fp32 activation on the CPU, so they need it.
+static bool q8_k_input_ok(const ggml_tensor * gate, const ggml_tensor * up, const float * x_f32, size_t x_f32_stride) {
+    const bool needed = kind_for(gate->type) == BANK_GGML_Q8_K || kind_for(up->type) == BANK_GGML_Q8_K;
+    return !needed || (x_f32 != nullptr && x_f32_stride >= (size_t) gate->ne[0]);
+}
+
 // Expert e of each bank starts at base[bank][e]. Callers validate ids against their base tables.
 static void q8_1_experts_core(
         const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down, const char * const * bases[3],
         const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
-        float * out, size_t out_stride, bool gelu) {
+        float * out, size_t out_stride, bool gelu, const float * x_f32, size_t x_f32_stride) {
     int32_t max_row = 0;
     for (uint32_t i = 0; i < count; ++i) {
         max_row = std::max(max_row, rows != nullptr ? rows[i] : 0);
@@ -616,10 +632,20 @@ static void q8_1_experts_core(
                 x0.data() + (size_t) row * x_blocks, x_blocks);
         }
     }
+    thread_local std::vector<char> xk, actk;
+    const auto q8_k_from_float = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)->from_float;
+    const size_t xk_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, n_embd);
+    if (gate_kind == BANK_GGML_Q8_K || up_kind == BANK_GGML_Q8_K) {
+        xk.resize((size_t) (max_row + 1) * xk_row_bytes);
+        for (int32_t row = 0; row <= max_row; ++row) {
+            q8_k_from_float(x_f32 + (size_t) row * x_f32_stride, xk.data() + (size_t) row * xk_row_bytes, n_embd);
+        }
+    }
     act.resize((size_t) count * n_ff);
     act1.resize((size_t) count * ff_blocks);
     float * act_data = act.data();
     const block_q8_0 * x0_data = x0.data();
+    const char * xk_data = xk.data();
 
     // Job = (group, weight row): the weight row comes from DRAM once, every route of the group reuses it.
     pool().run(n_groups * n_ff, 16, [&](int64_t begin, int64_t end) {
@@ -632,8 +658,9 @@ static void q8_1_experts_core(
                 const uint32_t route = order_p[k];
                 const int32_t r = rows != nullptr ? rows[route] : 0;
                 const block_q8_0 * x0_row = x0_data != nullptr ? x0_data + (size_t) r * x_blocks : nullptr;
-                const float gv = bank_dot(gate->type, gate_kind, g_row, x_row(route), x0_row, n_embd);
-                const float uv = bank_dot(up->type, up_kind, u_row, x_row(route), x0_row, n_embd);
+                const char * xk_row = xk_data != nullptr ? xk_data + (size_t) r * xk_row_bytes : nullptr;
+                const float gv = bank_dot(gate->type, gate_kind, g_row, x_row(route), x0_row, n_embd, xk_row);
+                const float uv = bank_dot(up->type, up_kind, u_row, x_row(route), x0_row, n_embd, xk_row);
                 const float a = gelu ? 0.5f*gv*(1.0f + std::tanh(0.7978845608f*(gv + 0.044715f*gv*gv*gv)))
                                      : gv / (1.0f + std::exp(-gv));
                 act_data[(size_t) route * n_ff + row] = a * uv;
@@ -647,9 +674,17 @@ static void q8_1_experts_core(
         act0.resize((size_t) count * ff_blocks);
         repack_q8_0(act1.data(), act0.data(), (int64_t) count * ff_blocks);
     }
+    const size_t actk_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, n_ff);
+    if (down_kind == BANK_GGML_Q8_K) {
+        actk.resize((size_t) count * actk_row_bytes);
+        for (uint32_t route = 0; route < count; ++route) {
+            q8_k_from_float(act.data() + (size_t) route * n_ff, actk.data() + (size_t) route * actk_row_bytes, n_ff);
+        }
+    }
 
     const block_q8_1 * act1_data = act1.data();
     const block_q8_0 * act0_data = act0.data();
+    const char * actk_data = actk.data();
     pool().run(n_groups * n_out, 32, [&](int64_t begin, int64_t end) {
         for (int64_t job = begin; job < end; ++job) {
             const int64_t g = job / n_out, row = job % n_out;
@@ -658,7 +693,8 @@ static void q8_1_experts_core(
             for (uint32_t k = begin_p[g]; k < begin_p[g + 1]; ++k) {
                 const uint32_t route = order_p[k];
                 out[(size_t) route * out_stride + row] = bank_dot(down->type, down_kind, d_row,
-                    act1_data + (size_t) route * ff_blocks, act0_data + (size_t) route * ff_blocks, down->ne[0]);
+                    act1_data + (size_t) route * ff_blocks, act0_data + (size_t) route * ff_blocks, down->ne[0],
+                    actk_data != nullptr ? actk_data + (size_t) route * actk_row_bytes : nullptr);
             }
         }
     });
@@ -667,9 +703,10 @@ static void q8_1_experts_core(
 bool llama_moe_hybrid_q8_1_experts(
         const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
         const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
-        float * out, size_t out_stride, bool gelu) {
+        float * out, size_t out_stride, bool gelu, const float * x_f32, size_t x_f32_stride) {
     if (!llama_moe_hybrid_q8_1_supported(gate, up, down) || x_q8_1 == nullptr || out == nullptr ||
-            experts == nullptr || count == 0 || (size_t) down->ne[1] > out_stride) {
+            experts == nullptr || count == 0 || (size_t) down->ne[1] > out_stride ||
+            !q8_k_input_ok(gate, up, x_f32, x_f32_stride)) {
         return false;
     }
     for (uint32_t i = 0; i < count; ++i) {
@@ -687,7 +724,8 @@ bool llama_moe_hybrid_q8_1_experts(
         }
         bases[b] = table[b].data();
     }
-    q8_1_experts_core(gate, up, down, bases, experts, rows, count, x_q8_1, x_row_bytes, out, out_stride, gelu);
+    q8_1_experts_core(gate, up, down, bases, experts, rows, count, x_q8_1, x_row_bytes, out, out_stride, gelu,
+        x_f32, x_f32_stride);
     return true;
 }
 
@@ -695,8 +733,9 @@ bool llama_moe_hybrid_q8_1_store_experts(
         llama_moe_expert_store & store, uint32_t group,
         const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
         const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
-        float * out, size_t out_stride, bool gelu) {
+        float * out, size_t out_stride, bool gelu, const float * x_f32, size_t x_f32_stride) {
     if (!llama_moe_hybrid_q8_1_supported(gate, up, down) || !experts || !x_q8_1 || !out || !count || count > 64 ||
+            !q8_k_input_ok(gate, up, x_f32, x_f32_stride) ||
             gate->ne[0] <= 0 || gate->ne[1] <= 0 || down->ne[1] <= 0 || gate->ne[0] != up->ne[0] ||
             gate->ne[1] != up->ne[1] || gate->ne[2] != up->ne[2] || gate->ne[2] != down->ne[2] ||
             gate->ne[1] != down->ne[0] || uint64_t(down->ne[1]) > out_stride ||
@@ -758,7 +797,7 @@ bool llama_moe_hybrid_q8_1_store_experts(
         }
         const char * const * bases[3] = {table[0].data(), table[1].data(), table[2].data()};
         q8_1_experts_core(gate, up, down, bases, local.data(), local_rows.data(), uint32_t(local.size()),
-            x_q8_1, x_row_bytes, chunk_out.data(), n_out, gelu);
+            x_q8_1, x_row_bytes, chunk_out.data(), n_out, gelu, x_f32, x_f32_stride);
         for (size_t k = 0; k < routes.size(); ++k) {
             memcpy(output.data() + routes[k] * n_out, chunk_out.data() + k * n_out, n_out * sizeof(float));
         }

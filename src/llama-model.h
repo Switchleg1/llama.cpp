@@ -806,7 +806,7 @@ struct llama_model {
     // One store shared by every context of this model, built on first use. Fully resident banks become the GPU
     // fill sources of grouped resources created afterwards. Returns null when the store cannot be built.
     llama_moe_expert_store * moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft,
-        const char * profile_path) const;
+        const char * profile_path, int32_t gpu_cache = LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL) const;
     // Promotes a file-backed expert into a resident expert's RAM position and repoints the GPU fill sources.
     // Call only while no grouped work or cold-expert computation of this model is in flight.
     bool moe_expert_store_promote(llama_moe_expert_store::expert in, llama_moe_expert_store::expert out) const;
@@ -815,7 +815,7 @@ struct llama_model {
         const std::vector<llama_moe_expert_store::expert> & gpu,
         const std::vector<llama_moe_expert_store::expert> & rank,
         size_t resident_budget, size_t staging_budget, uint32_t max_staged,
-        ggml_backend_buffer_type_t host_buft = nullptr) const;
+        ggml_backend_buffer_type_t host_buft = nullptr, uint32_t gpu_copies = 0) const;
     llama_moe_placement_report                   moe_placement() const;
     void record_tensor_override_resolution(
         std::string tensor_name, uint32_t origin, int32_t index, std::string pattern,

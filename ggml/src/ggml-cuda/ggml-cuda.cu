@@ -3183,7 +3183,9 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     std::vector<int32_t> source_wait_class_host;
     ggml_cuda_pool_alloc<uint32_t> stage_ready(ctx.pool());
     int stage_ready_capacity = 0;
-    if (overflow && !compact_source && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
+    // Split staging writes the cache slots, which exchange residency shares with grouped execution.
+    if (overflow && !compact_source && ggml_cuda_moe_cache_can_overlap_staging(cache) &&
+            !ggml_backend_cuda_moe_is_exchange_tensor(src0)) {
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
         GGML_ASSERT(n_slots > 0);
         const size_t n_staging_waves = 1 + ((size_t) n_unique - 1) / (size_t) n_slots;
@@ -3684,7 +3686,9 @@ static void ggml_cuda_mul_mat_id_cached(
     std::vector<int32_t> expert_to_slot(n_experts_total, -1);
     std::vector<int32_t> unique_eids;
     unique_eids.reserve(std::min<int64_t>(n_experts_total, 64));
-    bool overflow = false;
+    // Exchange residency: only the shared slots hold some experts, so stage every call instead of filling slots.
+    const bool exchange = ggml_backend_cuda_moe_is_exchange_tensor(src0);
+    bool overflow = exchange;
     for (int64_t i2 = 0; i2 < ids_ne2 && !overflow; ++i2) {
         for (int64_t i1 = 0; i1 < ids_ne1 && !overflow; ++i1) {
             for (int64_t i0 = 0; i0 < ids_ne0 && !overflow; ++i0) {
@@ -3703,7 +3707,7 @@ static void ggml_cuda_mul_mat_id_cached(
     }
 
     if (overflow) {
-        if (ids_group_pending && leased_owner != nullptr) {
+        if (ids_group_pending && leased_owner != nullptr && !exchange) {
             leased_owner->prefetch_legacy_siblings(
                 cache_lease, unique_eids.data(), (int) unique_eids.size(), telemetry_is_decode);
         }
@@ -8964,6 +8968,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_expert_sources;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_SET_EXPERT_EXCHANGE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_set_expert_exchange;
     }
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_COLD_FAILURES_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_hybrid_cold_failures;

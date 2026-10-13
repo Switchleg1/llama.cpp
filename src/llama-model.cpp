@@ -1236,6 +1236,7 @@ struct llama_model::impl {
     std::unique_ptr<llama_moe_expert_store> moe_store;
     std::vector<const ggml_tensor *> moe_store_registered;
     ggml_backend_moe_set_expert_sources_t moe_set_expert_sources = nullptr;
+    ggml_backend_moe_set_expert_exchange_t moe_set_expert_exchange = nullptr;
     ggml_backend_moe_update_expert_source_t moe_update_expert_source = nullptr;
 
     buft_list_t cpu_buft_list;
@@ -3268,7 +3269,7 @@ bool llama_moe_write_expert_profile(const char * path, const std::vector<std::ve
 }
 
 llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft,
-        const char * profile_path) const {
+        const char * profile_path, int32_t gpu_cache) const {
     std::lock_guard<std::mutex> lock(pimpl->moe_store_mutex);
     if (pimpl->moe_store_attempted) {
         return pimpl->moe_store.get();
@@ -3315,15 +3316,34 @@ llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, g
         });
     }
     LLAMA_LOG_INFO("%s: residency ranking: %s\n", __func__, profile.empty() ? "even across layers" : "usage profile");
-    pimpl->moe_store = create_moe_expert_store({}, rank, resident_budget, 16 * bundle, 16, host_buft);
+    for (size_t i = 0; i < ggml_backend_reg_count() && !pimpl->moe_set_expert_sources; ++i) {
+        pimpl->moe_set_expert_sources = (ggml_backend_moe_set_expert_sources_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_reg_get(i), GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME);
+        pimpl->moe_set_expert_exchange = (ggml_backend_moe_set_expert_exchange_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_reg_get(i), GGML_BACKEND_MOE_SET_EXPERT_EXCHANGE_PROC_NAME);
+    }
+    // Fewer RAM copies than GPU slots (Strata's complement at 0): each group's top-ranked experts start in its GPU
+    // slots, the lowest-ranked gpu_cache of them also keep a RAM copy, RAM holds the rest by rank, and the GPU trades
+    // experts with the store. Needs pinned memory and a uniform slot count.
+    const int32_t n_slots = moe_expert_cache_slots();
+    const bool want_exchange = gpu_cache >= 0 && gpu_cache < n_slots;
+    std::vector<llama_moe_expert_store::expert> gpu;
+    if (want_exchange && host_buft != nullptr && pimpl->moe_cache_byte_budgets_owned.empty() &&
+            pimpl->moe_set_expert_sources && pimpl->moe_set_expert_exchange) {
+        std::vector<uint32_t> taken(pimpl->moe_sources.size(), 0);
+        for (const auto & key : rank) {
+            if (taken[key.group] < uint32_t(n_slots)) {
+                gpu.push_back(key);
+                ++taken[key.group];
+            }
+        }
+    }
+    pimpl->moe_store = create_moe_expert_store(gpu, rank, resident_budget, 16 * bundle, 16, host_buft,
+        uint32_t(std::max(gpu_cache, 0)));
     if (!pimpl->moe_store) {
         return nullptr;
     }
     auto & store = *pimpl->moe_store;
-    for (size_t i = 0; i < ggml_backend_reg_count() && !pimpl->moe_set_expert_sources; ++i) {
-        pimpl->moe_set_expert_sources = (ggml_backend_moe_set_expert_sources_t) ggml_backend_reg_get_proc_address(
-            ggml_backend_reg_get(i), GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME);
-    }
     for (size_t i = 0; i < ggml_backend_reg_count() && !pimpl->moe_update_expert_source; ++i) {
         pimpl->moe_update_expert_source = (ggml_backend_moe_update_expert_source_t) ggml_backend_reg_get_proc_address(
             ggml_backend_reg_get(i), GGML_BACKEND_MOE_UPDATE_EXPERT_SOURCE_PROC_NAME);
@@ -3348,13 +3368,21 @@ llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, g
                 if (pimpl->moe_set_expert_sources(bank.tensor, hosts.data(), n, bank.tensor->nb[2])) {
                     pimpl->moe_store_registered.push_back(bank.tensor);
                     registered_bytes += held * bank.tensor->nb[2];
+                    if (store.locations(g) != nullptr && !pimpl->moe_set_expert_exchange(bank.tensor, store.locations(g),
+                            store.resident_base(), store.bank_offset(g, index - 1))) {
+                        LLAMA_LOG_ERROR("%s: exchange residency registration failed for %s\n", __func__, bank.tensor->name);
+                    }
                 }
             }
         }
     }
-    LLAMA_LOG_INFO("%s: resident=%.2f MiB staging=%.2f MiB pinned=%d gpu_source_banks=%zu (%.2f MiB)\n", __func__,
-        store.resident_bytes() / 1048576.0, store.staging_bytes() / 1048576.0, (int) store.pinned(),
-        pimpl->moe_store_registered.size(), registered_bytes / 1048576.0);
+    LLAMA_LOG_INFO("%s: resident=%.2f MiB staging=%.2f MiB pinned=%d gpu_source_banks=%zu (%.2f MiB) gpu_only=%zu\n",
+        __func__, store.resident_bytes() / 1048576.0, store.staging_bytes() / 1048576.0, (int) store.pinned(),
+        pimpl->moe_store_registered.size(), registered_bytes / 1048576.0, store.locations(0) != nullptr ? gpu.size() : 0);
+    if (want_exchange && store.locations(0) == nullptr) {
+        LLAMA_LOG_WARN("%s: --moe-expert-store-gpu-cache %d needs pinned store memory and a uniform slot count; "
+            "the store holds GPU experts too\n", __func__, gpu_cache);
+    }
     return pimpl->moe_store.get();
 }
 
@@ -3362,7 +3390,7 @@ std::unique_ptr<llama_moe_expert_store> llama_model::create_moe_expert_store(
         const std::vector<llama_moe_expert_store::expert> & gpu,
         const std::vector<llama_moe_expert_store::expert> & rank,
         size_t resident_budget, size_t staging_budget, uint32_t max_staged,
-        ggml_backend_buffer_type_t host_buft) const {
+        ggml_backend_buffer_type_t host_buft, uint32_t gpu_copies) const {
     const auto & sources = pimpl->moe_file_sources;
     if (!sources) {
         LLAMA_LOG_ERROR("%s: compatible retained GGUF expert sources are unavailable\n", __func__);
@@ -3370,7 +3398,7 @@ std::unique_ptr<llama_moe_expert_store> llama_model::create_moe_expert_store(
     }
     auto store = std::make_unique<llama_moe_expert_store>();
     if (!store->init(sources->geometry, gpu, rank, resident_budget, staging_budget, max_staged,
-                     llama_moe_file_sources::read, sources.get(), sources, host_buft)) {
+                     llama_moe_file_sources::read, sources.get(), sources, host_buft, gpu_copies)) {
         return nullptr;
     }
     return store;

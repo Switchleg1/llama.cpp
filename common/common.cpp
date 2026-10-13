@@ -1357,7 +1357,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.moe_expert_cache_host_pinned_size > 0) {
+    if (params.moe_expert_cache_host_pinned_size > 0 && params.moe_expert_cache_host_pinned_size != LLAMA_MOE_HOST_PINNED_OFF) {
         COM_INF("%s: MoE expert cache host-pinned budget = %.2f MiB (%zu bytes)\n", __func__,
             params.moe_expert_cache_host_pinned_size / (1024.0 * 1024.0),
             params.moe_expert_cache_host_pinned_size);
@@ -1859,6 +1859,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_expert_promote_misses = params.moe_expert_promote_misses;
     cparams.moe_expert_store_mib      = params.moe_expert_store_mib;
     cparams.moe_expert_store_adapt    = params.moe_expert_store_adapt;
+    cparams.moe_expert_store_gpu_cache = params.moe_expert_store_gpu_cache;
     cparams.moe_expert_profile        = params.moe_expert_profile.empty() ? nullptr : params.moe_expert_profile.c_str();
 
     return cparams;

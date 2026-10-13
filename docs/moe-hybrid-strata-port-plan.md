@@ -2393,3 +2393,56 @@ Checks (IQ3_S, KLD harness, 32 slots):
 Server with the converted tuned configuration (flags only, no environment): output hash identical to the env-gated runs. Speed was not judged, because the machine was in light use. Full MoE suites (store, insertion, full normally and with auto-pin, pageable fallback) and all 3 CTests in both modes passed.
 
 Remaining baseline steps: KV resident (design below), then the smoke suite.
+
+### 4a: sparse QSA attention for small batches
+
+`src/models/qwen4exp.cpp`: for up to 8 tokens, QSA attention gathers the K/V rows and mask entries of the indexer's selected cells (`top_k`) and attends over those only, instead of masking all cells. The softmax covers the same cells; only the summation order differs. Debug `LLAMA_QSA_DENSE` restores the dense path. At 4K context (KLD against a dense, flash-attention base): sparse ub=1 0.004528-0.004883, ub=4 0.005667-0.006355; dense with flash attention off against the same base 0.005543 (ub=1), dense ub=4 0.006265. Not yet validated at 16K and longer, and no speed claim yet.
+
+### Pinned sources by default
+
+`--moe-expert-cache-host-pinned-mb` now defaults to `auto`: total RAM less max(2 GiB, 20%), as `LLAMA_MOE_AUTO_PIN` did. `off` keeps pageable sources (`LLAMA_MOE_HOST_PINNED_OFF`). With a RAM expert store, the automatic budget is skipped, since the store pins its own copies. A KLD run at 4K context without an explicit budget had pageable sources: ub=4 took 452 s against 208 s pinned. A draft no longer inherits the target's store (`common_base_params_to_speculative`): it keeps the pinned cache path. Before this change, the MTP draft copied its experts from its own store every call, about 30 MiB per token.
+
+### Exchange residency and `--moe-expert-store-gpu-cache`
+
+`--moe-expert-store-gpu-cache N|all` (default `all`) sets, per layer, how many of the GPU's experts the RAM store also holds. `all` is the earlier store. With fewer, the GPU trades experts with the store: `0` is Strata's complement (`--resident-budget-gib`), where RAM holds only experts that no GPU slot holds.
+
+- Store: one location per expert in pinned memory, which the GPU writes. Values are -1 (file), -2 - slot (only that GPU slot holds it), or a byte offset with slot + 1 in bits 40 and up (a GPU slot also holds it). Store init places each layer's top-ranked experts in its slots; the lowest-ranked `N` of them keep a RAM copy.
+- Backend (`GGML_BACKEND_MOE_SET_EXPERT_EXCHANGE`): the grouped resource seeds the slots from the GGUF tensor data when it is built, and keeps per-expert source tables (no affine shortcut).
+- In-step trades: when the planner evicts a resident without a RAM copy, it points the resident at the incoming expert's RAM position. The gather then swaps the bytes word by word. A resident with a copy is overwritten, and the incoming expert keeps its copy. Among equally frequent candidates, residents with a copy are evicted first. Each fill keeps the number of copied GPU experts constant.
+- Batched trades (Strata's timing, debug `LLAMA_MOE_HYBRID_ADAPT_EVERY/SWAPS` with `--moe-expert-promote 0`) use the same rules through two small kernels.
+- Prompt processing: per-tensor caches never write exchange slots. Every call stages into scratch, taking slot experts device to device, RAM experts from the store and the rest from the file. A legacy handoff reset rebuilds the slot maps from the locations instead of clearing them.
+- `LLAMA_MOE_EXPERT_STORE_VERIFY` (debug) rereads every RAM expert from the GGUF at exit and compares bytes.
+
+The shared CPU kernel also covers k-quants now. Banks whose ggml dot takes Q8_K (Q4_K, Q5_K and similar) quantize the fp32 activation on the CPU, as ggml's CPU path does; custom Q8_1 kernels keep priority (IQ4_XS). Store mode previously failed Q4_K_XL with strict cold-packet errors, because no layer was covered.
+
+Correctness (IQ3_S KLD harness, 32 slots, 8 GiB store; the CPU/GPU split differs between modes, so their KLDs differ slightly):
+
+| gpu-cache | KLD | verify |
+| --- | --- | --- |
+| all | 0.006806 +- 0.001227 (unchanged) | 4,199 RAM experts, 0 mismatched |
+| 16 | 0.009581 +- 0.001721 | 3,499 RAM + 700 copies, 1,498 of 1,536 GPU experts moved, 0 mismatched |
+| 0 | 0.008657 +- 0.001856 | 1,516 of 1,536 GPU experts moved, 0 mismatched |
+| 0, batched trades | 0.007880 +- 0.001346 | 1,516 moved, 0 mismatched |
+| 16, ub=128 | 0.012207 (identical to before) | 0 mismatched |
+
+Speed, 512-token driver with MTP, mean of requests 2-4, fixed usage profile copied before every run (each run rewrites its profile at exit, which confounded earlier rounds):
+
+| gpu-cache | IQ3_S, 77 slots | RAM saved | Q4_K_XL, 46 slots, auto store | RAM saved |
+| --- | --- | --- | --- | --- |
+| all | 63.0 (first run 58.3) | 0 | 44.8 / 47.2 | 0 |
+| 60 / 32 | 62.1 / 62.4 | 1.6 GiB | 46.4 / 44.8 | 2.0 GiB |
+| 40 / 16 | 61.1 / 61.2 | 3.4 GiB | 43.8 / 39.1 | 4.2 GiB |
+| 20 | 56.7 / 56.8 | 5.2 GiB | | |
+| 0 | 56.6 / 58.1 | 7.0 GiB | 27.5 / 34.6 | 6.3 GiB |
+
+Legacy pinned (no store) measured 66-68 tok/s on IQ3_S and 45-46 on Q4_K_XL in the same sessions. Batched trades at gpu-cache 0 were not faster than in-step trades once a profile was used (IQ3_S 55.7-58.2).
+
+The cost is the write-back. In-step promotion moves about 4 MB per call, about 100 MB per token. `build/exchange-bench.cu`: a zero-copy gather of five 2 MiB experts takes 206 us (51 GB/s); with an in-kernel write-back, 420 us. Victims staged in device memory and written back by a copy engine leave the gather at 207 us alone, but slow a concurrent gather to 335 us. The link here behaves like one shared budget of about 50-60 GB/s.
+
+On this 96 GB machine, the working set of the driver workload fits the store at every budget tried. 99% of profiled expert uses fall on about 55% of the experts, and file reads go through the OS file cache. A duplicate store at 36 GiB (IQ3_S) read nothing from the file; at 24 GiB the complement cut file reads from 16,857 to 3,085 but the speed was a tie. Complement layouts are for RAM that cannot hold the working set; that case is not measured here, since file reads would need to bypass the OS cache, as Strata's budgeted file tier does.
+
+Known failure, earlier than this work: `test-llama-archs` stops at tied-embedding models (gemma, cohere2) with "conflicting placement provenance for tensor token_embd.weight" (`build/prerequisite-ctest-main.log`, 2026-10-10). The other suites pass: MoE store, full and pageable; MoE CTests; arg parser; `test-backend-ops -o MUL_MAT` 1297/1297.
+
+Artifacts: `build/qwen-kld-hybrid-gc*.log`, `build/qwen-kld-hybrid-exch8192*.log`, `build/ab-i3-gc*.json`, `build/ab-q4-gc*.json`, `build/ab-st{24,36}-*.json`, `build/nsys-{legacy,exch,nocomp}-decode.json`, `build/exchange-bench.cu`, `build/archs-fail.log`.
+
+Next: an automatic `gpu-cache` (grow and shrink by write-back and file-read rates) is deferred. Remaining baseline work: 4a validation at 16K and longer, `--kv-resident`, the smoke suite.

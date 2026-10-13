@@ -2982,17 +2982,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_MIB"));
     add_opt(common_arg(
-        {"--moe-expert-cache-host-pinned-mb"}, "N",
+        {"--moe-expert-cache-host-pinned-mb"}, "N|auto|off",
         "MoE expert cache: model-wide pinned host budget in MiB, including source weights and staging. "
-        "0 tries full pinning, then automatically registers complete groups after pageable fallback (default).",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        "auto: total RAM less max(2 GiB, 20%) (default; not with a RAM expert store, which pins its own copies); "
+        "off: pageable sources.",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_expert_cache_host_pinned_size = 0;
+                return;
+            }
+            if (value == "off") {
+                params.moe_expert_cache_host_pinned_size = LLAMA_MOE_HOST_PINNED_OFF;
+                return;
+            }
+            const long long mib = std::stoll(value);
+            if (mib < 0 || (uint64_t) mib > SIZE_MAX / (1024 * 1024) - 1) {
                 throw std::invalid_argument("invalid value");
             }
-            if ((uint64_t) value > SIZE_MAX / (1024 * 1024)) {
-                throw std::invalid_argument("pinned host budget is too large");
-            }
-            params.moe_expert_cache_host_pinned_size = (size_t) value * 1024 * 1024;
+            params.moe_expert_cache_host_pinned_size = (size_t) mib * 1024 * 1024;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_HOST_PINNED_MB"));
     add_opt(common_arg(
@@ -3058,6 +3065,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_STORE_ADAPT"));
+    add_opt(common_arg(
+        {"--moe-expert-store-gpu-cache"}, "N|all",
+        "MoE expert store: how many of each layer's GPU experts the store also keeps in RAM. With fewer than all, "
+        "the GPU trades experts with the store, which saves RAM at some speed cost (needs pinned memory); 0 keeps "
+        "no copies (default: all)",
+        [](common_params & params, const std::string & value) {
+            if (value == "all") {
+                params.moe_expert_store_gpu_cache = LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL;
+                return;
+            }
+            const int n = std::stoi(value);
+            if (n < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_store_gpu_cache = n;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_STORE_GPU_CACHE"));
     add_opt(common_arg(
         {"--moe-expert-profile"}, "FNAME",
         "MoE expert store: expert usage profile; ranks what the store keeps in RAM and is updated at exit",

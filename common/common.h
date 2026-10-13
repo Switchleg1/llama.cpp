@@ -554,6 +554,7 @@ struct common_params {
     int32_t moe_expert_promote_misses = 0;
     int64_t moe_expert_store_mib      = LLAMA_MOE_EXPERT_STORE_OFF; // --moe-expert-store-mb
     bool    moe_expert_store_adapt    = true; // --moe-expert-store-adapt
+    int32_t moe_expert_store_gpu_cache = LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL; // --moe-expert-store-gpu-cache
     std::string moe_expert_profile;           // --moe-expert-profile
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)

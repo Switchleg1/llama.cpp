@@ -1171,6 +1171,9 @@ bool ggml_backend_cuda_moe_update_expert_source(const ggml_tensor * tensor, uint
 void ggml_backend_cuda_moe_set_expert_prior(const ggml_tensor * tensor, const float * scores, uint32_t n);
 void ggml_backend_cuda_moe_adapt_residency(ggml_backend_t backend);
 bool ggml_backend_cuda_moe_set_expert_sources(const ggml_tensor * tensor, const void * const * hosts, uint32_t n_experts, size_t stride);
+bool ggml_backend_cuda_moe_set_expert_exchange(const ggml_tensor * tensor, int64_t * locations, const void * resident_base, size_t bank_offset);
+// True for a bank with exchange residency: per-tensor caches must not write the shared slots.
+bool ggml_backend_cuda_moe_is_exchange_tensor(const ggml_tensor * tensor);
 uint64_t ggml_backend_cuda_moe_hybrid_cold_failures(void);
 ggml_cuda_moe_stream_t ggml_cuda_moe_owner_stream_for_test(ggml_backend_t backend);
 

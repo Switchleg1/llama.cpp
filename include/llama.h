@@ -235,6 +235,11 @@ extern "C" {
         LLAMA_MOE_EXPERT_SPLIT_AUTO = 2,
     };
 
+    // moe_expert_store_gpu_cache: per layer, how many of the GPU's experts the RAM store also holds. With fewer than
+    // every one, the GPU trades experts with the store and writes back evicted experts without a RAM copy (needs
+    // pinned memory). 0 is Strata's low-RAM layout.
+    #define LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL (-1)
+    #define LLAMA_MOE_HOST_PINNED_OFF ((size_t) -1) // moe_expert_cache_host_pinned_size: do not pin expert sources
     #define LLAMA_MOE_EXPERT_STORE_OFF  (-1) // moe_expert_store_mib: no RAM expert store
     #define LLAMA_MOE_EXPERT_STORE_AUTO (-2) // moe_expert_store_mib: size the store from available RAM
 
@@ -358,7 +363,8 @@ extern "C" {
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         int32_t moe_expert_cache_slots; // # of MoE expert slabs to keep cached on GPU (LRU). 0 = disabled.
-        size_t moe_expert_cache_host_pinned_size; // model-wide pinned host budget in bytes; 0 keeps full pinning
+        size_t moe_expert_cache_host_pinned_size; // model-wide pinned host budget in bytes; 0: automatic from RAM,
+                                                  // LLAMA_MOE_HOST_PINNED_OFF: pageable sources
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
@@ -491,6 +497,7 @@ extern "C" {
         int32_t      moe_expert_promote_misses; // CPU calls before an expert may be promoted, <= 0: default (2)
         int64_t      moe_expert_store_mib;      // RAM expert store size, LLAMA_MOE_EXPERT_STORE_OFF or _AUTO
         bool         moe_expert_store_adapt;    // promote experts read from the file tier into the store
+        int32_t      moe_expert_store_gpu_cache; // GPU experts per layer the store also holds, or _GPU_CACHE_ALL
         const char * moe_expert_profile;        // expert usage profile, read for ranking and updated at exit; NULL: none
     };
 
