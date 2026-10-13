@@ -805,7 +805,8 @@ struct llama_model {
     void retain_moe_file_sources(const llama_model_loader & ml);
     // One store shared by every context of this model, built on first use. Fully resident banks become the GPU
     // fill sources of grouped resources created afterwards. Returns null when the store cannot be built.
-    llama_moe_expert_store * moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft) const;
+    llama_moe_expert_store * moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft,
+        const char * profile_path) const;
     // Promotes a file-backed expert into a resident expert's RAM position and repoints the GPU fill sources.
     // Call only while no grouped work or cold-expert computation of this model is in flight.
     bool moe_expert_store_promote(llama_moe_expert_store::expert in, llama_moe_expert_store::expert out) const;

@@ -548,6 +548,13 @@ struct common_params {
     std::vector<llama_model_layer_range> moe_expert_cache_layer_ranges;
     std::vector<size_t> moe_expert_cache_byte_budgets;
     bool moe_early_router = false;
+    enum llama_moe_expert_split moe_expert_split = LLAMA_MOE_EXPERT_SPLIT_OFF; // --moe-expert-split
+    int32_t moe_expert_split_threads  = 0;  // --moe-expert-split-threads, <= 0: logical cores - 1
+    int32_t moe_expert_promote_budget = -1; // --moe-expert-promote B[:M], < 0: default
+    int32_t moe_expert_promote_misses = 0;
+    int64_t moe_expert_store_mib      = LLAMA_MOE_EXPERT_STORE_OFF; // --moe-expert-store-mb
+    bool    moe_expert_store_adapt    = true; // --moe-expert-store-adapt
+    std::string moe_expert_profile;           // --moe-expert-profile
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale

@@ -1775,6 +1775,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
     mparams.moe_early_router = params.moe_early_router;
+    mparams.moe_expert_store = params.moe_expert_store_mib != LLAMA_MOE_EXPERT_STORE_OFF;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1851,6 +1852,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+
+    cparams.moe_expert_split          = params.moe_expert_split;
+    cparams.moe_expert_split_threads  = params.moe_expert_split_threads;
+    cparams.moe_expert_promote_budget = params.moe_expert_promote_budget;
+    cparams.moe_expert_promote_misses = params.moe_expert_promote_misses;
+    cparams.moe_expert_store_mib      = params.moe_expert_store_mib;
+    cparams.moe_expert_store_adapt    = params.moe_expert_store_adapt;
+    cparams.moe_expert_profile        = params.moe_expert_profile.empty() ? nullptr : params.moe_expert_profile.c_str();
 
     return cparams;
 }

@@ -227,6 +227,17 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_DRAFT   = 2,
     };
 
+    // MoE expert split: with an expert cache, experts that miss it run on the CPU while the GPU computes the
+    // cached ones. AUTO enables it when the model has an expert cache and the backend supports it.
+    enum llama_moe_expert_split {
+        LLAMA_MOE_EXPERT_SPLIT_OFF  = 0,
+        LLAMA_MOE_EXPERT_SPLIT_ON   = 1,
+        LLAMA_MOE_EXPERT_SPLIT_AUTO = 2,
+    };
+
+    #define LLAMA_MOE_EXPERT_STORE_OFF  (-1) // moe_expert_store_mib: no RAM expert store
+    #define LLAMA_MOE_EXPERT_STORE_AUTO (-2) // moe_expert_store_mib: size the store from available RAM
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -381,6 +392,7 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
         bool moe_early_router; // reserve cache memory for advisory early routing
+        bool moe_expert_store; // a context will own routed experts through the RAM expert store: do not prefetch them
 
         // Optional inclusive, zero-based cache layer ranges. NULL/0 preserves the
         // legacy all-expert placement behavior. The model copies the borrowed array
@@ -471,6 +483,15 @@ extern "C" {
 
         // A source/target/parent context that can share results or llama_memory.
         struct llama_context * ctx_other;
+
+        // MoE expert split and RAM expert store [EXPERIMENTAL]
+        enum llama_moe_expert_split moe_expert_split;
+        int32_t      moe_expert_split_threads;  // CPU threads for split experts, <= 0: logical cores - 1
+        int32_t      moe_expert_promote_budget; // in-call promotions per layer call, < 0: default (64)
+        int32_t      moe_expert_promote_misses; // CPU calls before an expert may be promoted, <= 0: default (2)
+        int64_t      moe_expert_store_mib;      // RAM expert store size, LLAMA_MOE_EXPERT_STORE_OFF or _AUTO
+        bool         moe_expert_store_adapt;    // promote experts read from the file tier into the store
+        const char * moe_expert_profile;        // expert usage profile, read for ranking and updated at exit; NULL: none
     };
 
     struct llama_model_tensor_override {

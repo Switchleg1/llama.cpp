@@ -1164,6 +1164,7 @@ bool ggml_cuda_moe_quantize_q8_1_for_test(const float * input, void * output, in
         int64_t rows, ggml_cuda_moe_stream_t stream);
 void ggml_backend_cuda_moe_hybrid_set_cold_handler(ggml_backend_moe_hybrid_cold_handler_t handler, void * user);
 void ggml_backend_cuda_moe_hybrid_set_cold_strict(bool strict);
+bool ggml_backend_cuda_moe_hybrid_configure(const struct ggml_backend_moe_hybrid_config * config);
 // Registers pinned per-expert sources for later grouped resources; null hosts unregisters.
 bool ggml_backend_cuda_moe_expert_usage(ggml_backend_t backend, const ggml_tensor * tensor, uint32_t * counts, uint32_t n);
 bool ggml_backend_cuda_moe_update_expert_source(const ggml_tensor * tensor, uint32_t expert, const void * host);

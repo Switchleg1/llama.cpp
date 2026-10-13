@@ -8,6 +8,12 @@
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
+    // MoE expert split and RAM expert store, resolved at context creation
+    bool        moe_expert_split          = false;
+    int32_t     moe_expert_split_threads  = 0;
+    int64_t     moe_expert_store_mib      = -1;
+    bool        moe_expert_store_adapt    = true;
+
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;

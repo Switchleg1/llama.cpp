@@ -3267,7 +3267,8 @@ bool llama_moe_write_expert_profile(const char * path, const std::vector<std::ve
     return bool(out);
 }
 
-llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft) const {
+llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, ggml_backend_buffer_type_t host_buft,
+        const char * profile_path) const {
     std::lock_guard<std::mutex> lock(pimpl->moe_store_mutex);
     if (pimpl->moe_store_attempted) {
         return pimpl->moe_store.get();
@@ -3307,7 +3308,7 @@ llama_moe_expert_store * llama_model::moe_expert_store(size_t resident_budget, g
         }
     }
     // A usage profile from earlier runs ranks the most used experts first, across layers; ties keep the even order.
-    const auto profile = llama_moe_read_expert_profile(getenv("LLAMA_MOE_EXPERT_PROFILE"), pimpl->moe_sources);
+    const auto profile = llama_moe_read_expert_profile(profile_path, pimpl->moe_sources);
     if (!profile.empty()) {
         std::stable_sort(rank.begin(), rank.end(), [&](const auto & a, const auto & b) {
             return profile[a.group][a.id] > profile[b.group][b.id];
@@ -4651,6 +4652,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.moe_early_router            =*/ false,
+        /*.moe_expert_store            =*/ false,
         /*.moe_expert_cache_layer_ranges =*/ nullptr,
         /*.n_moe_expert_cache_layer_ranges =*/ 0,
         /*.moe_expert_cache_byte_budgets =*/ nullptr,

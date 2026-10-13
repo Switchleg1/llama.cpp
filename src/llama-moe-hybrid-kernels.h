@@ -28,5 +28,8 @@ bool llama_moe_hybrid_q8_1_store_experts(
         const int32_t * experts, const int32_t * rows, uint32_t count, const void * x_q8_1, size_t x_row_bytes,
         float * out, size_t out_stride, bool gelu);
 
+// Threads of the CPU expert pool. Takes effect only before the first expert computation.
+void llama_moe_hybrid_set_threads(int n_threads);
+
 // The CUDA quantize_q8_1 rule, for the intermediate activation.
 void llama_moe_hybrid_quantize_q8_1(const float * x, void * y, int64_t n);

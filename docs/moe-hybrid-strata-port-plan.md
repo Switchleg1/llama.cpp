@@ -2361,3 +2361,35 @@ The throughput numbers are NOT a speedup claim for this change. The two runs sta
 Still not verified: sustained real-model behavior, large-context runs, and host memory use across the full 77.865 GiB payload rather than a short smoke.
 
 Artifacts: `build/run-qwen-page-align-smoke.py`, `build/run-qwen-page-align-smoke.json`, `build/run-qwen-page-align-smoke.log`.
+
+### Baseline, steps 1-3: supported options, strict cold results, debug gating
+
+The split runtime is now configured through parameters instead of environment variables (owner-approved names):
+
+| Option | Meaning |
+| --- | --- |
+| `--moe-expert-split on\|off\|auto` | Experts that miss the GPU expert cache run on the CPU while the GPU computes the cached ones; `auto` enables it when an expert cache is configured. Default off. |
+| `--moe-expert-split-threads N` | CPU expert threads; default logical cores - 1. |
+| `--moe-expert-promote B[:M]` | Up to B in-call promotions per layer call, after M CPU calls; default `64:2`, `0` disables. |
+| `--moe-expert-store-mb N\|auto\|off` | Bounded RAM expert store with file-backed overflow; `auto` uses free RAM less max(8 GiB, 20% of total). Default off. |
+| `--moe-expert-store-adapt on\|off` | Promote experts that keep being read from the files into the store; default on. |
+| `--moe-expert-profile FNAME` | Expert usage profile: ranks the store and is updated when the target context ends. |
+
+They map to new `llama_context_params` fields (`moe_expert_split`, `_threads`, `_promote_budget`, `_promote_misses`, `moe_expert_store_mib`, `_store_adapt`, `moe_expert_profile`) and the model parameter `moe_expert_store`, which tells the loader not to prefetch routed expert ranges. A context resolves the split once and configures the CUDA backend through `GGML_BACKEND_MOE_HYBRID_CONFIGURE` (split, promotion budget and threshold). That replaces the admission, doorbell, decide, substitute and promotion statics. Gates read the configuration when used, so it applies to resources created afterwards. The CPU pool thread count is set through `llama_moe_hybrid_set_threads()` before its first use. The launcher emits the flags instead of environment variables, and `build/moe-tuned-confirm-auto.json` is converted.
+
+Strict cold results now hold whenever the split is on, not only in store mode. A refused or timed-out CPU packet fails the graph, and decode rolls the ubatch back. The backend never recomputes from bank pointers. The CPU handler receives the activation row stride (`activation_stride`, a new handler argument). Layers that the shared Q8_1 kernels do not cover now use the ggml helper one row at a time, so multi-row verification no longer fails for them (previously anything but row 0 was refused). Forcing that fallback (`LLAMA_MOE_HYBRID_NO_Q8_1`, debug only) at ub=4: KLD 0.006749 +- 0.001152, 98.413%, no failures.
+
+All `LLAMA_MOE_HYBRID_*`, `LLAMA_MOE_ADMIT_*`, `LLAMA_MOE_ROUTE_DUMP` and the old store/profile variables now go through `ggml_moe_debug_getenv()`. They take effect only when `LLAMA_MOE_DEBUG` is set, so a normal run is configured by its parameters alone. `LLAMA_MOE_AUTO_PIN` and `LLAMA_MOE_CACHE_LOAD_THREADS` are unchanged. The development scripts set `LLAMA_MOE_DEBUG` for their legacy switches.
+
+Checks (IQ3_S, KLD harness, 32 slots):
+
+| Configuration | KLD |
+| --- | --- |
+| flags `--moe-expert-split on --moe-expert-promote 0`, `LLAMA_MOE_DEBUG=0` | 0.008835 +- 0.001676 (identical to the env-gated runs) |
+| legacy env switches with `LLAMA_MOE_DEBUG=1` | 0.008835 |
+| legacy env switches without `LLAMA_MOE_DEBUG` | 0.000000 (switches ignored; plain GPU cache path, the reference) |
+| `--moe-expert-store-mb 8192` | 0.006806 +- 0.001227; 8 GiB pinned store, 3,406 promotions |
+
+Server with the converted tuned configuration (flags only, no environment): output hash identical to the env-gated runs. Speed was not judged, because the machine was in light use. Full MoE suites (store, insertion, full normally and with auto-pin, pageable fallback) and all 3 CTests in both modes passed.
+
+Remaining baseline steps: KV resident (design below), then the smoke suite.

@@ -1564,12 +1564,37 @@ struct moe_candidate_execution_geometry {
     bool grouped_eligible = false;
 };
 
+// Expert split configuration (ggml_backend_moe_hybrid_configure). Until it is called, the debug environment
+// variables decide. Gates read it when they are used, so a later configuration applies to new resources.
+struct moe_hybrid_runtime_config {
+    std::atomic<bool>     configured{false};
+    std::atomic<bool>     split{false};
+    std::atomic<uint32_t> promote_budget{64};
+    std::atomic<uint32_t> promote_misses{2};
+};
+
+static moe_hybrid_runtime_config & moe_hybrid_config() {
+    static moe_hybrid_runtime_config config;
+    return config;
+}
+
+static bool moe_hybrid_env(const char * name) {
+    return getenv(name) != nullptr;
+}
+
+// Split mode implies the admission, doorbell and decide gates; the environment can only enable them.
+static bool moe_hybrid_split_configured() {
+    auto & config = moe_hybrid_config();
+    return config.configured.load(std::memory_order_acquire) && config.split.load(std::memory_order_relaxed);
+}
+
 // Plan arrays hold one entry per route and per slot. Decide mode sends routes beyond the slots to the CPU,
 // so it can plan a pass with more routes than slots; every reader of a plan uses the same capacity.
 #define MOE_GROUPED_DECIDE_ROUTE_CAPACITY 64
 #define MOE_GROUPED_DECIDE_MAX_ROWS 8
 static uint32_t moe_grouped_plan_capacity(uint32_t n_slots) {
-    static const bool decide = getenv("LLAMA_MOE_HYBRID_DECIDE") != nullptr && getenv("LLAMA_MOE_ADMIT_DOORBELL") != nullptr;
+    static const bool env_decide = moe_hybrid_env("LLAMA_MOE_HYBRID_DECIDE") && moe_hybrid_env("LLAMA_MOE_ADMIT_DOORBELL");
+    const bool decide = env_decide || moe_hybrid_split_configured();
     return decide ? std::max<uint32_t>(n_slots, MOE_GROUPED_DECIDE_ROUTE_CAPACITY) : n_slots;
 }
 
@@ -4245,14 +4270,15 @@ static __global__ void moe_grouped_admit_doorbell(moe_grouped_admit_publication 
 }
 
 static bool moe_grouped_admit_shadow_enabled() {
-    static const bool enabled = getenv("LLAMA_MOE_ADMIT_SHADOW") != nullptr;
+    static const bool env_enabled = ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_SHADOW") != nullptr;
+    const bool enabled = env_enabled || moe_hybrid_split_configured();
     return enabled;
 }
 
 // Caps the shadow policy's per-layer quota, so cold routes can be observed before graph capture begins.
 static uint32_t moe_grouped_admit_quota(uint32_t n_slots) {
     static const uint32_t quota = []() -> uint32_t {
-        const char * value = getenv("LLAMA_MOE_ADMIT_QUOTA");
+        const char * value = ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_QUOTA");
         return value != nullptr ? (uint32_t) atoi(value) : 0;
     }();
     return quota != 0 && quota < n_slots ? quota : n_slots;
@@ -4262,30 +4288,35 @@ static uint32_t moe_grouped_admit_quota(uint32_t n_slots) {
 static bool moe_grouped_admit_decide_enabled();
 
 static bool moe_grouped_admit_doorbell_enabled() {
-    static const bool enabled = getenv("LLAMA_MOE_ADMIT_DOORBELL") != nullptr;
+    static const bool env_enabled = ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_DOORBELL") != nullptr;
+    const bool enabled = env_enabled || moe_hybrid_split_configured();
     return enabled && moe_grouped_admit_shadow_enabled();
 }
 
 // Adaptive residency between tokens: an expert that went cold this many times may evict the least recently
 // used slot not needed by the current call, at most `budget` times per layer per call. Budget 0 freezes.
 static uint32_t moe_grouped_admit_promote_budget() {
-    static const uint32_t budget = []() -> uint32_t {
-        const char * value = getenv("LLAMA_MOE_HYBRID_PROMOTE");
+    static const uint32_t env_budget = []() -> uint32_t {
+        const char * value = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_PROMOTE");
         return value != nullptr ? (uint32_t) atoi(value) : 0;
     }();
-    return budget;
+    auto & config = moe_hybrid_config();
+    return config.configured.load(std::memory_order_acquire) ? config.promote_budget.load(std::memory_order_relaxed) : env_budget;
 }
 
 static uint32_t moe_grouped_admit_promote_min() {
-    static const uint32_t min = []() -> uint32_t {
-        const char * value = getenv("LLAMA_MOE_HYBRID_PROMOTE_MIN");
+    static const uint32_t env_min = []() -> uint32_t {
+        const char * value = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_PROMOTE_MIN");
         return value != nullptr ? std::max(1, atoi(value)) : 2;
     }();
-    return min;
+    auto & config = moe_hybrid_config();
+    return config.configured.load(std::memory_order_acquire) ?
+        std::max(1u, config.promote_misses.load(std::memory_order_relaxed)) : env_min;
 }
 
 static bool moe_grouped_admit_decide_enabled() {
-    static const bool enabled = getenv("LLAMA_MOE_HYBRID_DECIDE") != nullptr;
+    static const bool env_enabled = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_DECIDE") != nullptr;
+    const bool enabled = env_enabled || moe_hybrid_split_configured();
     return enabled && moe_grouped_admit_doorbell_enabled();
 }
 
@@ -4344,7 +4375,7 @@ static moe_grouped_admit_decompose_stats & moe_grouped_admit_decompose() {
 
 static int moe_grouped_admit_decompose_mode() {
     static const int mode = []() {
-        const char * value = getenv("LLAMA_MOE_ADMIT_DECOMPOSE");
+        const char * value = ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_DECOMPOSE");
         return value == nullptr ? 0 : (strcmp(value, "gpu") == 0 ? 2 : 1);
     }();
     return mode;
@@ -4542,7 +4573,8 @@ struct moe_grouped_admit_worker {
                             rows[k] = packet->top_k != 0 ? packet->routes[k] / (int32_t) packet->top_k : 0;
                         }
                         if (handler != nullptr && count != 0 && packet->n_embd != 0 &&
-                                handler(handler_user, group.down_tensor, packet->activation, packet->activation_q8_1,
+                                handler(handler_user, group.down_tensor, packet->activation, MOE_GROUPED_ADMIT_WIDTH,
+                                    packet->activation_q8_1,
                                     (MOE_GROUPED_ADMIT_WIDTH / QK8_1) * sizeof(block_q8_1), rows,
                                     packet->experts, count, packet->results, MOE_GROUPED_ADMIT_WIDTH)) {
                             packet->computed = count;
@@ -4553,13 +4585,13 @@ struct moe_grouped_admit_worker {
                         } else if (strict.load(std::memory_order_relaxed) && count != 0) {
                             packet->computed = 0;
                             failed.fetch_add(1, std::memory_order_relaxed);
-                        } else if (getenv("LLAMA_MOE_ADMIT_OWNER_ONLY") != nullptr) {
+                        } else if (ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_OWNER_ONLY") != nullptr) {
                             packet->computed = 0;   // measure only what the owner computed
                         } else {
                             compute(group);
                         }
                         static FILE * trace = []() -> FILE * {
-                            const char * path = getenv("LLAMA_MOE_ADMIT_TRACE");
+                            const char * path = ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_TRACE");
                             return path != nullptr ? fopen(path, "w") : nullptr;
                         }();
                         if (trace != nullptr) {
@@ -10127,8 +10159,10 @@ void ggml_cuda_moe_grouped_context::compare_admit_results(
     }
     // Only the first row's activation is published, so only its routes can be compared.
     const int64_t routes_per_row = n_routes;   // every row's activation is published
-    static const bool substitute = getenv("LLAMA_MOE_ADMIT_SUBSTITUTE") != nullptr || moe_grouped_admit_decide_enabled();
-    static const bool parity = getenv("LLAMA_MOE_ADMIT_PARITY") != nullptr || !substitute;
+    static const bool env_substitute = ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_SUBSTITUTE") != nullptr;
+    static const bool env_parity = ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_PARITY") != nullptr;
+    const bool substitute = env_substitute || moe_grouped_admit_decide_enabled();
+    const bool parity = env_parity || !substitute;
     if (parity) {
         // Diagnostic: one thread compares in double, and substitutes if asked. Slow by design.
         moe_grouped_admit_compare<<<1, 1, 0, stream>>>(packet, static_cast<float *>(down_output->data),
@@ -10225,15 +10259,15 @@ bool ggml_cuda_moe_grouped_context::adapt_residency(cudaStream_t stream) {
     return false;
 #else
     static const uint32_t every = []() {
-        const char * value = getenv("LLAMA_MOE_HYBRID_ADAPT_EVERY");
+        const char * value = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_ADAPT_EVERY");
         return value != nullptr ? (uint32_t) std::max(0, atoi(value)) : 0u;
     }();
     static const uint32_t max_swaps = []() {
-        const char * value = getenv("LLAMA_MOE_HYBRID_ADAPT_SWAPS");
+        const char * value = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_ADAPT_SWAPS");
         return value != nullptr ? (uint32_t) std::max(0, atoi(value)) : 96u;
     }();
     static const float decay = []() {
-        const char * value = getenv("LLAMA_MOE_HYBRID_ADAPT_DECAY");
+        const char * value = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_ADAPT_DECAY");
         return value != nullptr ? (float) atof(value) : 0.7f;
     }();
     if (every == 0 || stream == nullptr || ++impl_->adapt_calls % every != 0) {
@@ -10367,7 +10401,7 @@ bool ggml_cuda_moe_grouped_context::adapt_residency(cudaStream_t stream) {
     }
     impl_->adapt_swaps_total += swaps;
     ++impl_->adapt_steps;
-    static const bool trace = getenv("LLAMA_MOE_HYBRID_ADAPT_TRACE") != nullptr;
+    static const bool trace = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_ADAPT_TRACE") != nullptr;
     if (trace && impl_->adapt_steps % 16 == 0) {
         GGML_LOG_INFO("moe-adapt: steps=%llu swaps=%llu last=%u candidates=%zu\n",
             (unsigned long long) impl_->adapt_steps, (unsigned long long) impl_->adapt_swaps_total, swaps, incoming.size());
@@ -18724,6 +18758,18 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
 
 void ggml_backend_cuda_moe_hybrid_set_cold_handler(ggml_backend_moe_hybrid_cold_handler_t handler, void * user) {
     moe_grouped_admit_worker_instance().set_handler(handler, user);
+}
+
+bool ggml_backend_cuda_moe_hybrid_configure(const ggml_backend_moe_hybrid_config * config) {
+    if (config == nullptr) {
+        return false;
+    }
+    auto & runtime = moe_hybrid_config();
+    runtime.split.store(config->split, std::memory_order_relaxed);
+    runtime.promote_budget.store(config->promote_budget, std::memory_order_relaxed);
+    runtime.promote_misses.store(std::max(1u, config->promote_misses), std::memory_order_relaxed);
+    runtime.configured.store(true, std::memory_order_release);
+    return true;
 }
 
 void ggml_backend_cuda_moe_hybrid_set_cold_strict(bool strict) {

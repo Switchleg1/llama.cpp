@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdlib.h>
+
 #include "ggml-backend.h"
 
 // Private fork protocol shared by llama and backend implementations.
@@ -60,16 +62,35 @@ typedef bool (*ggml_backend_moe_hybrid_shadow_t)(
         bool gelu,
         struct ggml_backend_moe_hybrid_shadow_result * result);
 
-// Lets the owner compute cold routes with its own CPU path. Results are n_embd floats per route, written
-// result_stride floats apart. Return false to let the backend fall back. Clear with a null handler before
+// Lets the owner compute cold routes with its own CPU path. Activation rows are activation_stride floats apart;
+// rows[i] names the row of route i. Results are n_embd floats per route, written result_stride floats apart. Return false to let the backend fall back. Clear with a null handler before
 // the user data is destroyed; clearing waits for a call in progress.
 #define GGML_BACKEND_MOE_HYBRID_SET_COLD_HANDLER_PROC_NAME "ggml_backend_moe_hybrid_set_cold_handler"
 
 typedef bool (*ggml_backend_moe_hybrid_cold_handler_t)(
-        void * user, const struct ggml_tensor * down, const float * activation, const void * activation_q8_1,
-        size_t q8_1_row_bytes, const int32_t * rows, const int32_t * experts, uint32_t count,
+        void * user, const struct ggml_tensor * down, const float * activation, size_t activation_stride,
+        const void * activation_q8_1, size_t q8_1_row_bytes, const int32_t * rows, const int32_t * experts, uint32_t count,
         float * results, size_t result_stride);
 typedef void (*ggml_backend_moe_hybrid_set_cold_handler_t)(ggml_backend_moe_hybrid_cold_handler_t handler, void * user);
+
+// Debug and legacy environment switches of the MoE split take effect only when LLAMA_MOE_DEBUG is set, so a
+// normal run is configured by its parameters alone.
+static inline const char * ggml_moe_debug_getenv(const char * name) {
+    const char * debug = getenv("LLAMA_MOE_DEBUG");
+    return debug != NULL && debug[0] != '\0' && debug[0] != '0' ? getenv(name) : NULL;
+}
+
+// Expert split configuration: when split is set, experts that miss the GPU cache run on the owner's CPU
+// handler (cold routes) while the GPU computes the cached ones. promote_budget bounds in-call promotions per
+// layer call, promote_misses is the number of cold calls before an expert may be promoted. Process-wide; call
+// before the first graph that uses the expert cache. Without a call, debug environment variables apply.
+#define GGML_BACKEND_MOE_HYBRID_CONFIGURE_PROC_NAME "ggml_backend_moe_hybrid_configure"
+struct ggml_backend_moe_hybrid_config {
+    bool     split;
+    uint32_t promote_budget;
+    uint32_t promote_misses;
+};
+typedef bool (*ggml_backend_moe_hybrid_configure_t)(const struct ggml_backend_moe_hybrid_config * config);
 
 // Strict mode: a refused or failed cold packet is not recomputed from the backend's own bank pointers.
 // The cumulative failure count covers strict refusals and device wait timeouts. Unplanned packets carry no

@@ -367,8 +367,10 @@ private:
     void moe_hybrid_register_cpu(llm_graph_result * res);
 public:
     static bool moe_hybrid_cold_handler(void * user, const ggml_tensor * down, const float * activation,
-            const void * activation_q8_1, size_t q8_1_row_bytes, const int32_t * rows, const int32_t * experts,
-            uint32_t count, float * results, size_t result_stride);
+            size_t activation_stride, const void * activation_q8_1, size_t q8_1_row_bytes, const int32_t * rows,
+            const int32_t * experts, uint32_t count, float * results, size_t result_stride);
+    std::vector<int32_t> moe_hybrid_cpu_row_ids;
+    std::vector<int32_t> moe_hybrid_cpu_row_zero;
 private:
     struct moe_hybrid_q8_1_layer {
         const ggml_tensor * gate = nullptr;
@@ -384,6 +386,7 @@ private:
     llama_moe_expert_store * moe_hybrid_store = nullptr;   // owned by the model
     std::unordered_map<const ggml_tensor *, uint32_t> moe_hybrid_store_groups;
     bool moe_hybrid_store_required = false;
+    std::string moe_expert_profile;   // expert usage profile path, empty: none
     uint64_t moe_hybrid_store_graphs = 0;
     uint64_t moe_hybrid_store_promotions = 0;
     // Moves the most-read file-backed experts into RAM, evicting the least used residents. Store mode only,

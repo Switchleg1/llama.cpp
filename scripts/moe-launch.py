@@ -122,10 +122,8 @@ def plan(args):
         cmd += ['--backend-sampling', '--decode-overlap', '--decode-boundary-overlap']
     env = {}
     if hybrid:
-        env.update({'LLAMA_MOE_ADMIT_SHADOW': '1', 'LLAMA_MOE_ADMIT_DOORBELL': '1', 'LLAMA_MOE_HYBRID_CPU': '1',
-                    'LLAMA_MOE_HYBRID_Q8_1': '1', 'LLAMA_MOE_HYBRID_DECIDE': '1',
-                    'LLAMA_MOE_HYBRID_PROMOTE': '64', 'LLAMA_MOE_HYBRID_PROMOTE_MIN': '2',
-                    'LLAMA_MOE_HYBRID_CPU_THREADS': str(max(4, cores - 1))})
+        cmd += ['--moe-expert-split', 'on', '--moe-expert-split-threads', str(max(4, cores - 1)),
+                '--moe-expert-promote', '64:2']
     report = {
         'gpu': gpu_name, 'vram_free_gib': round(vram_free / GiB, 1), 'ram_available_gib': round(ram_avail / GiB, 1),
         'cores': cores, 'arch': facts['arch'], 'layers': facts['n_layer'], 'experts': facts['n_expert'],
@@ -242,12 +240,14 @@ def tuning_candidates(config, args):
         yield f'd{drafts}-lru', lru
         if lru['report']['hybrid_supported']:
             base.hybrid = 'on'
-            hybrid_env = plan(base)['env']
+            hybrid = plan(base)
             for budget in (16, 64):
-                candidate = copy.deepcopy(lru)
-                candidate['env'] = dict(hybrid_env, LLAMA_MOE_HYBRID_PROMOTE=str(budget))
-                candidate['report']['policy'] = f'hybrid decide, fill budget {budget}, threshold 2'
-                yield f'd{drafts}-hybrid-{budget}', candidate
+                candidate = copy.deepcopy(hybrid)
+                cmd = candidate['command']
+                cmd[cmd.index('--moe-expert-promote') + 1] = f'{budget}:2'
+                candidate['report'] = copy.deepcopy(lru['report'])
+                candidate['report']['policy'] = f'expert split, promote {budget}:2'
+                yield f'd{drafts}-split-{budget}', candidate
 
 
 def sweep_regressed(score, state, margin):

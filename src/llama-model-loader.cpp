@@ -1611,7 +1611,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             // With the expert store, routed expert banks are read through the store, so do not prefetch them.
             llama_mmap::ranges skip = lazy.for_file(idx);
-            if (use_mmap && getenv("LLAMA_MOE_EXPERT_STORE_MB") != nullptr) {
+            if (use_mmap && moe_expert_store) {
                 static const std::regex expert_bank("\\.ffn_(gate|up|down|gate_up)_(ch|)exps\\.weight$");
                 for (const auto & [name, weight] : weights_map) {
                     if (weight.idx == idx && std::regex_search(name, expert_bank)) {

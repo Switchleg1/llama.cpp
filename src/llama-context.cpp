@@ -18,6 +18,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <thread>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -754,6 +755,31 @@ llama_context::llama_context(
     cparams.phase_aware_workspace   = params.phase_aware_workspace;
     cparams.live_context_workspace  = params.live_context_workspace;
     cparams.decode_boundary_overlap = params.decode_boundary_overlap;
+
+    cparams.moe_expert_split = params.moe_expert_split == LLAMA_MOE_EXPERT_SPLIT_ON ||
+        (params.moe_expert_split == LLAMA_MOE_EXPERT_SPLIT_AUTO && model.moe_expert_cache_enabled());
+    cparams.moe_expert_split_threads = params.moe_expert_split_threads;
+    cparams.moe_expert_store_mib     = params.moe_expert_store_mib;
+    cparams.moe_expert_store_adapt   = params.moe_expert_store_adapt;
+    moe_expert_profile       = params.moe_expert_profile ? params.moe_expert_profile : "";
+    if (cparams.moe_expert_split) {
+        ggml_backend_moe_hybrid_configure_t configure = nullptr;
+        for (size_t i = 0; i < ggml_backend_reg_count() && configure == nullptr; ++i) {
+            configure = (ggml_backend_moe_hybrid_configure_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_reg_get(i), GGML_BACKEND_MOE_HYBRID_CONFIGURE_PROC_NAME);
+        }
+        ggml_backend_moe_hybrid_config config = {};
+        config.split          = true;
+        config.promote_budget = params.moe_expert_promote_budget < 0 ? 64u : (uint32_t) params.moe_expert_promote_budget;
+        config.promote_misses = params.moe_expert_promote_misses <= 0 ? 2u : (uint32_t) params.moe_expert_promote_misses;
+        if (configure == nullptr || !configure(&config)) {
+            LLAMA_LOG_WARN("%s: MoE expert split is not supported by the loaded backends; disabled\n", __func__);
+            cparams.moe_expert_split = false;
+        } else {
+            LLAMA_LOG_INFO("%s: MoE expert split on (promote budget %u, after %u misses)\n", __func__,
+                config.promote_budget, config.promote_misses);
+        }
+    }
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -1170,7 +1196,8 @@ llama_context::~llama_context() {
     synchronize();
 
     // Accumulate this run's expert usage into the residency profile of the target model.
-    static const char * profile_path = getenv("LLAMA_MOE_EXPERT_PROFILE");
+    const char * profile_path = !moe_expert_profile.empty() ? moe_expert_profile.c_str() :
+        ggml_moe_debug_getenv("LLAMA_MOE_EXPERT_PROFILE");
     if (profile_path != nullptr && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.hparams.no_alloc &&
             !model.moe_sources().empty()) {
         ggml_backend_moe_expert_usage_t usage = nullptr;
@@ -1923,7 +1950,7 @@ void llama_context::place_moe_regions(llm_graph_result * res) {
 
 // Cuts the graph at the hybrid seam of every placed region, so the halves can run between splits.
 void llama_context::moe_hybrid_set_cuts(llm_graph_result * res, ggml_cgraph * gf) {
-    static const bool cuts = getenv("LLAMA_MOE_HYBRID_CUTS") != nullptr;
+    static const bool cuts = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_CUTS") != nullptr;
     if (!cuts || res == nullptr || gf == nullptr) {
         return;
     }
@@ -1968,7 +1995,7 @@ void llama_context::moe_hybrid_set_cuts(llm_graph_result * res, ggml_cgraph * gf
 // Runs the graph one split at a time instead of in one submission. Same work, same order.
 ggml_status llama_context::graph_compute_certified(
         ggml_cgraph * gf, const ggml_graph_execution_certificate & certificate) {
-    static const bool ranged = getenv("LLAMA_MOE_HYBRID_RANGES") != nullptr;
+    static const bool ranged = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_RANGES") != nullptr;
     if (!ranged) {
         return ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
     }
@@ -2011,7 +2038,7 @@ ggml_status llama_context::graph_compute_certified(
 
 // Recomputes the resident half of regions whose experts just ran, and compares. Diagnostic only.
 void llama_context::moe_hybrid_shadow_regions(int node_end) {
-    static const bool shadow = getenv("LLAMA_MOE_HYBRID_SHADOW") != nullptr;
+    static const bool shadow = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_SHADOW") != nullptr;
     if (!shadow || moe_hybrid_shadow_pending.empty()) {
         return;
     }
@@ -2044,8 +2071,8 @@ void llama_context::moe_hybrid_shadow_regions(int node_end) {
 }
 
 static bool llama_moe_hybrid_dispatch(void * user, const ggml_tensor * down, const float * activation,
-        const void * activation_q8_1, size_t q8_1_row_bytes, const int32_t * rows, const int32_t * experts,
-        uint32_t count, float * results, size_t result_stride) {
+        size_t activation_stride, const void * activation_q8_1, size_t q8_1_row_bytes, const int32_t * rows,
+        const int32_t * experts, uint32_t count, float * results, size_t result_stride) {
     GGML_UNUSED(user);
     auto & registry = llama_moe_hybrid_owners();
     std::lock_guard<std::mutex> lock(registry.mutex);
@@ -2053,13 +2080,13 @@ static bool llama_moe_hybrid_dispatch(void * user, const ggml_tensor * down, con
     if (found == registry.owners.end() || found->second.empty()) {
         return false;
     }
-    return llama_context::moe_hybrid_cold_handler(found->second.front(), down, activation, activation_q8_1,
-        q8_1_row_bytes, rows, experts, count, results, result_stride);
+    return llama_context::moe_hybrid_cold_handler(found->second.front(), down, activation, activation_stride,
+        activation_q8_1, q8_1_row_bytes, rows, experts, count, results, result_stride);
 }
 
 bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * down, const float * activation,
-        const void * activation_q8_1, size_t q8_1_row_bytes, const int32_t * rows, const int32_t * experts,
-        uint32_t count, float * results, size_t result_stride) {
+        size_t activation_stride, const void * activation_q8_1, size_t q8_1_row_bytes, const int32_t * rows,
+        const int32_t * experts, uint32_t count, float * results, size_t result_stride) {
     auto * ctx = static_cast<llama_context *>(user);
     std::lock_guard<std::mutex> lock(ctx->moe_hybrid_cpu_mutex);
     if (ctx->moe_hybrid_store_required) {
@@ -2079,7 +2106,9 @@ bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * dow
         return true;
     }
     // Shared quantization: consume the GPU's own Q8_1 activation when every bank type is covered.
-    static const bool use_q8_1 = getenv("LLAMA_MOE_HYBRID_Q8_1") != nullptr;
+    static const bool env_q8_1 = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_Q8_1") != nullptr;
+    static const bool env_no_q8_1 = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_NO_Q8_1") != nullptr;   // debug: exercise the ggml fallback
+    const bool use_q8_1 = (env_q8_1 || ctx->cparams.moe_expert_split) && !env_no_q8_1;
     const auto layer = ctx->moe_hybrid_q8_1_layers.find(down);
     if (use_q8_1 && activation_q8_1 != nullptr && layer != ctx->moe_hybrid_q8_1_layers.end() && down != nullptr &&
             (size_t) down->ne[1] <= result_stride) {
@@ -2089,38 +2118,58 @@ bool llama_context::moe_hybrid_cold_handler(void * user, const ggml_tensor * dow
             return true;
         }
     }
-    static const bool q8_1_only = getenv("LLAMA_MOE_HYBRID_Q8_1_ONLY") != nullptr;
+    static const bool q8_1_only = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_Q8_1_ONLY") != nullptr;
     if (q8_1_only) {
         return false;
     }
-    // The ggml helper below takes one activation row.
-    for (uint32_t i = 0; i < count; ++i) {
-        if (rows != nullptr && rows[i] != 0) {
-            return false;
-        }
-    }
+    // Layers the shared Q8_1 kernels do not cover use the ggml helper, one activation row at a time.
     const auto it = ctx->moe_hybrid_cpu.find(down);
-    if (it == ctx->moe_hybrid_cpu.end() || down == nullptr) {
+    if (it == ctx->moe_hybrid_cpu.end() || down == nullptr || activation == nullptr) {
         return false;
     }
     const int64_t n_embd = down->ne[1];
-    if (n_embd <= 0 || (size_t) n_embd > result_stride) {
+    if (n_embd <= 0 || (size_t) n_embd > result_stride || (rows != nullptr && (size_t) n_embd > activation_stride)) {
         return false;
     }
-    ctx->moe_hybrid_cpu_output.resize((size_t) count * n_embd);
-    if (!it->second->compute(activation, experts, count, ctx->moe_hybrid_cpu_output.data())) {
-        return false;
+    auto & ids = ctx->moe_hybrid_cpu_row_ids;
+    auto & zero = ctx->moe_hybrid_cpu_row_zero;
+    std::vector<uint32_t> routes;
+    int32_t max_row = 0;
+    for (uint32_t i = 0; rows != nullptr && i < count; ++i) {
+        if (rows[i] < 0) {
+            return false;
+        }
+        max_row = std::max(max_row, rows[i]);
     }
-    for (uint32_t i = 0; i < count; ++i) {
-        memcpy(results + (size_t) i * result_stride, ctx->moe_hybrid_cpu_output.data() + (size_t) i * n_embd,
-               (size_t) n_embd * sizeof(float));
+    for (int32_t row = 0; row <= max_row; ++row) {
+        ids.clear();
+        routes.clear();
+        for (uint32_t i = 0; i < count; ++i) {
+            if ((rows != nullptr ? rows[i] : 0) == row) {
+                ids.push_back(experts[i]);
+                routes.push_back(i);
+            }
+        }
+        if (ids.empty()) {
+            continue;
+        }
+        zero.assign(ids.size(), 0);
+        ctx->moe_hybrid_cpu_output.resize(ids.size() * n_embd);
+        if (!it->second->compute(activation + (size_t) row * activation_stride, ids.data(), ids.size(),
+                ctx->moe_hybrid_cpu_output.data(), zero.data())) {
+            return false;
+        }
+        for (size_t k = 0; k < routes.size(); ++k) {
+            memcpy(results + (size_t) routes[k] * result_stride, ctx->moe_hybrid_cpu_output.data() + k * n_embd,
+                   (size_t) n_embd * sizeof(float));
+        }
     }
     return true;
 }
 
 void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
-    static const bool enabled = getenv("LLAMA_MOE_HYBRID_CPU") != nullptr;
-    if (!enabled || res == nullptr) {
+    static const bool env_enabled = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_CPU") != nullptr;
+    if (!(cparams.moe_expert_split || env_enabled) || res == nullptr) {
         return;
     }
     if (moe_hybrid_set_cold_handler == nullptr) {
@@ -2132,10 +2181,18 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
             return;
         }
     }
-    static const int n_threads = []() {
-        const char * value = getenv("LLAMA_MOE_HYBRID_CPU_THREADS");
-        return value != nullptr ? std::max(1, atoi(value)) : 8;
+    // explicit setting, then the debug environment variable, then all logical cores but one
+    const int n_threads = [&]() {
+        if (cparams.moe_expert_split_threads > 0) {
+            return (int) cparams.moe_expert_split_threads;
+        }
+        const char * value = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_CPU_THREADS");
+        if (value != nullptr) {
+            return std::max(1, atoi(value));
+        }
+        return std::max(1, (int) std::thread::hardware_concurrency() - 1);
     }();
+    llama_moe_hybrid_set_threads(n_threads);
     std::unique_lock<std::mutex> lock(moe_hybrid_cpu_mutex);
     if (moe_hybrid_cpu_pool == nullptr) {
         auto params = ggml_threadpool_params_default(n_threads);
@@ -2144,15 +2201,44 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
             return;
         }
     }
-    static const char * store_mb = getenv("LLAMA_MOE_EXPERT_STORE_MB");
-    if (store_mb != nullptr && !moe_hybrid_store_required && !model.hparams.no_alloc) {
+    if (cparams.moe_expert_split && moe_hybrid_cold_failures == nullptr) {
+        // No backend recomputation from bank pointers: a refused or late packet fails the batch.
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            auto * reg = ggml_backend_reg_get(i);
+            auto set_strict = (ggml_backend_moe_hybrid_set_cold_strict_t) ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_MOE_HYBRID_SET_COLD_STRICT_PROC_NAME);
+            auto failures = (ggml_backend_moe_hybrid_cold_failures_t) ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_MOE_HYBRID_COLD_FAILURES_PROC_NAME);
+            if (set_strict != nullptr && failures != nullptr) {
+                set_strict(true);
+                moe_hybrid_cold_failures = failures;
+                break;
+            }
+        }
+    }
+    static const char * env_store_mb = ggml_moe_debug_getenv("LLAMA_MOE_EXPERT_STORE_MB");
+    const int64_t store_request = cparams.moe_expert_store_mib != LLAMA_MOE_EXPERT_STORE_OFF ? cparams.moe_expert_store_mib :
+        env_store_mb != nullptr ? std::max<int64_t>(0, atoll(env_store_mb)) : LLAMA_MOE_EXPERT_STORE_OFF;
+    if (store_request != LLAMA_MOE_EXPERT_STORE_OFF && !moe_hybrid_store_required && !model.hparams.no_alloc) {
         moe_hybrid_store_required = true;
         const auto & groups = model.moe_sources();
-        const size_t budget = size_t(std::max(0LL, atoll(store_mb))) * 1024 * 1024;
+        size_t budget = store_request >= 0 ? size_t(store_request) * 1024 * 1024 : 0;
+        if (store_request == LLAMA_MOE_EXPERT_STORE_AUTO) {
+            // what is free now, less a reserve for the OS, KV growth and the file cache
+            size_t free = 0, total = 0;
+            if (auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+                ggml_backend_dev_memory(cpu, &free, &total);
+            }
+            const size_t reserve = std::max<size_t>(size_t(8) << 30, total / 5);
+            budget = free > reserve ? free - reserve : 0;
+            LLAMA_LOG_INFO("moe-expert-store: auto size %.2f GiB (free %.2f GiB, reserve %.2f GiB)\n",
+                budget / 1073741824.0, free / 1073741824.0, reserve / 1073741824.0);
+        }
         // Pinned like Strata's RAM complement; pageable if locking fails. Shared by the model's contexts.
         ggml_backend_buffer_type_t host_buft = model.devices.empty() ? nullptr :
             ggml_backend_dev_host_buffer_type(model.devices[0].dev);
-        moe_hybrid_store = model.moe_expert_store(budget, host_buft);
+        moe_hybrid_store = model.moe_expert_store(budget, host_buft,
+            moe_expert_profile.empty() ? ggml_moe_debug_getenv("LLAMA_MOE_EXPERT_PROFILE") : moe_expert_profile.c_str());
         if (!moe_hybrid_store) {
             LLAMA_LOG_ERROR("moe-expert-store: creation failed; cold routes will fail\n");
         } else {
@@ -2227,9 +2313,9 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
 }
 
 void llama_context::moe_hybrid_store_adapt() {
-    static const bool enabled = getenv("LLAMA_MOE_EXPERT_STORE_ADAPT") == nullptr ||
-        atoi(getenv("LLAMA_MOE_EXPERT_STORE_ADAPT")) != 0;
-    if (!enabled || moe_hybrid_store == nullptr) {
+    static const bool env_disabled = ggml_moe_debug_getenv("LLAMA_MOE_EXPERT_STORE_ADAPT") != nullptr &&
+        atoi(ggml_moe_debug_getenv("LLAMA_MOE_EXPERT_STORE_ADAPT")) == 0;
+    if (!cparams.moe_expert_store_adapt || env_disabled || moe_hybrid_store == nullptr) {
         return;
     }
     const auto hot = moe_hybrid_store->file_hot(2);
@@ -2302,8 +2388,8 @@ void llama_context::moe_hybrid_store_adapt() {
 }
 
 void llama_context::moe_adapt_residency() {
-    static const bool enabled = getenv("LLAMA_MOE_HYBRID_ADAPT_EVERY") != nullptr &&
-        atoi(getenv("LLAMA_MOE_HYBRID_ADAPT_EVERY")) > 0;
+    static const bool enabled = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_ADAPT_EVERY") != nullptr &&
+        atoi(ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_ADAPT_EVERY")) > 0;
     if (!enabled || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model.hparams.no_alloc) {
         return;
     }
@@ -2323,7 +2409,8 @@ void llama_context::moe_adapt_residency() {
         }
         // An expert profile seeds the scores, so the first swaps already move toward the profiled hot set.
         const auto & groups = model.moe_sources();
-        const auto profile = llama_moe_read_expert_profile(getenv("LLAMA_MOE_EXPERT_PROFILE"), groups);
+        const auto profile = llama_moe_read_expert_profile(
+            !moe_expert_profile.empty() ? moe_expert_profile.c_str() : ggml_moe_debug_getenv("LLAMA_MOE_EXPERT_PROFILE"), groups);
         size_t seeded = 0;
         for (size_t g = 0; set_prior != nullptr && g < profile.size(); ++g) {
             uint64_t max_count = 0;
@@ -2358,7 +2445,7 @@ void llama_context::moe_adapt_residency() {
 
 // Reports whether real graphs expose hybrid spans. Diagnostic only, it does not change execution.
 void llama_context::moe_hybrid_probe_spans(llm_graph_result * res, ggml_cgraph * gf) {
-    static const bool probe = getenv("LLAMA_MOE_HYBRID_PROBE") != nullptr;
+    static const bool probe = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_PROBE") != nullptr;
     if (!probe || res == nullptr || gf == nullptr) {
         return;
     }
@@ -4836,7 +4923,7 @@ ggml_status llama_context::graph_compute(
 
     // Store mode trades overlap with the next host step for a checked cold-route result.
     moe_adapt_residency();
-    const bool check_cold = moe_hybrid_store_required && moe_hybrid_cold_failures != nullptr;
+    const bool check_cold = (moe_hybrid_store_required || cparams.moe_expert_split) && moe_hybrid_cold_failures != nullptr;
     const uint64_t cold_failures = check_cold ? moe_hybrid_cold_failures() : 0;
     ggml_status status;
     const bool  required_grouped_supported = moe_graph_supports_required_grouped(gf);
@@ -6079,6 +6166,13 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.moe_expert_split            =*/ LLAMA_MOE_EXPERT_SPLIT_OFF,
+        /*.moe_expert_split_threads    =*/ 0,
+        /*.moe_expert_promote_budget   =*/ -1,
+        /*.moe_expert_promote_misses   =*/ 0,
+        /*.moe_expert_store_mib        =*/ LLAMA_MOE_EXPERT_STORE_OFF,
+        /*.moe_expert_store_adapt      =*/ true,
+        /*.moe_expert_profile          =*/ nullptr,
     };
 
     return result;

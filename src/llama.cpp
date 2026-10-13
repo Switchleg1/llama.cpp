@@ -485,6 +485,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         ml.lazy.mode    = params.lazy_mode;
         ml.model_shared = params.model_shared;
+        ml.moe_expert_store = params.moe_expert_store;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));

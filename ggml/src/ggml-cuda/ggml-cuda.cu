@@ -3644,7 +3644,7 @@ static void ggml_cuda_mul_mat_id_cached(
 
     // Diagnostic: record the routed experts so admission policies can be replayed offline.
     static FILE * route_dump = []() -> FILE * {
-        const char * path = getenv("LLAMA_MOE_ROUTE_DUMP");
+        const char * path = ggml_moe_debug_getenv("LLAMA_MOE_ROUTE_DUMP");
         return path != nullptr ? fopen(path, "w") : nullptr;
     }();
     if (route_dump != nullptr && ids_host_bytes != nullptr) {
@@ -3908,7 +3908,7 @@ static void ggml_cuda_moe_hybrid_compact_check(
         bool use_mmq,
         ggml_cuda_mmid_consumer consumer,
         const ggml_cuda_mmid_direct_source_view & direct_source_view) {
-    static const bool enabled = getenv("LLAMA_MOE_HYBRID_COMPACT_CHECK") != nullptr;
+    static const bool enabled = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_COMPACT_CHECK") != nullptr;
     if (!enabled || dst == nullptr || dst->src[1] == nullptr) {
         return;
     }
@@ -8943,6 +8943,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_SET_COLD_HANDLER_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_hybrid_set_cold_handler;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_HYBRID_CONFIGURE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_hybrid_configure;
     }
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_SET_COLD_STRICT_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_hybrid_set_cold_strict;

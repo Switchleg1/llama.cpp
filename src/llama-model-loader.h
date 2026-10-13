@@ -114,6 +114,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool moe_expert_store = false; // routed experts are read through the RAM expert store: do not prefetch them
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand

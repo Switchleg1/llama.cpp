@@ -1,5 +1,6 @@
 #include "llama-moe-hybrid-kernels.h"
 #include "llama-moe-expert-store.h"
+#include "../ggml/src/ggml-backend-moe.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -384,7 +385,7 @@ using dot_fn = float (*)(const void *, const block_q8_1 *, int64_t);
 
 static dot_fn custom_dot_for(ggml_type type) {
 #if defined(LLAMA_MOE_HYBRID_X86)
-    static const bool scalar = getenv("LLAMA_MOE_HYBRID_SCALAR") != nullptr;
+    static const bool scalar = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_SCALAR") != nullptr;
     if (!scalar && cpu_has_avx2_fma()) {
         switch (type) {
             case GGML_TYPE_IQ2_S:   return dot_iq2_s_avx2;
@@ -511,9 +512,23 @@ struct row_pool {
     }
 };
 
+static std::atomic<int> & pool_threads() {
+    static std::atomic<int> threads{0};
+    return threads;
+}
+
+void llama_moe_hybrid_set_threads(int n_threads) {
+    pool_threads().store(std::max(1, n_threads), std::memory_order_relaxed);
+}
+
+// Created on first use; a thread count set before that wins over the debug environment variable.
 static row_pool & pool() {
     static row_pool instance([]() {
-        const char * value = getenv("LLAMA_MOE_HYBRID_CPU_THREADS");
+        const int configured = pool_threads().load(std::memory_order_relaxed);
+        if (configured > 0) {
+            return configured;
+        }
+        const char * value = ggml_moe_debug_getenv("LLAMA_MOE_HYBRID_CPU_THREADS");
         return value != nullptr ? std::max(1, atoi(value)) : 8;
     }());
     return instance;

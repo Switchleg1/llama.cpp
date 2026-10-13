@@ -2996,6 +2996,76 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_HOST_PINNED_MB"));
     add_opt(common_arg(
+        {"--moe-expert-split"}, "on|off|auto",
+        "MoE expert cache: run experts that miss the GPU cache on the CPU while the GPU computes the cached ones "
+        "(auto: on when an expert cache is configured; default: off)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "on")   { params.moe_expert_split = LLAMA_MOE_EXPERT_SPLIT_ON;   }
+            else if (value == "off")  { params.moe_expert_split = LLAMA_MOE_EXPERT_SPLIT_OFF;  }
+            else if (value == "auto") { params.moe_expert_split = LLAMA_MOE_EXPERT_SPLIT_AUTO; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_SPLIT"));
+    add_opt(common_arg(
+        {"--moe-expert-split-threads"}, "N",
+        "MoE expert split: CPU threads for experts that miss the GPU cache (default: logical cores - 1)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_split_threads = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_SPLIT_THREADS"));
+    add_opt(common_arg(
+        {"--moe-expert-promote"}, "B[:M]",
+        "MoE expert split: promote up to B CPU experts per layer call into the GPU cache, after M CPU calls each "
+        "(default: 64:2; 0 disables promotions)",
+        [](common_params & params, const std::string & value) {
+            const auto colon = value.find(':');
+            const int budget = std::stoi(value.substr(0, colon));
+            const int misses = colon == std::string::npos ? 0 : std::stoi(value.substr(colon + 1));
+            if (budget < 0 || misses < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_promote_budget = budget;
+            params.moe_expert_promote_misses = misses;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_PROMOTE"));
+    add_opt(common_arg(
+        {"--moe-expert-store-mb"}, "N|auto|off",
+        "MoE expert split: keep experts the GPU does not hold in a bounded RAM store of N MiB, reading the rest from "
+        "the model files (auto: free RAM less a reserve; default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.moe_expert_store_mib = LLAMA_MOE_EXPERT_STORE_OFF;
+            } else if (value == "auto") {
+                params.moe_expert_store_mib = LLAMA_MOE_EXPERT_STORE_AUTO;
+            } else {
+                const long long mib = std::stoll(value);
+                if (mib < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_expert_store_mib = mib;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_STORE_MB"));
+    add_opt(common_arg(
+        {"--moe-expert-store-adapt"}, "on|off",
+        "MoE expert store: move experts that keep being read from the model files into the store (default: on)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "on")  { params.moe_expert_store_adapt = true;  }
+            else if (value == "off") { params.moe_expert_store_adapt = false; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_STORE_ADAPT"));
+    add_opt(common_arg(
+        {"--moe-expert-profile"}, "FNAME",
+        "MoE expert store: expert usage profile; ranks what the store keeps in RAM and is updated at exit",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_PROFILE"));
+    add_opt(common_arg(
         {"--moe-early-router"},
         "MoE expert cache: predict the next layer's routed experts and prepack eligible adjacent groups (default: disabled)",
         [](common_params & params) {
