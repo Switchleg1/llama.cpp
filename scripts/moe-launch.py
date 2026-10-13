@@ -117,6 +117,9 @@ def plan(args):
         cmd += ['--moe-expert-cache-host-pinned-mb', str(pinned_mib)]
     if mtp:
         cmd += ['-md', str(mtp), '-ngld', 'all', '--spec-type', 'draft-mtp', '--spec-draft-n-max', str(drafts)]
+    # Measured: GPU-side sampling and decode/draft overlap shorten the host gap between rounds (same greedy output).
+    if not args.no_overlap:
+        cmd += ['--backend-sampling', '--decode-overlap', '--decode-boundary-overlap']
     env = {}
     if hybrid:
         env.update({'LLAMA_MOE_ADMIT_SHADOW': '1', 'LLAMA_MOE_ADMIT_DOORBELL': '1', 'LLAMA_MOE_HYBRID_CPU': '1',
@@ -361,6 +364,8 @@ def main():
     ap.add_argument('--mtp', help='MTP sidecar (default: an mtp-*.gguf next to the model)')
     ap.add_argument('--no-mtp', action='store_true')
     ap.add_argument('--drafts', type=int, default=4)
+    ap.add_argument('--no-overlap', action='store_true',
+                    help='omit the experimental --backend-sampling/--decode-overlap/--decode-boundary-overlap flags')
     ap.add_argument('--hybrid', choices=['auto', 'on', 'off'], default='auto')
     ap.add_argument('--slots', type=int, help='fixed expert cache slots instead of auto (simulates a smaller GPU)')
     ap.add_argument('--ctx', type=int, default=8192)

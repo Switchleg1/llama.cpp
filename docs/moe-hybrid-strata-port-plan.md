@@ -2210,6 +2210,39 @@ Artifacts: `build/ab-*.json`/`.server.log`, `build/nsys-llama-bf16.nsys-rep`, `b
 
 Next: kernel fusion around the hyper-connections, a draft-vocabulary subset head, planner kernel cost (25 us per call), and the remaining CPU-expert throughput before swaps-only residency can pay off.
 
+### Host gaps, backend sampling, and the expert-phase critical path
+
+A new trace of the tuned configuration (23 CPU threads) showed the GPU idle 22% of the decode window across all streams. Within graphs, gaps between kernels are negligible (median 0.19 us, about 100 ms per request), so kernel count is not the problem. The idle time sits between graphs. The largest repeated gap (about 2.3-2.7 ms per round, about 0.67 s per request) follows the verify graph's small input copies: on this Windows/WDDM machine, `cudaGraphLaunch` of the roughly 5,000-node verify graph takes about 1.9 ms, and the GPU starts only when it returns. Before the launch, about a dozen input copies each run with their own stream synchronization (about 200 us). Smaller gaps surround the logits read-back and sampling.
+
+Per layer, the expert phase is bounded by the CPU: after the planner publishes the cold experts, the GPU's fills and hot experts finish before the CPU's cold experts, and the GPU then waits (`admit_wait`). Synchronous fills are therefore mostly hidden behind CPU work. Cutting fill time alone does not shorten the round, but anything that starts the CPU earlier or makes it faster does.
+
+Measured changes (512-token driver workload, mean of the last three requests; greedy output identical, the same content hash in every run below):
+
+| Change | Before | After | Status |
+| --- | --- | --- | --- |
+| `--backend-sampling` | 61.32, 62.32 | 64.18, 63.70, 63.57 | adopted |
+| plus `--decode-overlap --decode-boundary-overlap` | 64.18, 63.70, 63.57 | 64.18, 65.92, 64.89, 65.93 | adopted |
+| segmented CUDA graph capture (first segment short so the GPU starts while the host launches the rest; segment sizes 64-1024 nodes) | 64.20-65.16 | 59.25-65.52 | reverted: gaps over 1 ms fell from 757 to 311 ms, but more launches and graph boundaries cancelled the gain |
+| `--lazy-mode off` for the 27 GiB per-layer embedding table | 65.12-66.16 | 59.92 cold, 66.24 warm | no steady-state effect, not adopted |
+| planner: count vacant slots once and skip the slot scan for misses that can neither fill nor evict | 277 ms/request | 257 ms/request | kept |
+| publish: 4-byte stores of the Q8_1 activation into mapped memory instead of byte stores (256 threads) | 162 ms/request | 132 ms/request | kept (1,024 threads was slower: 260 ms) |
+
+The launcher now adds the three adopted flags unless `--no-overlap` is given, and `build/moe-tuned-confirm-auto.json` includes them. The planner and publish changes leave decisions and bytes unchanged: KLD repeats exactly (0.008835 at budget 0, 0.009220 at budget 64). In the trace, `admit_wait` also fell from 641 to 603 ms per request.
+
+A mid-session slowdown to 60-62 tok/s was checked by building three binaries (committed source, planner plus 1,024-thread publish, planner plus 256-thread publish) and alternating them in one session: 63.39/65.80, 65.12/65.07 and 66.25/65.60. The dip came from the session, not the change.
+
+Current measured rate with the tuned configuration: about 65-66 tok/s on the 512-token driver workload, against Strata's 63.5-74.5 on the same workload in an earlier session of the same day.
+
+Remaining host-side costs worth attacking: the 1.9 ms verify-graph launch (fewer graph nodes, or a launch path that overlaps the previous round), the per-input synchronous copies before each launch, and the draft-vocabulary head.
+
+Artifacts: `build/nsys-llama-ov.nsys-rep`, `build/nsys-llama-seg.nsys-rep`, `build/nsys-llama-plan2.nsys-rep` (with `.sqlite`), `build/ab-*.json`, `build/qwen-kld-hybrid-{planner,planner0,publish}.log`, `build/round2-*.log`, `build/patch_planner_publish.py`.
+
+Also tried and removed: a dedicated BF16 kernel for 1-4 columns (rows split across warps; row length split across warps for short matrices; deterministic reduction). It passed all 151 BF16 `MUL_MAT` backend-op tests and kept KLD in range (0.007822 at ub=1, 0.008275 at ub=4). Per verify graph, BF16 matmul time fell from 4.75 to 3.34 ms; the 48-row `ssm_alpha`/`ssm_beta` projections went from cuBLAS at 14.1 us to 1.9 us. However, the end-to-end measurement was confounded by a slower GPU session (unrelated kernels such as `rms_norm` ran twice as long in that trace). The backend-op perf test showed it slower on large matrices: 166/184 against 146 us at 3/4 columns for 4096x14336. With no defensible net gain, it was removed. Per-shape dispatch for the hyper-connection and SSM projections remains a candidate for the later tuning sweep.
+
+Re-checked the promotion threshold at 23 CPU threads (outputs differ between thresholds, so these are not like for like): threshold 1 gave 62.09/63.63, threshold 2 gave 64.76/65.15, threshold 3 gave 64.62/66.93. Threshold 2 is kept.
+
+Direction from here (owner): stop chasing gains of about 1% until there is a working, supported baseline. A full sweep of tests and tuning comes later.
+
 Next: isolate intermediate projections/nonlinear outputs, then select a compatible shared representation without changing ordinary inference arithmetic. A device-count hot path and mapped-memory handoff remain pending. Speculative parity, greedy-token identity and overlap remain unmeasured, and no inference hook or switch exists. Only then does an inference hook become meaningful, and speculation parity and overlap still have to be measured before any switch is exposed. The existing cached planner still performs demand filling and must not become the permanent hybrid execution path. Only after those qualifiers and speculation parity should inference wiring and a user-facing switch be exposed.
 
 ### Stream-ordered insertion without an intermediate drain

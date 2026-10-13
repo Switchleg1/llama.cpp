@@ -4190,15 +4190,26 @@ static __global__ void moe_grouped_admit_publish_activation(
     if (((const volatile moe_grouped_admit_publication *) publication)->count == 0) {
         return;
     }
-    for (uint32_t row = 0; row < n_rows; ++row) {
-        for (uint32_t i = threadIdx.x; i < n_embd && i < MOE_GROUPED_ADMIT_WIDTH; i += blockDim.x) {
-            publication->activation[row * MOE_GROUPED_ADMIT_WIDTH + i] = activation[row * row_stride + i];
-        }
+    // Mapped host writes are posted, so fewer and wider stores finish sooner; q8_1 rows are 4-byte multiples.
+    const uint32_t width = n_embd < MOE_GROUPED_ADMIT_WIDTH ? n_embd : MOE_GROUPED_ADMIT_WIDTH;
+    for (uint32_t index = threadIdx.x; index < n_rows * width; index += blockDim.x) {
+        const uint32_t row = index / width, i = index % width;
+        publication->activation[row * MOE_GROUPED_ADMIT_WIDTH + i] = activation[row * row_stride + i];
     }
     const uint32_t q8_row = (MOE_GROUPED_ADMIT_WIDTH / QK8_1) * sizeof(block_q8_1);
-    for (uint32_t row = 0; quantized != nullptr && row < n_rows; ++row) {
-        for (uint32_t i = threadIdx.x; i < quantized_row_bytes; i += blockDim.x) {
-            publication->activation_q8_1[row * q8_row + i] = quantized[row * quantized_row_bytes + i];
+    if (quantized != nullptr && quantized_row_bytes % 4 == 0 && q8_row % 4 == 0 &&
+            (reinterpret_cast<uintptr_t>(publication->activation_q8_1) | reinterpret_cast<uintptr_t>(quantized)) % 4 == 0) {
+        const uint32_t words = quantized_row_bytes / 4;
+        for (uint32_t index = threadIdx.x; index < n_rows * words; index += blockDim.x) {
+            const uint32_t row = index / words, i = index % words;
+            reinterpret_cast<uint32_t *>(publication->activation_q8_1 + row * q8_row)[i] =
+                reinterpret_cast<const uint32_t *>(quantized + row * quantized_row_bytes)[i];
+        }
+    } else {
+        for (uint32_t row = 0; quantized != nullptr && row < n_rows; ++row) {
+            for (uint32_t i = threadIdx.x; i < quantized_row_bytes; i += blockDim.x) {
+                publication->activation_q8_1[row * q8_row + i] = quantized[row * quantized_row_bytes + i];
+            }
         }
     }
     if (threadIdx.x == 0) {
@@ -4948,11 +4959,22 @@ static __global__ void moe_grouped_plan_decode(
     }
     __shared__ bool promote_this;
     __shared__ bool fill_this;
+    __shared__ bool scan_this;
     __shared__ uint32_t promotions;
+    __shared__ uint32_t vacant;
     if (thread == 0) {
         promotions = 0;
+        vacant = 0;
     }
     __syncthreads();
+    if (admit_decide) {
+        for (uint32_t candidate = thread; candidate < n_slots; candidate += blockDim.x) {
+            if (route_storage[candidate] == 0 && expert_for_slot[candidate] < 0) {
+                atomicAdd(&vacant, 1u);
+            }
+        }
+        __syncthreads();
+    }
     const uint32_t lane = thread % WARP_SIZE;
     const uint32_t warp = thread / WARP_SIZE;
     for (uint32_t miss = 0; miss < plan->n_misses; ++miss) {
@@ -4963,12 +4985,17 @@ static __global__ void moe_grouped_plan_decode(
                 admit_cold_score[expert] >= admit_promote_min;
             // Unfillable experts stay cold; without decide that is invalid and the caller falls back first.
             fill_this = fillable == nullptr || (expert >= 0 && (uint32_t) expert < n_experts && fillable[expert] != 0);
+            // Under decide, a miss that may neither take a vacant slot nor evict has no candidate: skip the scan.
+            scan_this = !admit_decide || (admit_is_decode && fill_this && (promote_this || vacant != 0));
+            if (!scan_this) {
+                selected_slot = UINT32_MAX;
+            }
         }
         __syncthreads();
         uint32_t frequency = UINT32_MAX;
         unsigned long long age = UINT64_MAX;
         uint32_t slot = UINT32_MAX;
-        for (uint32_t candidate = thread; candidate < n_slots; candidate += blockDim.x) {
+        for (uint32_t candidate = thread; scan_this && candidate < n_slots; candidate += blockDim.x) {
             if (route_storage[candidate] == 0 && fill_this &&
                     (!admit_decide || (admit_is_decode && (expert_for_slot[candidate] < 0 || promote_this)))) {
                 const int32_t resident = expert_for_slot[candidate];
@@ -4988,7 +5015,9 @@ static __global__ void moe_grouped_plan_decode(
                 }
             }
         }
-        if (blockDim.x == WARP_SIZE) {
+        if (!scan_this) {
+            // selected_slot was set by thread 0 above
+        } else if (blockDim.x == WARP_SIZE) {
             uint32_t candidate_slot = moe_grouped_warp_min_slot(frequency, age);
             // With no qualifying slot every lane ties at the maximum and lane 0 would win, which would evict a
             // slot this call uses. Only the no-eviction rule can leave a miss without a candidate.
@@ -5031,6 +5060,9 @@ static __global__ void moe_grouped_plan_decode(
                 }
             } else {
                 if (admit_decide && selected_slot < n_slots) {
+                    if (expert_for_slot[selected_slot] < 0 && vacant != 0) {
+                        --vacant;
+                    }
                     if (expert_for_slot[selected_slot] >= 0) {
                         ++promotions;   // evicted a resident: counts against the budget
                         ++plan->admit_promotions;
