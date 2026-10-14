@@ -349,6 +349,25 @@ void test_cached_mmid_prefill_and_overflow() {
     (void) run_cached_mmid_path_test(
         cuda_backend.get(), reference_backend.get(), cuda_prefill, reference_prefill, {0, 1, 2, 3, 4, 5});
 
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_IQ3_S}) {
+        auto cuda_chunk = build_cached_mmid_path_test_graph(
+            cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, 256, 4, 32);
+        auto reference_chunk = build_cached_mmid_path_test_graph(
+            reference_backend.get(), ggml_backend_cuda_buffer_type(0), type, 256, 4, 32);
+        initialize_cached_mmid_path_test_graphs(cuda_chunk, reference_chunk);
+        std::vector<int32_t> chunk_ids(4 * 32);
+        for (int32_t token = 0; token < 32; ++token) {
+            for (int32_t route = 0; route < 4; ++route) {
+                chunk_ids[token * 4 + route] = (token + route * 3) % 8;
+            }
+        }
+        const auto first = run_cached_mmid_path_test(
+            cuda_backend.get(), reference_backend.get(), cuda_chunk, reference_chunk, chunk_ids);
+        const auto second = run_cached_mmid_path_test(
+            cuda_backend.get(), reference_backend.get(), cuda_chunk, reference_chunk, chunk_ids);
+        CHECK(first == second);
+    }
+
     for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         auto cuda_fp4 = build_cached_mmid_path_test_graph(
             cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, 128, 3, 2);

@@ -3195,6 +3195,87 @@ static void ggml_cuda_moe_record_legacy_op(
 // either isn't initialized or its slot size doesn't match this op's expert
 // stride. Same approach as iteration 1: stage every unique expert touched by
 // this op into a pool scratch buffer, run the impl, free the scratch.
+static bool ggml_cuda_moe_prefill_stream(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_moe_cache * cache,
+        const std::vector<int32_t> & unique_experts, const std::vector<int32_t> & expert_to_pos,
+        const std::vector<int32_t> & ids_values, size_t source_padding, size_t capacity, bool telemetry_is_decode) {
+    ggml_tensor * src0 = dst->src[0];
+    ggml_tensor * ids = dst->src[2];
+    const size_t expert_stride = src0->nb[2];
+    const size_t n_ids = ids_values.size();
+    capacity = std::min(capacity, unique_experts.size());
+    if (capacity == 0 || cache == nullptr || expert_stride == 0 ||
+            capacity > (SIZE_MAX - source_padding) / expert_stride) {
+        return false;
+    }
+    GGML_LOG_DEBUG("moe-prefill-stream: %s rows=%lld experts=%zu capacity=%zu\n", src0->name,
+        static_cast<long long>(ids->ne[1]), unique_experts.size(), capacity);
+    const size_t buffer_bytes = capacity * expert_stride + source_padding;
+    if (buffer_bytes > SIZE_MAX / 2 || n_ids > SIZE_MAX / (2 * sizeof(int32_t))) {
+        return false;
+    }
+    ggml_cuda_pool_alloc<char> expert_buffer(ctx.pool(), 2 * buffer_bytes);
+    ggml_cuda_pool_alloc<int32_t> route_buffer(ctx.pool(), 2 * n_ids);
+    std::array<std::vector<int32_t>, 2> routes = {std::vector<int32_t>(n_ids), std::vector<int32_t>(n_ids)};
+    ggml_cuda_concurrent_event lifetime(2);
+    for (cudaEvent_t event : lifetime.join_events) {
+        CUDA_CHECK(cudaEventRecord(event, ctx.stream()));
+    }
+    std::vector<const void *> sources(capacity);
+    const char * source = static_cast<const char *>(src0->data);
+    const bool completed = [&]() {
+        for (size_t first = 0; first < unique_experts.size(); first += capacity) {
+            const size_t buffer = (first / capacity) % 2;
+            const size_t count = std::min(capacity, unique_experts.size() - first);
+            if (first >= 2 * capacity && cudaEventSynchronize(lifetime.join_events[buffer]) != cudaSuccess) {
+                return false;
+            }
+            char * weights = expert_buffer.get() + buffer * buffer_bytes;
+            int32_t * ids_data = route_buffer.get() + buffer * n_ids;
+            for (size_t i = 0; i < count; ++i) {
+                sources[i] = source + static_cast<size_t>(unique_experts[first + i]) * expert_stride;
+            }
+            for (size_t i = 0; i < n_ids; ++i) {
+                const size_t position = static_cast<size_t>(expert_to_pos[ids_values[i]]);
+                routes[buffer][i] = position >= first && position < first + count ? static_cast<int32_t>(position - first) : -1;
+            }
+            if (!ggml_cuda_moe_cache_copy_to_staging(cache, sources.data(), static_cast<int>(count),
+                    expert_stride, weights, ctx.stream(), telemetry_is_decode, lifetime.join_events[buffer]) ||
+                    (source_padding != 0 && cudaMemsetAsync(weights + count * expert_stride,
+                        0, source_padding, ctx.stream()) != cudaSuccess) ||
+                    cudaMemcpyAsync(ids_data, routes[buffer].data(), n_ids * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, ctx.stream()) != cudaSuccess) {
+                return false;
+            }
+            ggml_tensor source_view = *src0;
+            source_view.ne[2] = count;
+            source_view.nb[3] = count * expert_stride;
+            source_view.data = weights;
+            ggml_tensor ids_view = *ids;
+            ids_view.data = ids_data;
+            ids_view.nb[0] = sizeof(int32_t);
+            ids_view.nb[1] = static_cast<size_t>(ids->ne[0]) * sizeof(int32_t);
+            ids_view.nb[2] = n_ids * sizeof(int32_t);
+            ids_view.nb[3] = ids_view.nb[2];
+            ggml_tensor * original_source = dst->src[0];
+            ggml_tensor * original_ids = dst->src[2];
+            dst->src[0] = &source_view;
+            dst->src[2] = &ids_view;
+            const bool dispatched = ggml_cuda_mul_mat_id_impl(ctx, dst, true, nullptr, GGML_CUDA_MMID_CONSUMER_MMQ);
+            dst->src[0] = original_source;
+            dst->src[2] = original_ids;
+            if (!dispatched || cudaEventRecord(lifetime.join_events[buffer], ctx.stream()) != cudaSuccess) {
+                return false;
+            }
+        }
+        return true;
+    }();
+    // Drain both streams before releasing buffers, including after a partial copy failure.
+    const cudaError_t copy_status = cudaStreamSynchronize(ggml_cuda_moe_cache_copy_stream(cache));
+    const cudaError_t compute_status = cudaStreamSynchronize(ctx.stream());
+    return completed && copy_status == cudaSuccess && compute_status == cudaSuccess;
+}
+
 static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                         const std::vector<char> & ids_host_bytes,
                                         size_t ids_host_nb0,
@@ -3500,6 +3581,13 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
     if (expert_stride == 0 || unique_experts.size() > (SIZE_MAX - source_padding) / expert_stride) {
         return false;
     }
+    const char * stream_experts_env = ids->ne[1] > 8 ? ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS") : nullptr;
+    const int stream_experts = stream_experts_env != nullptr ? std::atoi(stream_experts_env) : 0;
+    if (stream_experts > 0 && runtime.consumer == GGML_CUDA_MMID_CONSUMER_MMQ) {
+        return ggml_cuda_moe_prefill_stream(ctx, dst, cache, unique_experts, expert_to_pos,
+            ids_values, source_padding, static_cast<size_t>(stream_experts), telemetry_is_decode);
+    }
+
     const size_t staged_expert_bytes = unique_experts.size() * expert_stride;
     ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), staged_expert_bytes + source_padding);
     std::vector<const void *> host_sources;
@@ -3682,7 +3770,7 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
 //
 // Cache misses cost one cudaMemcpyAsync per slab (slot_size bytes on PCIe).
 // Cache hits cost zero PCIe traffic; only the kernel reads the resident slot.
-static void ggml_cuda_mul_mat_id_cached(
+static bool ggml_cuda_mul_mat_id_cached(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
         const ggml_cuda_moe_group_call_lease * authority) {
@@ -3748,11 +3836,47 @@ static void ggml_cuda_mul_mat_id_cached(
         fputc('\n', route_dump);
     }
 
+    if (ids_host_bytes == nullptr) {
+        return false;
+    }
+    const char * stream_experts_env = ids->ne[1] > 8 && ids->ne[2] == 1 && ids->ne[3] == 1 ?
+        ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS") : nullptr;
+    const int stream_experts = stream_experts_env != nullptr ? std::atoi(stream_experts_env) : 0;
+    if (stream_experts > 0 && cache != nullptr && use_mmq &&
+            (ggml_cuda_mmid_source_capability_for(src0->type).flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0) {
+        std::vector<int32_t> positions(src0->ne[2], -1);
+        std::vector<int32_t> experts;
+        std::vector<int32_t> values;
+        for (int64_t row = 0; row < ids->ne[1]; ++row) {
+            for (int64_t route = 0; route < ids->ne[0]; ++route) {
+                int32_t expert;
+                memcpy(&expert, ids_host_bytes->data() + row * ids_host_nb1 + route * ids_host_nb0, sizeof(expert));
+                if (expert < 0 || expert >= src0->ne[2]) {
+                    return false;
+                }
+                values.push_back(expert);
+                if (positions[expert] < 0) {
+                    positions[expert] = static_cast<int32_t>(experts.size());
+                    experts.push_back(expert);
+                }
+            }
+        }
+        const int64_t remainder = src0->ne[0] % MATRIX_ROW_PADDING;
+        const size_t padding = remainder != 0 ? ggml_row_size(src0->type, MATRIX_ROW_PADDING - remainder) : 0;
+        const bool dispatched = ggml_cuda_moe_prefill_stream(ctx, dst, cache, experts, positions, values, padding,
+            static_cast<size_t>(stream_experts), telemetry_is_decode);
+        if (dispatched) {
+            ggml_cuda_moe_record_legacy_op(leased_owner, telemetry_is_decode, true, false,
+                experts.size() > static_cast<size_t>(ggml_cuda_moe_cache_n_slots(cache)), experts.size(), ggml_nbytes(ids),
+                ids_d2h_time_us, ids_d2h_sync_count, 0, 0, 0, 0, ggml_time_us() - op_start_us, ids_cache_hit);
+        }
+        return dispatched;
+    }
     if (cache == nullptr) {
         ggml_cuda_mul_mat_id_staged(
             ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2,
             single_row, telemetry_is_decode, false, nullptr, leased_owner, ids_cache_hit);
-        return;
+        return true;
     }
 
     // 3. First pass: count unique experts referenced by this op. If the
@@ -3802,7 +3926,7 @@ static void ggml_cuda_mul_mat_id_cached(
         ggml_cuda_mul_mat_id_staged(
             ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2,
             single_row, telemetry_is_decode, true, cache, leased_owner, ids_cache_hit);
-        return;
+        return true;
     }
 
     const bool compact_mmvq = !single_row && ggml_cuda_moe_use_compact_mmvq(dst, slot_capacity);
@@ -3854,7 +3978,7 @@ static void ggml_cuda_mul_mat_id_cached(
         ggml_cuda_mul_mat_id_staged(
             ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2,
             single_row, telemetry_is_decode, false, nullptr, leased_owner, ids_cache_hit);
-        return;
+        return true;
     }
     const uint64_t acquire_time_us = (uint64_t) (ggml_time_us() - acquire_start_us);
     uint64_t copy_wait_event_time_us = 0;
@@ -3939,6 +4063,7 @@ static void ggml_cuda_mul_mat_id_cached(
         telemetry_is_decode, false, false, false, (uint64_t) unique_eids.size(), (uint64_t) ggml_nbytes(ids),
         ids_d2h_time_us, ids_d2h_sync_count, acquire_time_us, remap_time_us,
         1, copy_wait_event_time_us, (uint64_t) (ggml_time_us() - op_start_us), ids_cache_hit);
+    return true;
 }
 
 static void ggml_cuda_moe_shadow_probe_registered(
@@ -4354,8 +4479,7 @@ static bool ggml_cuda_mul_mat_id(
     if (src0_cached) {
         const auto * authority = group != nullptr && group->authority ? &group->authority :
             (execution != nullptr ? execution->find_authority(dst) : nullptr);
-        ggml_cuda_mul_mat_id_cached(ctx, dst, authority);
-        return true;
+        return ggml_cuda_mul_mat_id_cached(ctx, dst, authority);
     }
     ggml_cuda_mul_mat_id_impl(ctx, dst, true);
     return true;

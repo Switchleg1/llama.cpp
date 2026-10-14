@@ -1658,6 +1658,10 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     if (cparams.prompt_moe_expert_cache_slots > 0) {
         const bool prompt_phase = n_tokens > n_tokens_tg;
         if (prompt_phase != moe_prompt_phase) {
+            if (!prompt_phase && cparams.live_context_workspace) {
+                const uint64_t released = trim_transient_memory();
+                LLAMA_LOG_INFO("moe-cache-phase-resize: released transient memory = %.2f MiB\n", released / (1024.0 * 1024.0));
+            }
             LLAMA_LOG_INFO("moe-cache-phase-resize: phase=%s slots=%d\n", prompt_phase ? "prefill" : "decode",
                 prompt_phase ? int32_t(cparams.prompt_moe_expert_cache_slots) : model.moe_expert_cache_slots());
             moe_prompt_phase = prompt_phase;

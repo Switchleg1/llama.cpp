@@ -15,10 +15,13 @@
 
 #if defined(GGML_USE_HIP)
 using ggml_cuda_moe_stream_t = hipStream_t;
+using ggml_cuda_moe_event_t = hipEvent_t;
 #elif defined(GGML_USE_MUSA)
 using ggml_cuda_moe_stream_t = musaStream_t;
+using ggml_cuda_moe_event_t = musaEvent_t;
 #else
 using ggml_cuda_moe_stream_t = cudaStream_t;
+using ggml_cuda_moe_event_t = cudaEvent_t;
 #endif
 
 #include "ggml-backend-moe.h"
@@ -1292,6 +1295,7 @@ void ggml_cuda_moe_cache_release_slots(
     int n_slot_ids);
 
 // Copy host slabs into consecutive staging slots, using resident cache slots when available.
+// With buffer_reusable, the caller owns the staging buffer and holds source residency fixed until compute completes.
 // Returns false without enqueuing work if the arguments are invalid.
 bool ggml_cuda_moe_cache_copy_to_staging(
     struct ggml_cuda_moe_cache * cache,
@@ -1300,7 +1304,8 @@ bool ggml_cuda_moe_cache_copy_to_staging(
     size_t               byte_count,
     void *               dst,
     ggml_cuda_moe_stream_t compute_stream,
-    bool                  is_decode);
+    bool                  is_decode,
+    ggml_cuda_moe_event_t  buffer_reusable = nullptr);
 
 bool ggml_cuda_moe_cache_prepare_split_staging(
     struct ggml_cuda_moe_cache * cache,

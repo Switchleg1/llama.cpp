@@ -17533,7 +17533,8 @@ bool ggml_cuda_moe_cache_copy_to_staging(
     size_t               byte_count,
     void *               dst,
     cudaStream_t         compute_stream,
-    bool                 is_decode) {
+    bool                 is_decode,
+    cudaEvent_t          buffer_reusable) {
 
     if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || !dst || !compute_stream) {
         return false;
@@ -17549,10 +17550,14 @@ bool ggml_cuda_moe_cache_copy_to_staging(
         return false;
     }
 
-    if (!ggml_cuda_moe_cache_record_compute_locked(cache, compute_stream)) {
-        return false;
+    if (buffer_reusable != nullptr) {
+        CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, buffer_reusable, 0));
+    } else {
+        if (!ggml_cuda_moe_cache_record_compute_locked(cache, compute_stream)) {
+            return false;
+        }
+        CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
     }
-    CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
 
     for (int i = 0; i < n_host_srcs;) {
         const auto it = cache->host_to_slot.find(host_srcs[i]);
