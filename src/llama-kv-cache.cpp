@@ -329,7 +329,8 @@ llama_kv_cache::llama_kv_cache(
 
         bool k_store_quantize = false;
         bool v_store_quantize = false;
-        if (ggml_backend_buft_is_host(buft)) {
+        // the accelerator writes mapped host KV itself, so it needs no staged store
+        if (ggml_backend_buft_is_host(buft) && cache_buft == nullptr) {
             k_store_quantize = resolve_store_quantize(
                     il, type_k, n_embd_k_gqa, kv_store_side::key);
             v_store_quantize = has_v && !v_trans && resolve_store_quantize(

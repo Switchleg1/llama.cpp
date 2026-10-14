@@ -194,6 +194,18 @@ __global__ void kv_cache_fill(const char * base, char * pool, const int32_t * me
     }
 }
 
+// One element of a cached row: plain types read directly, q8_0 rows are dequantized.
+template <typename src_t>
+__device__ float kv_row_value(const char * row, int64_t e) {
+    return ggml_cuda_cast<float>(reinterpret_cast<const src_t *>(row)[e]);
+}
+
+template <>
+__device__ float kv_row_value<block_q8_0>(const char * row, int64_t e) {
+    const block_q8_0 * block = reinterpret_cast<const block_q8_0 *>(row) + e / QK8_0;
+    return __half2float(block->d) * block->qs[e % QK8_0];
+}
+
 template <typename src_t, typename dst_t>
 __global__ void kv_cache_gather(const char * base, const char * pool, const int32_t * ids, const int32_t * slots,
         int64_t row0, int n_ids, int64_t row_elems, size_t row_bytes, dst_t * dst, unsigned long long * verify) {
@@ -203,8 +215,7 @@ __global__ void kv_cache_gather(const char * base, const char * pool, const int3
         const int32_t slot = slots[r];
         const char * host = base + (size_t) (row0 + ids[r]) * row_bytes;
         const char * row = slot >= 0 ? pool + (size_t) slot * row_bytes : host;
-        const src_t value = reinterpret_cast<const src_t *>(row)[e];
-        dst[i] = ggml_cuda_cast<dst_t>(value);
+        dst[i] = ggml_cuda_cast<dst_t>(kv_row_value<src_t>(row, e));
         if (verify != nullptr && slot >= 0 && e == 0) {
             atomicAdd(&verify[0], 1ull);
             bool same = true;
@@ -239,7 +250,7 @@ void kv_cache_reset_async(const kv_host_cache & cache, cudaStream_t stream) {
 
 bool kv_row_view(const kv_host_cache & cache, const ggml_tensor * t, int64_t & row0) {
     const size_t offs = t->view_src != nullptr ? t->view_offs : 0;
-    if (t->nb[1] != cache.row_bytes || offs % cache.row_bytes != 0 || (size_t) t->ne[0] * ggml_type_size(t->type) != cache.row_bytes) {
+    if (t->nb[1] != cache.row_bytes || offs % cache.row_bytes != 0 || ggml_row_size(t->type, t->ne[0]) != cache.row_bytes) {
         return false;
     }
     row0 = (int64_t) (offs / cache.row_bytes);
@@ -274,7 +285,8 @@ bool ggml_backend_cuda_kv_host_cache(ggml_tensor * tensor, ggml_tensor * pool, g
         return true;
     }
     if (meta == nullptr || page_rows == 0 || tensor->data == nullptr || pool->data == nullptr || meta->data == nullptr ||
-            pool->type != tensor->type || tensor->nb[0] != ggml_type_size(tensor->type) || ggml_is_quantized(tensor->type) ||
+            pool->type != tensor->type || tensor->nb[0] != ggml_type_size(tensor->type) ||
+            (ggml_is_quantized(tensor->type) && tensor->type != GGML_TYPE_Q8_0) ||
             pool->nb[1] != tensor->nb[1] || meta->type != GGML_TYPE_I32 || !ggml_is_contiguous(tensor) ||
             tensor->nb[1] % sizeof(uint4) != 0) {
         return false;
@@ -316,6 +328,12 @@ bool ggml_cuda_kv_host_cache_get_rows(ggml_backend_cuda_context & ctx, ggml_tens
             dst->ne[0] != src0->ne[0] || ggml_nrows(dst) != ggml_nelements(src1)) {
         return false;
     }
+    const bool supported = (dst->type == GGML_TYPE_F32 &&
+            (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_Q8_0)) ||
+        (dst->type == GGML_TYPE_F16 && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_Q8_0));
+    if (!supported) {
+        return false;
+    }
     const int n_ids = (int) ggml_nelements(src1);
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool_alloc<int32_t> slots(ctx.pool(), n_ids);
@@ -337,6 +355,10 @@ bool ggml_cuda_kv_host_cache_get_rows(ggml_backend_cuda_context & ctx, ggml_tens
         KV_GATHER(nv_bfloat16, float);
     } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         KV_GATHER(float, float);
+    } else if (src0->type == GGML_TYPE_Q8_0 && dst->type == GGML_TYPE_F32) {
+        KV_GATHER(block_q8_0, float);
+    } else if (src0->type == GGML_TYPE_Q8_0 && dst->type == GGML_TYPE_F16) {
+        KV_GATHER(block_q8_0, half);
     } else {
         GGML_ABORT("kv host cache: unsupported gather %s -> %s", ggml_type_name(src0->type), ggml_type_name(dst->type));
     }
