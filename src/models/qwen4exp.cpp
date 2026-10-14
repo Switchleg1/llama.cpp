@@ -1043,6 +1043,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // a KV cache in mapped host memory is read once into device memory: attention kernels reread their keys
+    const ggml_tensor * k_src = k->view_src ? k->view_src : k;
+    if (k_src->buffer != nullptr && ggml_backend_buffer_is_host(k_src->buffer)) {
+        k = ggml_cont(ctx0, k);
+        v = ggml_cont(ctx0, v);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 

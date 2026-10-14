@@ -2446,3 +2446,34 @@ Known failure, earlier than this work: `test-llama-archs` stops at tied-embeddin
 Artifacts: `build/qwen-kld-hybrid-gc*.log`, `build/qwen-kld-hybrid-exch8192*.log`, `build/ab-i3-gc*.json`, `build/ab-q4-gc*.json`, `build/ab-st{24,36}-*.json`, `build/nsys-{legacy,exch,nocomp}-decode.json`, `build/exchange-bench.cu`, `build/archs-fail.log`.
 
 Next: an automatic `gpu-cache` (grow and shrink by write-back and file-read rates) is deferred. Remaining baseline work: 4a validation at 16K and longer, `--kv-resident`, the smoke suite.
+
+### 4a at 16K
+
+KLD at 16K context against a dense ub=512 base: sparse ub=8 0.007988 +- 0.000338, dense ub=8 0.007746 +- 0.000307; run times 408 and 401 s. The long-context harness is not deterministic: two identical ub=512 runs differ by KLD 0.0073 (MMQ and atomics in the prompt path), so differences below about 0.007 are noise there. Perplexities are compared as well.
+
+### 4b phase 1: QSA KV in mapped host memory (`--kv-resident`)
+
+`--kv-resident N` with N > 0 puts the attention KV of a sparse-attention (QSA) model in pinned, device-mapped host memory, through a CUDA buffer type that the CUDA device claims (`CUDA_KV_Host`, `GGML_BACKEND_KV_HOST_BUFFER_TYPE`). The scheduler then keeps the attention ops on the GPU without copying: `set_rows` writes the host copy, and the 4a decode gather reads only the selected rows over the bus. The indexer cache stays in VRAM, since the indexer reads every key each step. The dense QSA path (prompt processing) copies each layer's cells into device memory once (`ggml_cont`), because attention kernels reread their keys. Only the memory type of `llama_memory_hybrid_idx`'s attention cache changes; fit counts the buffer as host memory. The VRAM page cache (phase 2) is not built yet, so N has no other effect.
+
+Checks at 16K (perplexities, since KLD is noise-bound here): base 2.3648, VRAM ub=512 2.3587, host ub=512 2.3609, VRAM ub=8 2.3629, host ub=8 2.3555.
+
+32K-token prompt at 64K context, tuned launcher configuration with MTP:
+
+| Configuration | Prefill | Decode tok/s | llama-server VRAM peak |
+| --- | --- | --- | --- |
+| VRAM KV, 48 slots | 93.8 s | 52.4 / 54.1 (another run 41.3 / 48.7) | about 13.9 GB |
+| host KV, 48 slots | 94.4 s | 50.8 / 51.4 (another run 49.3 / 52.2) | about 12.8 GB |
+| VRAM KV, auto 46 slots (new reserve) | 94.9 s | 51.7 / 52.8 | 13.7 GB |
+| host KV, auto 61 slots (new reserve) | 96.3 s | 51.4 / 51.6 | 13.7 GB |
+
+At equal slots the bus reads cost about 4% decode at 32K. At equal VRAM the freed KV (1.5 GiB at 64K) buys 15 slots, which offsets it at this length; the VRAM KV doubles at 128K.
+
+### Auto slot sizing keeps room for later growth
+
+Auto sizing used to spend all measured slack beyond `--fit-target` (1 GiB). At 64K it chose 56 slots with VRAM KV, which ran out of memory during prompt processing, and 71 with host KV, which ran at 31.6 tok/s: on Windows, speed drops sharply as dedicated memory nears its limit, before any allocation fails. Per-process counters (`build/gpu-mem-poll.py`) and an Nsight allocation trace show what the measurement misses: the CUDA memory pool, which prompt processing grows to about 0.41 GB with full ubatches (whole-bank expert staging; 0.21 GB with a short prompt), roughly 0.6 GB of CUDA context and kernel code loaded on first use, and other processes, which held 1.1-1.85 GB and drifted by about 0.15 GB within a run. `GGML_CUDA_POOL_LOG` logs pool growth.
+
+Auto sizing now also keeps the largest expert bank (an upper bound of one op's prompt staging, 450 MiB for IQ3_S) plus 512 MiB. Results: 64K with VRAM KV 46 slots, no failure; 64K with host KV 61 slots, 51.4-51.6 tok/s; 8K 67 slots (was 77), 66.5 / 66.6 tok/s against 64.1 / 57.3 for 77 slots in the same session, where one 77-slot request fell to 35.3 tok/s.
+
+Artifacts: `build/qsa-kld-*-c16384*.log`, `build/prof*-long-*.json`, `build/mem*-*.json`, `build/nsys-mem-long.nsys-rep`, `build/bufs*-*.log`.
+
+Next: phase 2, a VRAM page cache in front of the mapped KV (pages of 4 cells, device-side resolve with clock eviction inside the gather, invalidation on writes, reset after host-side writes).

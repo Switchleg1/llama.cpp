@@ -2545,6 +2545,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_CPU_PINNED"));
     add_opt(common_arg(
+        {"--kv-resident"}, "N",
+        "sparse-attention KV cache (QSA models): N > 0 keeps it in pinned host memory, which the GPU reads in place, "
+        "and frees its VRAM. N will set the VRAM cache in cells per layer; 0 keeps the KV in VRAM (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kv_resident = value;
+        }
+    ).set_env("LLAMA_ARG_KV_RESIDENT"));
+    add_opt(common_arg(
         {"--recurrent-state-offload"},
         {"--no-recurrent-state-offload"},
         string_format("offload recurrent state independently of attention KV storage (default: %s)",

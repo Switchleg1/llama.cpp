@@ -749,6 +749,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
+    cparams.kv_resident             = std::max(0, params.kv_resident);
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.offload_attn_compute    = params.offload_kqv || (params.op_offload && params.kv_cpu_pinned);
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
@@ -6166,6 +6167,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.kv_cpu_pinned               =*/ false,
+        /*.kv_resident                 =*/ 0,
         /*.recurrent_state_offload     =*/ false,
         /*.phase_aware_workspace       =*/ false,
         /*.live_context_workspace      =*/ false,

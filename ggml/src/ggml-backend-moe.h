@@ -121,6 +121,11 @@ typedef bool (*ggml_backend_moe_update_expert_source_t)(const struct ggml_tensor
 typedef void (*ggml_backend_moe_adapt_residency_t)(ggml_backend_t backend);
 typedef void (*ggml_backend_moe_set_expert_prior_t)(const struct ggml_tensor * tensor, const float * scores, uint32_t n);
 
+// Pinned, device-mapped host memory that the accelerator claims: its kernels read and write tensors in it over the
+// bus, and the scheduler does not copy them. For KV caches whose readers touch only a few rows per step.
+#define GGML_BACKEND_KV_HOST_BUFFER_TYPE_PROC_NAME "ggml_backend_kv_host_buffer_type"
+typedef ggml_backend_buffer_type_t (*ggml_backend_kv_host_buffer_type_t)(void);
+
 #define GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME "ggml_backend_moe_set_expert_sources"
 typedef bool (*ggml_backend_moe_set_expert_sources_t)(
         const struct ggml_tensor * tensor, const void * const * hosts, uint32_t n_experts, size_t stride);

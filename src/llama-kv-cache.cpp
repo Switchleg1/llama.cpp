@@ -1,3 +1,4 @@
+#include "../ggml/src/ggml-backend-moe.h"
 #include "llama-kv-cache.h"
 
 #include "llama-impl.h"
@@ -295,6 +296,16 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            if (placement.kv_host_mapped) {
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                auto kv_host = reg ? (ggml_backend_kv_host_buffer_type_t) ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_KV_HOST_BUFFER_TYPE_PROC_NAME) : nullptr;
+                if (kv_host != nullptr && kv_host() != nullptr) {
+                    buft = kv_host();
+                    dev_name = ggml_backend_buft_name(buft);
+                }
+            }
         }
 
         if (!offload && layer_offload) {

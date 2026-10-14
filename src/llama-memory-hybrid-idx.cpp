@@ -62,10 +62,14 @@ llama_memory_placement_options placement,
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // the indexer reads every key each step, so its cache stays in device memory
+        llama_memory_placement_options placement_idx = placement;
+        placement_idx.kv_host_mapped = false;
+
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, placement, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, placement_idx, "idx_");
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

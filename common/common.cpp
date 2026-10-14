@@ -1342,10 +1342,43 @@ static void common_moe_cache_auto_size(common_params & params) {
         return;
     }
     const size_t per_slot = (required_high - required_low) / (high - low);
-    const int64_t extra = slack_high > 0 ? slack_high / (int64_t) per_slot : -1;
+    // The measurement misses what grows after it: prompt processing stages up to a whole expert bank per op in the
+    // CUDA memory pool, kernels load on first use, and other processes take memory. Keep room for all three.
+    size_t staging = 0;
+    {
+        common_params probe = params;
+        probe.n_moe_expert_cache_slots = low;
+        llama_model_params mparams = common_model_params_to_llama(probe);
+        mparams.no_alloc = true;
+        // a metadata probe: keep its load messages out of the log, as the measurement does
+        struct quiet_log {
+            ggml_log_callback callback = nullptr;
+            void * user_data = nullptr;
+            quiet_log() {
+                llama_log_get(&callback, &user_data);
+                llama_log_set([](ggml_log_level level, const char * text, void * self) {
+                    const auto * q = static_cast<const quiet_log *>(self);
+                    q->callback(level >= GGML_LOG_LEVEL_ERROR ? level : GGML_LOG_LEVEL_DEBUG, text, q->user_data);
+                }, this);
+            }
+            ~quiet_log() { llama_log_set(callback, user_data); }
+        } quiet;
+        llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
+        if (model) {
+            for (const auto & group : llama_model_moe_placement(model.get()).groups) {
+                for (const auto & bank : group.banks) {
+                    staging = std::max<size_t>(staging, std::max<size_t>(bank.tensor_bytes, bank.expert_stride * group.n_experts));
+                }
+            }
+        }
+    }
+    const int64_t reserve = (int64_t) staging + (int64_t) (512u << 20);
+    const int64_t usable = slack_high - reserve;
+    const int64_t extra = usable >= 0 ? usable / (int64_t) per_slot : -((-usable + (int64_t) per_slot - 1) / (int64_t) per_slot);
     const int32_t slots = std::max<int32_t>(1, high + (int32_t) std::max<int64_t>(extra, -(high - 1)));
-    COM_INF("%s: MoE expert cache auto: %d slots (%.1f MiB per slot, %.0f MiB slack at %d slots)\n", __func__,
-        slots, per_slot / 1048576.0, slack_high / 1048576.0, high);
+    COM_INF("%s: MoE expert cache auto: %d slots (%.1f MiB per slot, %.0f MiB slack at %d slots, %.0f MiB kept for "
+        "prompt staging and later growth)\n", __func__,
+        slots, per_slot / 1048576.0, slack_high / 1048576.0, high, reserve / 1048576.0);
     params.n_moe_expert_cache_slots = slots;
 }
 
@@ -1841,6 +1874,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.kv_cpu_pinned     = params.kv_cpu_pinned;
+    cparams.kv_resident       = params.kv_resident;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.kv_gpu_layers     = (uint32_t) std::max(0, params.kv_gpu_layers);
     cparams.phase_aware_workspace = params.phase_aware_workspace;

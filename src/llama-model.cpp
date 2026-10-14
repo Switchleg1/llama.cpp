@@ -4478,7 +4478,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
-                        // sparse attention over a per-token indexer cache, in its own memory type
+                        // sparse attention over a per-token indexer cache, in its own memory type. Its attention reads
+                        // only the selected cells per step, so --kv-resident may keep the KV in mapped host memory.
+                        llama_memory_placement_options idx_placement = placement;
+                        idx_placement.kv_host_mapped = cparams.kv_resident > 0 && cparams.offload_kqv;
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
@@ -4494,7 +4497,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
-                            /* placement         */ placement,
+                            /* placement         */ idx_placement,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),

@@ -612,6 +612,7 @@ struct common_params {
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
     bool kv_cpu_pinned     = false; // use pinned host buffers for CPU-resident KV cache storage
+    int32_t kv_resident    = 0;     // --kv-resident N
     bool recurrent_state_offload = false; // offload recurrent state independently of attention KV storage
     int32_t kv_gpu_layers  = 0;     // with no_kv_offload, keep this many attention KV layers device-resident
     bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases

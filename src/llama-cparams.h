@@ -65,6 +65,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool kv_cpu_pinned;
+    int32_t kv_resident;
     bool recurrent_state_offload;
     bool phase_aware_workspace;
     bool live_context_workspace;

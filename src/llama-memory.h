@@ -18,6 +18,7 @@ struct llama_memory_placement_options {
     bool cpu_pinned = false;
     uint32_t gpu_resident_layers = 0;
     bool recurrent_offload = false;
+    bool kv_host_mapped = false;   // offloaded attention KV in accelerator-mapped host memory
 };
 
 struct llama_memory_params {

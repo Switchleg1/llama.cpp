@@ -1358,8 +1358,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // A duplicated tensor (a tied output embedding, per-layer rope freqs) is a second placement of the same
+        // weights, possibly in another buffer type, so it gets its own key.
+        const std::string resolution_key = (flags & TENSOR_DUPLICATED) ? tn.str() + "#" + std::to_string(tn.bid) : tn.str();
         const auto record_resolution = [&](tensor_override_resolution resolution) {
-            const auto [it, inserted] = tensor_override_resolutions.emplace(tn.str(), resolution);
+            const auto [it, inserted] = tensor_override_resolutions.emplace(resolution_key, resolution);
             if (!inserted && !(it->second == resolution)) {
                 throw std::runtime_error(format("conflicting placement provenance for tensor %s", tn.str().c_str()));
             }

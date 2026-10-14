@@ -595,6 +595,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
 
+            static const bool log_growth = getenv("GGML_CUDA_POOL_LOG") != nullptr;
+            if (log_growth) {
+                GGML_LOG_WARN("%s[%d]: pool grows to %.1f MiB for a %.1f MiB request (%.1f MiB in use)\n", __func__, device,
+                    (pool_size + reserve_size) / 1048576.0, size / 1048576.0, pool_used / 1048576.0);
+            }
+
             // allocate more physical memory
             CUmemAllocationProp prop = {};
             prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -1376,6 +1382,50 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     };
 
     return &ggml_backend_cuda_buffer_type_host;
+}
+
+// KV host buffer type: pinned and mapped like CUDA_Host, but claimed by the CUDA device, so kernels access its
+// tensors in place over the bus. No pageable fallback: kernels cannot reach pageable memory.
+
+static const char * ggml_backend_cuda_kv_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_KV_Host";
+
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_buft_is_cuda_kv_host(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_cuda_kv_host_buffer_type_name;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_kv_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    void * ptr = ggml_cuda_host_malloc(size);
+    if (ptr == nullptr) {
+        GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of pinned KV memory\n", __func__, size / 1024.0 / 1024.0);
+        return nullptr;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+
+    return buffer;
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_kv_host_buffer_type() {
+    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_kv_host = {
+        /* .iface    = */ {
+            /* .get_name         = */ ggml_backend_cuda_kv_host_buffer_type_name,
+            /* .alloc_buffer     = */ ggml_backend_cuda_kv_host_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        },
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
+        /* .context  = */ nullptr,
+    };
+
+    return &ggml_backend_cuda_buffer_type_kv_host;
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
@@ -8749,6 +8799,9 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
     if (ggml_backend_buft_is_cuda_moe_cached(buft)) {
         return true;
     }
+    if (ggml_backend_buft_is_cuda_kv_host(buft)) {
+        return true;
+    }
     return false;
 }
 
@@ -8968,6 +9021,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_expert_sources;
+    }
+    if (strcmp(name, GGML_BACKEND_KV_HOST_BUFFER_TYPE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_kv_host_buffer_type;
     }
     if (strcmp(name, GGML_BACKEND_MOE_SET_EXPERT_EXCHANGE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_expert_exchange;
