@@ -676,8 +676,11 @@ static void test_live_context_workspace_reserve(size_t seed, float stdev) {
             common_batch_add(batch, tokens[pos], pos, { 0 }, i + 1 == (int32_t) ctx_params.n_batch);
             ++pos;
         }
+        const auto bound = ctx->make_sched_reserve_plan(batch.n_tokens,
+            llama_get_memory(ctx.get())->get_attn_reserve_upper_bound(batch.n_tokens));
         GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
         llama_synchronize(ctx.get());
+        GGML_ASSERT(ctx->make_sched_reserve_plan(0).n_kv <= bound.n_kv);
         llama_batch_free(batch);
     }
 
@@ -696,11 +699,14 @@ static void test_live_context_workspace_reserve(size_t seed, float stdev) {
 
     // Logical positions are compacted, but live rows at the physical tail still require the high reserve.
     const auto physical_high = ctx->make_sched_reserve_plan(0);
+    GGML_ASSERT(ctx->make_sched_reserve_plan(1,
+        llama_get_memory(ctx.get())->get_attn_reserve_upper_bound(1)).n_kv == physical_high.n_kv);
     GGML_ASSERT(physical_high.n_tokens == ctx_params.n_batch);
     GGML_ASSERT(physical_high.n_kv == 1024);
     GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched, backend_cpu) > size_256);
 
     llama_memory_clear(llama_get_memory(ctx.get()), false);
+    GGML_ASSERT(llama_get_memory(ctx.get())->get_attn_reserve_upper_bound(1) == 256);
     llama_batch short_batch = llama_batch_init(1, 0, 1);
     common_batch_add(short_batch, tokens[0], 0, { 0 }, true);
     GGML_ASSERT(llama_decode(ctx.get(), short_batch) == 0);
@@ -780,6 +786,21 @@ static void test_live_context_workspace_indexer_reserve(size_t seed, float stdev
     const auto grown = ctx->make_sched_reserve_plan(ctx_params.n_batch, 257);
     GGML_ASSERT(grown.n_kv == 512);
     assert_reserve(512);
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const auto tokens = get_tokens(ctx_params.n_batch, n_vocab, seed);
+    llama_batch batch = llama_batch_init(ctx_params.n_batch, 0, 1);
+    for (int32_t i = 0; i < (int32_t) ctx_params.n_batch; ++i) {
+        common_batch_add(batch, tokens[i], i, { 0 }, i + 1 == (int32_t) ctx_params.n_batch);
+    }
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    llama_synchronize(ctx.get());
+    const float * logits = llama_get_logits_ith(ctx.get(), -1);
+    GGML_ASSERT(logits != nullptr);
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        GGML_ASSERT(std::isfinite(logits[i]));
+    }
+    llama_batch_free(batch);
 }
 
 static void test_live_context_workspace_unsupported(size_t seed, float stdev) {

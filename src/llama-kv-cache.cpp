@@ -909,6 +909,17 @@ uint32_t llama_kv_cache::get_attn_reserve_capacity() const {
     return get_size();
 }
 
+uint32_t llama_kv_cache::get_attn_reserve_upper_bound(uint32_t n_tokens) const {
+    uint64_t extent = 0;
+    for (uint32_t stream = 0; stream < n_stream; ++stream) {
+        const uint64_t start = std::max(v_heads[stream], v_cells[stream].used_max_p1());
+        extent = std::max(extent, start + n_tokens);
+    }
+    const uint32_t padding = std::max(n_pad, 256u);
+    extent = std::max<uint64_t>(padding, GGML_PAD(extent, padding));
+    return static_cast<uint32_t>(std::min<uint64_t>(get_size(), extent));
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 

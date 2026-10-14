@@ -136,6 +136,10 @@ uint32_t llama_memory_hybrid::get_attn_reserve_capacity() const {
     return mem_attn->get_attn_reserve_capacity();
 }
 
+uint32_t llama_memory_hybrid::get_attn_reserve_upper_bound(uint32_t n_tokens) const {
+    return mem_attn->get_attn_reserve_upper_bound(n_tokens);
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }

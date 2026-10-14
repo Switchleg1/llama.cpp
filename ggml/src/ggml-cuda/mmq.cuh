@@ -1680,6 +1680,24 @@ EXTERN_DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
+struct ggml_cuda_mmq_id_input {
+    ggml_cuda_pool_alloc<int32_t> ids_dst;
+    ggml_cuda_pool_alloc<int32_t> expert_bounds;
+    ggml_cuda_pool_alloc<char> data;
+    ggml_cuda_pool_alloc<float> scales;
+    int64_t n_experts = 0;
+
+    explicit ggml_cuda_mmq_id_input(ggml_cuda_pool & pool) : ids_dst(pool), expert_bounds(pool), data(pool), scales(pool) {}
+};
+
+void ggml_cuda_mmq_prepare_id_input(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_cuda_mmq_id_input & input);
+
+void ggml_cuda_mul_mat_q_prepared(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mmq_id_input & input, int64_t first_expert);
+
 void ggml_cuda_mul_mat_q_mapped(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src0_secondary,
         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,

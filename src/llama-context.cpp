@@ -1506,6 +1506,20 @@ static uint32_t llama_workspace_kv_growth_bound(uint32_t required, uint32_t capa
     return result;
 }
 
+static uint32_t llama_moe_prefill_token_limit(uint32_t maximum, uint32_t n_kv) {
+    const char * text = ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_KV_BUDGET");
+    if (text == nullptr || n_kv == 0 || text[0] == '-') {
+        return maximum;
+    }
+    char * end = nullptr;
+    const uint64_t budget = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || budget == 0) {
+        return maximum;
+    }
+    const uint64_t tokens = std::min<uint64_t>(maximum, budget / n_kv);
+    return static_cast<uint32_t>(std::min<uint64_t>(maximum, std::max<uint64_t>(64, tokens / 64 * 64)));
+}
+
 llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
         uint32_t n_tokens_req,
         uint32_t n_kv_req) const {
@@ -1546,6 +1560,11 @@ llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
         }
     }
 
+    if (plan.live_kv && cparams.phase_aware_workspace && cparams.n_seq_max == 1 &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_slots() > 0 &&
+            n_tokens_req > plan.n_tokens_decode) {
+        plan.n_tokens = std::max(plan.n_tokens_decode, std::min(plan.n_tokens, llama_moe_prefill_token_limit(plan.n_tokens_max, plan.n_kv)));
+    }
     return plan;
 }
 
@@ -1654,6 +1673,8 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
         LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
     }
 
+    const bool restore_moe_after_reserve = cparams.prompt_moe_expert_cache_slots > 0 &&
+        moe_prompt_phase && n_tokens <= n_tokens_tg;
     // the prompt workspace takes the VRAM of the slots the cache gives up while it is reserved
     if (cparams.prompt_moe_expert_cache_slots > 0) {
         const bool prompt_phase = n_tokens > n_tokens_tg;
@@ -1670,7 +1691,9 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     }
 
     synchronize();
-    refresh_moe_candidates();
+    if (!restore_moe_after_reserve) {
+        refresh_moe_candidates();
+    }
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -1856,6 +1879,10 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     }
     sched_reserved_tokens = n_tokens;
     sched_reserved_kv = live_kv ? n_kv : 0;
+    if (restore_moe_after_reserve) {
+        // Release prompt compute backing before restoring generation slots.
+        refresh_moe_candidates();
+    }
 
     if (live_kv) {
         LLAMA_LOG_INFO("%s: %s workspace reserve took %.2f ms (kv = %u), sched copies = %d\n",
@@ -4139,9 +4166,18 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
     }
 
     llama_memory_context_ptr mctx;
+    uint32_t n_ubatch = cparams.n_ubatch;
+    if (live_exact_batch_plan && cparams.phase_aware_workspace && cparams.n_seq_max == 1 &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_slots() > 0 &&
+            ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_KV_BUDGET") != nullptr &&
+            n_tokens_all > std::max(cparams.n_seq_max, sched_decode_outputs)) {
+        const uint32_t extent = memory->get_attn_reserve_upper_bound(n_tokens_all);
+        n_ubatch = std::min(n_ubatch, make_sched_reserve_plan(n_tokens_all, extent).n_tokens);
+        LLAMA_LOG_DEBUG("moe-prefill-chunk: tokens=%u kv_bound=%u maximum=%u\n", n_ubatch, extent, cparams.n_ubatch);
+    }
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, n_ubatch, output_all);
         if (!mctx) {
             return -2;
         }
@@ -4192,7 +4228,7 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
 
     if (live_exact_batch_plan) {
         try {
-            sched_reserve(n_tokens_all, mctx->get_attn_reserve_n_kv());
+            sched_reserve(std::min(n_tokens_all, n_ubatch), mctx->get_attn_reserve_n_kv());
         } catch (const std::exception & err) {
             LLAMA_LOG_ERROR("%s: failed to reserve live-context workspace: %s\n", __func__, err.what());
             return -2;

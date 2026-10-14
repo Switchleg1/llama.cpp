@@ -3215,8 +3215,23 @@ static bool ggml_cuda_moe_prefill_stream(
         return false;
     }
     ggml_cuda_pool_alloc<char> expert_buffer(ctx.pool(), 2 * buffer_bytes);
-    ggml_cuda_pool_alloc<int32_t> route_buffer(ctx.pool(), 2 * n_ids);
-    std::array<std::vector<int32_t>, 2> routes = {std::vector<int32_t>(n_ids), std::vector<int32_t>(n_ids)};
+    ggml_cuda_pool_alloc<int32_t> route_buffer(ctx.pool(), n_ids);
+    std::vector<int32_t> routes(n_ids);
+    for (size_t i = 0; i < n_ids; ++i) {
+        routes[i] = expert_to_pos[ids_values[i]];
+    }
+    CUDA_CHECK(cudaMemcpyAsync(route_buffer.get(), routes.data(), n_ids * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+    ggml_tensor source_shape = *src0;
+    source_shape.ne[2] = unique_experts.size();
+    source_shape.nb[3] = unique_experts.size() * expert_stride;
+    ggml_tensor ids_view = *ids;
+    ids_view.data = route_buffer.get();
+    ids_view.nb[0] = sizeof(int32_t);
+    ids_view.nb[1] = static_cast<size_t>(ids->ne[0]) * sizeof(int32_t);
+    ids_view.nb[2] = n_ids * sizeof(int32_t);
+    ids_view.nb[3] = ids_view.nb[2];
+    ggml_cuda_mmq_id_input input(ctx.pool());
+    ggml_cuda_mmq_prepare_id_input(ctx, &source_shape, dst->src[1], &ids_view, input);
     ggml_cuda_concurrent_event lifetime(2);
     for (cudaEvent_t event : lifetime.join_events) {
         CUDA_CHECK(cudaEventRecord(event, ctx.stream()));
@@ -3231,40 +3246,21 @@ static bool ggml_cuda_moe_prefill_stream(
                 return false;
             }
             char * weights = expert_buffer.get() + buffer * buffer_bytes;
-            int32_t * ids_data = route_buffer.get() + buffer * n_ids;
             for (size_t i = 0; i < count; ++i) {
                 sources[i] = source + static_cast<size_t>(unique_experts[first + i]) * expert_stride;
-            }
-            for (size_t i = 0; i < n_ids; ++i) {
-                const size_t position = static_cast<size_t>(expert_to_pos[ids_values[i]]);
-                routes[buffer][i] = position >= first && position < first + count ? static_cast<int32_t>(position - first) : -1;
             }
             if (!ggml_cuda_moe_cache_copy_to_staging(cache, sources.data(), static_cast<int>(count),
                     expert_stride, weights, ctx.stream(), telemetry_is_decode, lifetime.join_events[buffer]) ||
                     (source_padding != 0 && cudaMemsetAsync(weights + count * expert_stride,
-                        0, source_padding, ctx.stream()) != cudaSuccess) ||
-                    cudaMemcpyAsync(ids_data, routes[buffer].data(), n_ids * sizeof(int32_t),
-                        cudaMemcpyHostToDevice, ctx.stream()) != cudaSuccess) {
+                        0, source_padding, ctx.stream()) != cudaSuccess)) {
                 return false;
             }
             ggml_tensor source_view = *src0;
             source_view.ne[2] = count;
             source_view.nb[3] = count * expert_stride;
             source_view.data = weights;
-            ggml_tensor ids_view = *ids;
-            ids_view.data = ids_data;
-            ids_view.nb[0] = sizeof(int32_t);
-            ids_view.nb[1] = static_cast<size_t>(ids->ne[0]) * sizeof(int32_t);
-            ids_view.nb[2] = n_ids * sizeof(int32_t);
-            ids_view.nb[3] = ids_view.nb[2];
-            ggml_tensor * original_source = dst->src[0];
-            ggml_tensor * original_ids = dst->src[2];
-            dst->src[0] = &source_view;
-            dst->src[2] = &ids_view;
-            const bool dispatched = ggml_cuda_mul_mat_id_impl(ctx, dst, true, nullptr, GGML_CUDA_MMID_CONSUMER_MMQ);
-            dst->src[0] = original_source;
-            dst->src[2] = original_ids;
-            if (!dispatched || cudaEventRecord(lifetime.join_events[buffer], ctx.stream()) != cudaSuccess) {
+            ggml_cuda_mul_mat_q_prepared(ctx, &source_view, dst->src[1], &ids_view, dst, input, first);
+            if (cudaEventRecord(lifetime.join_events[buffer], ctx.stream()) != cudaSuccess) {
                 return false;
             }
         }
@@ -4485,6 +4481,75 @@ static bool ggml_cuda_mul_mat_id(
     return true;
 }
 
+static bool ggml_cuda_set_rows_host_bulk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * values = dst->src[0];
+    const ggml_tensor * indices = dst->src[1];
+    if (values == nullptr || indices == nullptr || values->ne[1] < 32 || values->type != GGML_TYPE_F32 ||
+            dst->type != GGML_TYPE_Q8_0 || dst->buffer == nullptr ||
+            !ggml_backend_buft_is_cuda_kv_host(dst->buffer->buft) ||
+            values->ne[2] != 1 || values->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            indices->ne[0] != values->ne[1] || indices->ne[1] != 1 || indices->ne[2] != 1 || indices->ne[3] != 1 ||
+            (indices->type != GGML_TYPE_I32 && indices->type != GGML_TYPE_I64) || !ggml_is_contiguous(indices) ||
+            ggml_moe_debug_getenv("LLAMA_KV_HOST_BULK_STORE") == nullptr) {
+        return false;
+    }
+    cudaStreamCaptureStatus capture;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+        return false;
+    }
+    const size_t rows = static_cast<size_t>(values->ne[1]);
+    const size_t row_bytes = ggml_row_size(dst->type, dst->ne[0]);
+    if (dst->ne[0] != values->ne[0] || dst->nb[1] != row_bytes || rows > SIZE_MAX / row_bytes) {
+        return false;
+    }
+    std::vector<char> raw_indices(ggml_nbytes(indices));
+    CUDA_CHECK(cudaMemcpyAsync(raw_indices.data(), indices->data, raw_indices.size(), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    const auto row_index = [&](size_t i) -> int64_t {
+        if (indices->type == GGML_TYPE_I64) {
+            int64_t value;
+            memcpy(&value, raw_indices.data() + i * sizeof(value), sizeof(value));
+            return value;
+        }
+        int32_t value;
+        memcpy(&value, raw_indices.data() + i * sizeof(value), sizeof(value));
+        return value;
+    };
+    const int64_t first = row_index(0);
+    if (first < 0 || first > dst->ne[1] || rows > static_cast<size_t>(dst->ne[1] - first)) {
+        return false;
+    }
+    for (size_t i = 1; i < rows; ++i) {
+        if (row_index(i) != first + static_cast<int64_t>(i)) {
+            return false;
+        }
+    }
+    ggml_cuda_pool_alloc<char> staging(ctx.pool(), rows * row_bytes);
+    ggml_cuda_pool_alloc<int64_t> row_ids(ctx.pool(), rows);
+    std::vector<int64_t> sequential(rows);
+    for (size_t i = 0; i < rows; ++i) {
+        sequential[i] = i;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(row_ids.get(), sequential.data(), rows * sizeof(int64_t), cudaMemcpyHostToDevice, ctx.stream()));
+    ggml_tensor ids_view = *indices;
+    ids_view.type = GGML_TYPE_I64;
+    ids_view.data = row_ids.get();
+    ids_view.nb[0] = sizeof(int64_t);
+    ids_view.nb[1] = ids_view.nb[2] = ids_view.nb[3] = rows * sizeof(int64_t);
+    ggml_tensor staged = *dst;
+    staged.ne[1] = rows;
+    staged.nb[2] = staged.nb[3] = rows * row_bytes;
+    staged.data = staging.get();
+    staged.src[1] = &ids_view;
+    ggml_cuda_op_set_rows(ctx, &staged);
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<char *>(dst->data) + first * row_bytes, staging.get(),
+        rows * row_bytes, cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    GGML_LOG_DEBUG("kv-host-bulk-store: %s rows=%zu bytes=%zu\n", dst->name, rows, rows * row_bytes);
+    return true;
+}
+
 static bool ggml_cuda_compute_forward(
         ggml_backend_cuda_context & ctx,
         struct ggml_tensor * dst,
@@ -4532,7 +4597,9 @@ static bool ggml_cuda_compute_forward(
             ggml_cuda_op_get_rows_back(ctx, dst);
             break;
         case GGML_OP_SET_ROWS:
-            ggml_cuda_op_set_rows(ctx, dst);
+            if (!ggml_cuda_set_rows_host_bulk(ctx, dst)) {
+                ggml_cuda_op_set_rows(ctx, dst);
+            }
             ggml_cuda_kv_host_cache_set_rows(ctx, dst);
             break;
         case GGML_OP_SET:

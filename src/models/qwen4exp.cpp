@@ -1047,7 +1047,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     const ggml_tensor * k_src = k->view_src ? k->view_src : k;
     if (k_src->buffer != nullptr && ggml_backend_buffer_is_host(k_src->buffer)) {
         k = ggml_cont(ctx0, k);
+        // Keep the transposed V layout after the host copy.
+        const bool v_trans = v->nb[1] > v->nb[2];
+        if (v_trans) {
+            v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        }
         v = ggml_cont(ctx0, v);
+        if (v_trans) {
+            v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);

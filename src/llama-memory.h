@@ -113,6 +113,12 @@ struct llama_memory_i {
     // Nonzero only when init_reserve() implements a bounded attention layout.
     virtual uint32_t get_attn_reserve_capacity() const { return 0; }
 
+    // Conservative physical KV extent after planning another batch, without changing cache state.
+    virtual uint32_t get_attn_reserve_upper_bound(uint32_t n_tokens) const {
+        GGML_UNUSED(n_tokens);
+        return get_attn_reserve_capacity();
+    }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;

@@ -335,6 +335,54 @@ void test_cached_mmid_prefill_and_overflow() {
     const auto disabled = candidate_snapshot(4, nullptr, 0);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(cuda_backend.get(), &disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
+    using host_buft_fn = ggml_backend_buffer_type_t (*)();
+    const auto host_buft = reinterpret_cast<host_buft_fn>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(cuda_backend.get())), GGML_BACKEND_KV_HOST_BUFFER_TYPE_PROC_NAME));
+    if (host_buft != nullptr && std::getenv("GGML_CUDA_NO_PINNED") == nullptr) {
+        for (ggml_type index_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+            ggml_context_ptr device_ctx(ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
+            ggml_context_ptr host_ctx(ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
+            auto * values = ggml_new_tensor_2d(device_ctx.get(), GGML_TYPE_F32, 256, 64);
+            auto * indices = ggml_new_tensor_1d(device_ctx.get(), index_type, 64);
+            auto * reference = ggml_new_tensor_2d(device_ctx.get(), GGML_TYPE_Q8_0, 256, 96);
+            auto * host = ggml_new_tensor_2d(host_ctx.get(), GGML_TYPE_Q8_0, 256, 96);
+            auto * reference_rows = ggml_set_rows(device_ctx.get(), reference, values, indices);
+            auto * host_rows = ggml_set_rows(host_ctx.get(), host, values, indices);
+            auto * reference_graph = ggml_new_graph(device_ctx.get());
+            auto * host_graph = ggml_new_graph(host_ctx.get());
+            ggml_build_forward_expand(reference_graph, reference_rows);
+            ggml_build_forward_expand(host_graph, host_rows);
+            ggml_backend_buffer_ptr device_buffer(ggml_backend_alloc_ctx_tensors(device_ctx.get(), cuda_backend.get()));
+            ggml_backend_buffer_ptr host_buffer(ggml_backend_alloc_ctx_tensors_from_buft(host_ctx.get(), host_buft()));
+            CHECK(device_buffer != nullptr && host_buffer != nullptr);
+            std::vector<float> input(256 * 64);
+            for (size_t i = 0; i < input.size(); ++i) {
+                input[i] = std::sin(float(i) * 0.17f);
+            }
+            ggml_backend_tensor_set(values, input.data(), 0, ggml_nbytes(values));
+            for (bool contiguous : {true, false}) {
+                std::vector<int32_t> rows32(64);
+                std::vector<int64_t> rows64(64);
+                for (int i = 0; i < 64; ++i) {
+                    rows32[i] = rows64[i] = 15 + (contiguous ? i : 63 - i);
+                }
+                ggml_backend_tensor_set(indices, index_type == GGML_TYPE_I32 ?
+                    static_cast<const void *>(rows32.data()) : static_cast<const void *>(rows64.data()), 0, ggml_nbytes(indices));
+                std::vector<uint8_t> zeros(ggml_nbytes(host), 0);
+                ggml_backend_tensor_set(host, zeros.data(), 0, zeros.size());
+                ggml_backend_tensor_set(reference, zeros.data(), 0, zeros.size());
+                CHECK(ggml_backend_graph_compute(cuda_backend.get(), reference_graph) == GGML_STATUS_SUCCESS);
+                CHECK(ggml_backend_graph_compute(cuda_backend.get(), host_graph) == GGML_STATUS_SUCCESS);
+                ggml_backend_synchronize(cuda_backend.get());
+                std::vector<uint8_t> actual(zeros.size()), expected(zeros.size());
+                ggml_backend_tensor_get(host, actual.data(), 0, actual.size());
+                ggml_backend_tensor_get(reference, expected.data(), 0, expected.size());
+                CHECK(actual == expected);
+            }
+        }
+        fprintf(stderr, "test-moe-cache: mapped q8_0 row stores byte-exact OK\n");
+    }
+
     auto cuda_prefill = build_cached_mmid_path_test_graph(
         cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0, 128, 3, 2);
     auto reference_prefill = build_cached_mmid_path_test_graph(
