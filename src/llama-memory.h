@@ -19,6 +19,7 @@ struct llama_memory_placement_options {
     uint32_t gpu_resident_layers = 0;
     bool recurrent_offload = false;
     bool kv_host_mapped = false;   // offloaded attention KV in accelerator-mapped host memory
+    uint32_t kv_cache_cells = 0;   // with kv_host_mapped: VRAM page cache per layer, in cells (0: none)
 };
 
 struct llama_memory_params {

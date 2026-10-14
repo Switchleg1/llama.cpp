@@ -28,6 +28,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/kv-host-cache.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmid.cuh"
@@ -1397,6 +1398,33 @@ static bool ggml_backend_buft_is_cuda_kv_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_kv_host_buffer_type_name;
 }
 
+// Host-side writes bypass the VRAM page cache, so they mark it stale.
+static ggml_backend_buffer_i & ggml_backend_cuda_kv_host_cpu_iface() {
+    static ggml_backend_buffer_i iface = {};
+    return iface;
+}
+
+static void ggml_backend_cuda_kv_host_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_kv_host_cpu_iface().set_tensor(buffer, tensor, data, offset, size);
+    ggml_cuda_kv_host_cache_mark_dirty((const char *) tensor->data + offset, size);
+}
+
+static void ggml_backend_cuda_kv_host_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_backend_cuda_kv_host_cpu_iface().memset_tensor(buffer, tensor, value, offset, size);
+    ggml_cuda_kv_host_cache_mark_dirty((const char *) tensor->data + offset, size);
+}
+
+static bool ggml_backend_cuda_kv_host_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    const bool done = ggml_backend_cuda_kv_host_cpu_iface().cpy_tensor(buffer, src, dst);
+    ggml_cuda_kv_host_cache_mark_dirty(dst->data, ggml_nbytes(dst));
+    return done;
+}
+
+static void ggml_backend_cuda_kv_host_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    ggml_backend_cuda_kv_host_cpu_iface().clear(buffer, value);
+    ggml_cuda_kv_host_cache_mark_dirty(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer));
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_kv_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * ptr = ggml_cuda_host_malloc(size);
     if (ptr == nullptr) {
@@ -1407,6 +1435,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_kv_host_buffer_type_alloc_buffer(
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    if (ggml_backend_cuda_kv_host_cpu_iface().set_tensor == nullptr) {
+        ggml_backend_cuda_kv_host_cpu_iface() = buffer->iface;
+    }
+    buffer->iface.set_tensor    = ggml_backend_cuda_kv_host_set_tensor;
+    buffer->iface.memset_tensor = ggml_backend_cuda_kv_host_memset_tensor;
+    buffer->iface.cpy_tensor    = ggml_backend_cuda_kv_host_cpy_tensor;
+    buffer->iface.clear         = ggml_backend_cuda_kv_host_clear;
+    buffer->iface.set_tensor_2d = nullptr;
 
     return buffer;
 }
@@ -4364,13 +4400,16 @@ static bool ggml_cuda_compute_forward(
             ggml_cuda_op_repeat_back(ctx, dst);
             break;
         case GGML_OP_GET_ROWS:
-            ggml_cuda_op_get_rows(ctx, dst);
+            if (!ggml_cuda_kv_host_cache_get_rows(ctx, dst)) {
+                ggml_cuda_op_get_rows(ctx, dst);
+            }
             break;
         case GGML_OP_GET_ROWS_BACK:
             ggml_cuda_op_get_rows_back(ctx, dst);
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
+            ggml_cuda_kv_host_cache_set_rows(ctx, dst);
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
@@ -6114,6 +6153,7 @@ static int ggml_cuda_try_fuse(
         ggml_tensor * set_rows = cgraph->nodes[i + 2];
 
         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
+        ggml_cuda_kv_host_cache_set_rows(*cuda_ctx, set_rows);
         return 2;
     }
 
@@ -6917,6 +6957,7 @@ static int ggml_cuda_try_fuse(
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+        ggml_cuda_kv_host_cache_set_rows(*cuda_ctx, cgraph->nodes[i + 4]);
         return 4;
     }
 
@@ -7641,6 +7682,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (cuda_ctx->moe_grouped_context != nullptr && (!use_cuda_graph || cuda_graph_update_required)) {
         cuda_ctx->moe_grouped_context->configure_early_router(cgraph, &moe_execution, cuda_ctx->stream(), use_cuda_graph && cuda_graph_update_required, *cuda_ctx);
     }
+    ggml_cuda_kv_host_cache_begin_graph(cgraph, cuda_ctx->stream());
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -7653,6 +7695,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     const bool graph_evaluated = ggml_cuda_graph_evaluate_and_capture(
         cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, &moe_execution);
+    ggml_cuda_kv_host_cache_end_graph(cgraph, cuda_ctx->stream());
 
     if (graph_evaluated && moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE) {
         graph->moe_resource_fingerprint = moe_resource_fingerprint;
@@ -9024,6 +9067,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_KV_HOST_BUFFER_TYPE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_kv_host_buffer_type;
+    }
+    if (strcmp(name, GGML_BACKEND_KV_HOST_CACHE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_kv_host_cache;
     }
     if (strcmp(name, GGML_BACKEND_MOE_SET_EXPERT_EXCHANGE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_expert_exchange;

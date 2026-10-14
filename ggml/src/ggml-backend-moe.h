@@ -126,6 +126,17 @@ typedef void (*ggml_backend_moe_set_expert_prior_t)(const struct ggml_tensor * t
 #define GGML_BACKEND_KV_HOST_BUFFER_TYPE_PROC_NAME "ggml_backend_kv_host_buffer_type"
 typedef ggml_backend_buffer_type_t (*ggml_backend_kv_host_buffer_type_t)(void);
 
+// VRAM page cache for a tensor in the KV host buffer: pool (device memory, same type and row size, a multiple of
+// page_rows rows) holds pages of page_rows rows, meta is an int32 device tensor of at least
+// ggml_backend_kv_host_cache_meta_size() elements. Gathers of the tensor then read through the pages and writes
+// drop them. Null pool unregisters.
+#define GGML_BACKEND_KV_HOST_CACHE_PROC_NAME "ggml_backend_kv_host_cache"
+typedef bool (*ggml_backend_kv_host_cache_t)(struct ggml_tensor * tensor, struct ggml_tensor * pool,
+        struct ggml_tensor * meta, uint32_t page_rows);
+static inline size_t ggml_backend_kv_host_cache_meta_size(size_t n_blocks, size_t n_pages) {
+    return n_blocks + 6 * n_pages + 3;
+}
+
 #define GGML_BACKEND_MOE_SET_EXPERT_SOURCES_PROC_NAME "ggml_backend_moe_set_expert_sources"
 typedef bool (*ggml_backend_moe_set_expert_sources_t)(
         const struct ggml_tensor * tensor, const void * const * hosts, uint32_t n_experts, size_t stride);

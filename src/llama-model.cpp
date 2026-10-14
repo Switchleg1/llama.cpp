@@ -4480,8 +4480,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type. Its attention reads
                         // only the selected cells per step, so --kv-resident may keep the KV in mapped host memory.
+                        // The VRAM cache must hold every block one gather selects: up to 8 tokens of indexer_top_k
+                        // cells, so at least ten selections (Strata's minimum). A context it covers stays in VRAM.
                         llama_memory_placement_options idx_placement = placement;
-                        idx_placement.kv_host_mapped = cparams.kv_resident > 0 && cparams.offload_kqv;
+                        const uint32_t cache_cells = std::max<uint32_t>(cparams.kv_resident, 10 * std::max<uint32_t>(hparams.indexer_top_k, 1));
+                        idx_placement.kv_host_mapped = cparams.kv_resident > 0 && cparams.offload_kqv && cparams.n_ctx_seq > cache_cells;
+                        idx_placement.kv_cache_cells = idx_placement.kv_host_mapped ? cache_cells : 0;
+                        if (cparams.kv_resident > 0 && !idx_placement.kv_host_mapped) {
+                            LLAMA_LOG_INFO("%s: --kv-resident: the %u-cell context fits the %u-cell VRAM cache; KV stays in VRAM\n",
+                                __func__, cparams.n_ctx_seq, cache_cells);
+                        }
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,

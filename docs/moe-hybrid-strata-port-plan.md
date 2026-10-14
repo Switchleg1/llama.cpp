@@ -2477,3 +2477,26 @@ Auto sizing now also keeps the largest expert bank (an upper bound of one op's p
 Artifacts: `build/qsa-kld-*-c16384*.log`, `build/prof*-long-*.json`, `build/mem*-*.json`, `build/nsys-mem-long.nsys-rep`, `build/bufs*-*.log`.
 
 Next: phase 2, a VRAM page cache in front of the mapped KV (pages of 4 cells, device-side resolve with clock eviction inside the gather, invalidation on writes, reset after host-side writes).
+
+### 4b phase 2: VRAM page cache for the mapped KV
+
+With `--kv-resident N`, each QSA layer's K and V in mapped host memory get a VRAM page cache of max(N, 10 x indexer_top_k) cells (20,480 for this model, Strata's minimum: one gather of up to 8 tokens selects at most about 8 x 513 blocks). A context that the cache covers keeps its KV in VRAM. The KV cache allocates the pools and page tables as ordinary device tensors, so fit and memory reports count them, and registers them with the backend (`GGML_BACKEND_KV_HOST_CACHE`, `ggml/src/ggml-cuda/kv-host-cache.cu`).
+
+- Pages hold 4 cells (one indexer block). A gather (`get_rows` of a registered tensor) runs a one-block resolve: hits are stamped with this call's epoch, misses claim a page by clock (second chance, never a page this call uses) and are copied in from the host copy, and a gather kernel reads each row from its page, or from the host copy when no page was free.
+- The host copy stays authoritative. `set_rows` writes it and drops the written blocks' pages, including the fused RoPE + `set_rows` paths. Another graph op writing the tensor (K shift, cell moves) resets the cache after the graph; host-side writes (state load, clear, stream copy) mark it stale and the next graph resets it first.
+- A transposed V (flash attention off) is not cached; that case already reads through the dense path.
+
+Check (debug `LLAMA_KV_CACHE_VERIFY` compares every row served from a page with the host copy): 32K context, ub=8, `--kv-resident 20480`: each of the 24 tensors served 63,006,720 rows from pages, 0 differed. KLD against a dense VRAM base 0.002972 +- 0.000085, PPL ratio 0.999698 +- 0.000673.
+
+32K-token prompt at 64K context, auto slots, same session, same llama-server VRAM (about 13.7 GB):
+
+| Configuration | Slots | Prefill | Decode tok/s |
+| --- | --- | --- | --- |
+| VRAM KV | 46 | 93.2 / 93.1 s | 52.4 / 53.8, 49.0 / 50.3 |
+| host KV + 20,480-cell cache | 56 | 95.7 / 94.7 s | 53.1 / 51.1, 55.4 / 53.8 |
+
+The cache removes phase 1's bus reads, so the freed VRAM shows up as about 4% decode at 32K (runs vary by about as much). Longer contexts were not measured.
+
+Artifacts: `build/qsa-kld-*-c32768*.log`, `build/prof5-long-*.json`, `build/mem5-long-*.json`.
+
+Next: measure 128K and longer; the MTP drafter's own KV is small and stays in VRAM (Strata's ring is not needed here). Then the smoke suite.

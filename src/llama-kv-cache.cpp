@@ -287,6 +287,7 @@ llama_kv_cache::llama_kv_cache(
         const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
 
         const char * dev_name = "CPU";
+        ggml_backend_buffer_type_t cache_buft = nullptr;   // device memory for the page caches of a mapped layer
 
         const bool layer_offload = offload || n_gpu_resident < placement.gpu_resident_layers;
         ggml_backend_buffer_type_t buft = llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
@@ -302,6 +303,7 @@ llama_kv_cache::llama_kv_cache(
                 auto kv_host = reg ? (ggml_backend_kv_host_buffer_type_t) ggml_backend_reg_get_proc_address(
                     reg, GGML_BACKEND_KV_HOST_BUFFER_TYPE_PROC_NAME) : nullptr;
                 if (kv_host != nullptr && kv_host() != nullptr) {
+                    cache_buft = buft;
                     buft = kv_host();
                     dev_name = ggml_backend_buft_name(buft);
                 }
@@ -348,6 +350,26 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_store_quantize, v_store_quantize, k_stream, v_stream, });
+
+        // page caches of 4 cells; a transposed V has no cell rows, so only a row-major V is cached
+        constexpr uint32_t page_cells = 4;
+        const uint32_t n_rows = kv_size * n_stream;
+        if (cache_buft != nullptr && placement.kv_cache_cells > 0 && n_rows % page_cells == 0 && !v_trans) {
+            ggml_context * cctx = ctx_for_buft(cache_buft);
+            const uint32_t n_pages = (placement.kv_cache_cells + page_cells - 1) / page_cells;
+            const size_t meta = ggml_backend_kv_host_cache_meta_size(n_rows / page_cells, n_pages);
+            auto & layer = layers.back();
+            layer.k_pool = ggml_new_tensor_2d(cctx, type_k, n_embd_k_gqa, (int64_t) n_pages * page_cells);
+            layer.k_meta = ggml_new_tensor_1d(cctx, GGML_TYPE_I32, (int64_t) meta);
+            ggml_format_name(layer.k_pool, "cache_%sk_pool_l%d", name_tag, il);
+            ggml_format_name(layer.k_meta, "cache_%sk_meta_l%d", name_tag, il);
+            if (has_v) {
+                layer.v_pool = ggml_new_tensor_2d(cctx, type_v, n_embd_v_gqa, (int64_t) n_pages * page_cells);
+                layer.v_meta = ggml_new_tensor_1d(cctx, GGML_TYPE_I32, (int64_t) meta);
+                ggml_format_name(layer.v_pool, "cache_%sv_pool_l%d", name_tag, il);
+                ggml_format_name(layer.v_meta, "cache_%sv_meta_l%d", name_tag, il);
+            }
+        }
     }
 
     if (!offload && placement.gpu_resident_layers > 0) {
@@ -398,6 +420,21 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // register the page caches once their tensors have memory
+    for (auto & layer : layers) {
+        if (layer.k_pool == nullptr || hparams.no_alloc) {
+            continue;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(model.dev_layer(layer.il));
+        auto set_cache = reg ? (ggml_backend_kv_host_cache_t) ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_KV_HOST_CACHE_PROC_NAME) : nullptr;
+        const bool ok = set_cache != nullptr && set_cache(layer.k, layer.k_pool, layer.k_meta, 4) &&
+            (layer.v_pool == nullptr || set_cache(layer.v, layer.v_pool, layer.v_meta, 4));
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: layer %u: VRAM page cache unavailable; the GPU reads the host KV directly\n", __func__, layer.il);
+        }
     }
 
     {
@@ -803,6 +840,23 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     }
 
     return ret;
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    for (auto & layer : layers) {
+        if (layer.k_pool == nullptr) {
+            continue;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(model.dev_layer(layer.il));
+        auto set_cache = reg ? (ggml_backend_kv_host_cache_t) ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_KV_HOST_CACHE_PROC_NAME) : nullptr;
+        if (set_cache != nullptr) {
+            set_cache(layer.k, nullptr, nullptr, 0);
+            if (layer.v != nullptr) {
+                set_cache(layer.v, nullptr, nullptr, 0);
+            }
+        }
+    }
 }
 
 llama_memory_context_ptr llama_kv_cache::init_batch(

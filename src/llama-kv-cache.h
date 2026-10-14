@@ -117,7 +117,7 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -279,6 +279,12 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // VRAM page caches of a K/V in mapped host memory
+        ggml_tensor * k_pool = nullptr;
+        ggml_tensor * v_pool = nullptr;
+        ggml_tensor * k_meta = nullptr;
+        ggml_tensor * v_meta = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
