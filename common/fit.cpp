@@ -1828,6 +1828,7 @@ static void common_params_fit_impl(
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    llama_model_ptr target_probe; // a draft head is measured against a metadata probe of the main model
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
@@ -1849,8 +1850,19 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
+                llama_model_params mparams_extra = *extra->mparams;
+                if (extra->borrows_target) {
+                    if (!target_probe) {
+                        common_scoped_log_filter quiet(log_level);
+                        llama_model_params mparams_target = *mparams;
+                        mparams_target.no_alloc  = true;
+                        mparams_target.load_mode = LLAMA_LOAD_MODE_NONE;
+                        target_probe.reset(llama_model_load_from_file(path_model, mparams_target));
+                    }
+                    mparams_extra.model_shared = target_probe.get();
+                }
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                    extra->path_model, &mparams_extra, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());

@@ -2314,11 +2314,12 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
     size_t added = 0, refused = 0;
     for (const auto & region : res->get_moe_regions()) {
         const auto & ffn = region.hybrid_ffn;
-        if (ffn.down == nullptr || moe_hybrid_cpu.count(ffn.down) != 0) {
+        if (ffn.down == nullptr || moe_hybrid_cpu.count(ffn.down) != 0 || moe_hybrid_cpu_refused.count(ffn.down) != 0) {
             continue;
         }
         auto helper = std::make_unique<llm_graph_moe_hybrid_cpu>();
         if (!helper->init(ffn, moe_hybrid_cpu_pool, n_threads)) {
+            moe_hybrid_cpu_refused.insert(ffn.down);
             ++refused;
             continue;
         }
@@ -2334,7 +2335,7 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
         downs.push_back(entry.first);
     }
     if (added != 0 || refused != 0) {
-        LLAMA_LOG_WARN("moe-hybrid-cpu: helpers=%zu added=%zu refused=%zu threads=%d q8_1_layers=%zu\n",
+        LLAMA_LOG_INFO("moe-hybrid-cpu: helpers=%zu added=%zu refused=%zu threads=%d q8_1_layers=%zu\n",
                        moe_hybrid_cpu.size(), added, refused, n_threads, moe_hybrid_q8_1_layers.size());
     }
     // Lock order: worker -> registry -> context. Do not hold the context lock beyond this point.

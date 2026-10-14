@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -381,6 +382,7 @@ private:
     uint64_t moe_hybrid_q8_1_routes = 0;
     std::mutex moe_hybrid_cpu_mutex;
     std::unordered_map<const ggml_tensor *, std::unique_ptr<llm_graph_moe_hybrid_cpu>> moe_hybrid_cpu;
+    std::unordered_set<const ggml_tensor *> moe_hybrid_cpu_refused;   // not retried on later graphs
     std::vector<float> moe_hybrid_cpu_output;
     // Opt-in bounded expert store for cold routes. Store errors fail the graph; no fallback to bank pointers.
     llama_moe_expert_store * moe_hybrid_store = nullptr;   // owned by the model

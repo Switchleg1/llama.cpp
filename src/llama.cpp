@@ -18,6 +18,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cinttypes>
 #include <cstddef>
@@ -473,7 +474,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_CACHE_LEGACY);
                 append_user_overrides();
             }
-            if (had_user_overrides && !residual) {
+            // probes load the model too: say it once per process
+            static std::atomic<bool> override_notice{false};
+            if (had_user_overrides && !residual && !override_notice.exchange(true)) {
                 LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
                                "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
             }

@@ -170,6 +170,7 @@ struct common_fit_extra_model {
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
+    bool borrows_target = false; // a draft head that takes tensors (the token embedding) from the main model
 };
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
