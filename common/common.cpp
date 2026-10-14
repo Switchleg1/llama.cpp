@@ -1318,10 +1318,18 @@ struct common_init_result::impl {
 // Resolves --moe-expert-cache-size auto: measure the whole configuration, draft included, at two slot counts,
 // derive the device cost of one slot, then add slots while the measured slack allows. Oversubscribing the
 // device is not a soft failure on Windows: paged-out slots made expert kernels 20-250 times slower.
+// With --prompt-moe-expert-cache-size auto it also measures with a decode-sized workspace: generation keeps that
+// many slots, and prompts shrink the cache to the count that fits next to the prompt workspace.
 static void common_moe_cache_auto_size(common_params & params) {
-    const auto measure = [&](int32_t slots, size_t & required, int64_t & slack) {
+    const auto measure = [&](int32_t slots, bool decode, size_t & required, int64_t & slack) {
         common_params probe = params;
         probe.n_moe_expert_cache_slots = slots;
+        probe.prompt_moe_expert_cache_slots = 0;
+        if (decode) {
+            // measurement probes reserve one workspace; a decode batch is at most 8 tokens here
+            probe.n_batch = std::min(probe.n_batch, 8);
+            probe.n_ubatch = std::min(probe.n_ubatch, 8);
+        }
         const auto measurement = common_measure_joint_configuration(probe, GGML_LOG_LEVEL_ERROR, true);
         for (const auto & owner : measurement.owners) {
             if (!owner.host && owner.capacity_available) {
@@ -1335,10 +1343,11 @@ static void common_moe_cache_auto_size(common_params & params) {
     constexpr int32_t low = 16, high = 32;
     size_t required_low = 0, required_high = 0;
     int64_t slack_low = 0, slack_high = 0;
-    if (!measure(low, required_low, slack_low) || !measure(high, required_high, slack_high) ||
+    if (!measure(low, false, required_low, slack_low) || !measure(high, false, required_high, slack_high) ||
             required_high <= required_low) {
         COM_WRN("%s: could not measure the MoE expert cache; using %d slots\n", __func__, low);
         params.n_moe_expert_cache_slots = low;
+        params.prompt_moe_expert_cache_slots = std::max(params.prompt_moe_expert_cache_slots, 0);
         return;
     }
     const size_t per_slot = (required_high - required_low) / (high - low);
@@ -1373,19 +1382,41 @@ static void common_moe_cache_auto_size(common_params & params) {
         }
     }
     const int64_t reserve = (int64_t) staging + (int64_t) (512u << 20);
-    const int64_t usable = slack_high - reserve;
-    const int64_t extra = usable >= 0 ? usable / (int64_t) per_slot : -((-usable + (int64_t) per_slot - 1) / (int64_t) per_slot);
-    const int32_t slots = std::max<int32_t>(1, high + (int32_t) std::max<int64_t>(extra, -(high - 1)));
+    const auto slots_for = [&](int64_t slack) {
+        const int64_t usable = slack - reserve;
+        const int64_t extra = usable >= 0 ? usable / (int64_t) per_slot : -((-usable + (int64_t) per_slot - 1) / (int64_t) per_slot);
+        return std::max<int32_t>(1, high + (int32_t) std::max<int64_t>(extra, -(high - 1)));
+    };
+    const int32_t slots = slots_for(slack_high);
     COM_INF("%s: MoE expert cache auto: %d slots (%.1f MiB per slot, %.0f MiB slack at %d slots, %.0f MiB kept for "
         "prompt staging and later growth)\n", __func__,
         slots, per_slot / 1048576.0, slack_high / 1048576.0, high, reserve / 1048576.0);
     params.n_moe_expert_cache_slots = slots;
+
+    if (params.prompt_moe_expert_cache_slots < 0) {
+        params.prompt_moe_expert_cache_slots = 0;
+        size_t required_decode = 0;
+        int64_t slack_decode = 0;
+        if (measure(high, true, required_decode, slack_decode)) {
+            const int32_t decode_slots = slots_for(slack_decode);
+            if (decode_slots > slots) {
+                params.n_moe_expert_cache_slots = decode_slots;
+                params.prompt_moe_expert_cache_slots = slots;
+            }
+            COM_INF("%s: MoE expert cache auto: %d slots for generation, %d while a prompt is processed\n", __func__,
+                params.n_moe_expert_cache_slots, slots);
+        }
+    }
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     if (params.n_moe_expert_cache_slots < 0) {
         common_moe_cache_auto_size(params);
+    }
+    if (params.prompt_moe_expert_cache_slots < 0) {
+        COM_WRN("%s: --prompt-moe-expert-cache-size auto needs --moe-expert-cache-size auto; keeping one size\n", __func__);
+        params.prompt_moe_expert_cache_slots = 0;
     }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -1877,7 +1908,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_resident       = params.kv_resident;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.kv_gpu_layers     = (uint32_t) std::max(0, params.kv_gpu_layers);
-    cparams.phase_aware_workspace = params.phase_aware_workspace;
+    cparams.prompt_moe_expert_cache_slots = (uint32_t) std::max(params.prompt_moe_expert_cache_slots, 0);
+    cparams.phase_aware_workspace = params.phase_aware_workspace || params.prompt_moe_expert_cache_slots > 0;
     cparams.live_context_workspace = params.live_context_workspace;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

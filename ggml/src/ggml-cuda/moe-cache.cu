@@ -16327,6 +16327,19 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v2(
     } catch (...) {
         return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
     }
+    if (snapshot != nullptr && snapshot->magic == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC &&
+            snapshot->abi_version == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION &&
+            snapshot->struct_size == sizeof(*snapshot)) {
+        const auto previous = ctx->moe_grouped_context->state();
+        if (previous.accepted && previous.n_slots != snapshot->n_slots) {
+            // Captured graphs hold cache addresses: retire them before the backing is replaced.
+            ggml_cuda_set_device(ctx->device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+#ifdef USE_CUDA_GRAPH
+            ctx->cuda_graphs.clear();
+#endif
+        }
+    }
     return ctx->moe_grouped_context->replace(snapshot);
 }
 

@@ -750,6 +750,27 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
     cparams.kv_resident             = std::max(0, params.kv_resident);
+    cparams.prompt_moe_expert_cache_slots = params.prompt_moe_expert_cache_slots;
+    if (cparams.prompt_moe_expert_cache_slots > 0) {
+        const int32_t slots = model.moe_expert_cache_slots();
+        const uint32_t min_slots = std::max(1u, hparams.n_expert_used_max());
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || slots <= 0 ||
+                cparams.prompt_moe_expert_cache_slots > uint32_t(slots) || cparams.prompt_moe_expert_cache_slots < min_slots) {
+            throw std::invalid_argument("prompt MoE cache size requires a target expert cache and must lie between the "
+                "active expert count and --moe-expert-cache-size");
+        }
+        // a resize rebuilds the slots, which would lose experts that only the GPU holds
+        if (params.moe_expert_store_mib != LLAMA_MOE_EXPERT_STORE_OFF &&
+                params.moe_expert_store_gpu_cache != LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL) {
+            throw std::invalid_argument("--prompt-moe-expert-cache-size needs --moe-expert-store-gpu-cache all");
+        }
+        if (uint32_t(slots) == cparams.prompt_moe_expert_cache_slots) {
+            cparams.prompt_moe_expert_cache_slots = 0;
+        } else {
+            LLAMA_LOG_INFO("%s: prompt MoE cache = %u slots, generation = %d; phase-aware workspace enabled\n",
+                __func__, cparams.prompt_moe_expert_cache_slots, slots);
+        }
+    }
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.offload_attn_compute    = params.offload_kqv || (params.op_offload && params.kv_cpu_pinned);
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
@@ -1633,6 +1654,17 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
         LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
     }
 
+    // the prompt workspace takes the VRAM of the slots the cache gives up while it is reserved
+    if (cparams.prompt_moe_expert_cache_slots > 0) {
+        const bool prompt_phase = n_tokens > n_tokens_tg;
+        if (prompt_phase != moe_prompt_phase) {
+            LLAMA_LOG_INFO("moe-cache-phase-resize: phase=%s slots=%d\n", prompt_phase ? "prefill" : "decode",
+                prompt_phase ? int32_t(cparams.prompt_moe_expert_cache_slots) : model.moe_expert_cache_slots());
+            moe_prompt_phase = prompt_phase;
+            moe_candidate_refresh_pending = true;
+        }
+    }
+
     synchronize();
     refresh_moe_candidates();
 
@@ -1858,6 +1890,9 @@ void llama_context::refresh_moe_candidates() {
             auto owner_candidates = candidates.get();
             owner_candidates.n_slots = std::max(
                 model.moe_expert_cache_slots(ggml_backend_get_device(endpoint.first)), 0);
+            if (moe_prompt_phase) {
+                owner_candidates.n_slots = std::min<uint32_t>(owner_candidates.n_slots, cparams.prompt_moe_expert_cache_slots);
+            }
             const int32_t result = endpoint.second(endpoint.first, &owner_candidates);
             if (result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED &&
                     result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED) {
@@ -6168,6 +6203,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.kv_cpu_pinned               =*/ false,
         /*.kv_resident                 =*/ 0,
+        /*.prompt_moe_expert_cache_slots =*/ 0,
         /*.recurrent_state_offload     =*/ false,
         /*.phase_aware_workspace       =*/ false,
         /*.live_context_workspace      =*/ false,

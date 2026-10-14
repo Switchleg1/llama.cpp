@@ -500,6 +500,9 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // --prompt-moe-expert-cache-size: the expert cache runs smaller while the prompt workspace is reserved
+    bool moe_prompt_phase = false;
     uint64_t sched_buffer_generation = 0;
     uint64_t sched_shrink_generation = 0;
     // Paired contexts must be serialized; do not execute or destroy them concurrently.

@@ -2977,6 +2977,8 @@ common_speculative_init_result::common_speculative_init_result(
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+    // the prompt cache size belongs to the target context
+    cparams.prompt_moe_expert_cache_slots = 0;
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -3028,7 +3030,7 @@ common_speculative_init_result::common_speculative_init_result(
         pimpl->context.reset(ctx_dft);
     }
 
-    if (pimpl->context && spec_mtp && params.phase_aware_workspace) {
+    if (pimpl->context && spec_mtp && (params.phase_aware_workspace || params.prompt_moe_expert_cache_slots != 0)) {
         const int32_t status = llama_attach_shared_workspace(pimpl->context.get(), ctx_tgt);
         if (status < 0) {
             LOG_ERR("%s: failed to prepare shared target/MTP workspaces\n", __func__);

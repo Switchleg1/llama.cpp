@@ -477,6 +477,7 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool kv_cpu_pinned;           // use pinned host buffers for CPU-resident KV cache storage when available
         int32_t kv_resident;          // sparse-attention KV: > 0 keeps it in pinned host memory that the GPU reads in place
+        uint32_t prompt_moe_expert_cache_slots; // 0 keeps fixed cache sizing; > 0 uses this many slots during prompt processing
         bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
         bool phase_aware_workspace;   // resize this context's compute scheduler between prompt processing and token generation
         bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent

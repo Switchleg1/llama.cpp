@@ -2500,3 +2500,15 @@ The cache removes phase 1's bus reads, so the freed VRAM shows up as about 4% de
 Artifacts: `build/qsa-kld-*-c32768*.log`, `build/prof5-long-*.json`, `build/mem5-long-*.json`.
 
 Next: measure 128K and longer; the MTP drafter's own KV is small and stays in VRAM (Strata's ring is not needed here). Then the smoke suite.
+
+### q8_0 KV in the page cache
+
+`-ctk q8_0 -ctv q8_0` stores int8 codes with an fp16 scale per 32 values (Strata scales per 64). At 256K: host KV 3,264 MiB instead of 6,144 (Strata 3.09 GiB), page caches 418 MiB instead of 778, auto slots 35 instead of 25. The page cache now copies raw q8_0 rows and dequantizes in the gather. The verifier caught stale pages at first: for host-mapped KV the q8_0 "store quantize" staging (meant for `--kv-cpu-pinned`) made the row copy run on the CPU backend, outside the invalidation hook. Mapped KV now skips the staging; CUDA `set_rows` quantizes directly. 32K check: 0 of 63,006,720 page reads per tensor differed, KLD 0.003152, PPL ratio 1.000783.
+
+### Prompt-sized expert cache (`--prompt-moe-expert-cache-size`)
+
+Ported from `4f5204c19` (branch `qwen4exp-mtp-multigpu`, prompt cache sizing only). While the workspace planner holds a prompt reservation, the expert cache runs at the prompt size; generation restores the full size. A size change synchronizes, retires captured CUDA graphs and rebuilds the slots (cleared, refilled on demand), and it turns on the phase-aware workspace. The draft context keeps one size. It is refused with `--moe-expert-store-gpu-cache` below `all`, since a rebuild would lose experts that only the GPU holds.
+
+`auto` (with an auto cache size) measures twice: the prompt size is the old auto result, with the full prompt workspace reserved; the generation size comes from a probe with an 8-token workspace (probes reserve one workspace and ignore phase-aware sizing). At 256K with q8_0 KV: 56 slots for generation, 35 during prompts. 512-token driver, alternating: 57.25 / 57.37 tok/s against 53.13 / 53.98 with a fixed 35. Every request then gives the same output, since each prompt starts from a cleared cache. Smoke suite (32K, `--kv-resident`, q8_0, auto): pass, including cancellation, cache reuse and restart.
+
+Launcher: `run-qwen-iq3-s-256k.bat` (local): 256K context, `--kv-resident 32768`, q8_0 KV, `--prompt-moe-expert-cache-size auto`, MTP with 2 drafts.

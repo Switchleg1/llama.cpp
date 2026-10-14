@@ -2556,6 +2556,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_RESIDENT"));
     add_opt(common_arg(
+        {"--prompt-moe-expert-cache-size"}, "N|auto",
+        "MoE expert cache slots while a prompt is processed; generation restores --moe-expert-cache-size. The prompt "
+        "workspace uses the VRAM the cache gives up, so generation can keep more slots. auto (with an auto cache "
+        "size) picks both sizes. 0 keeps one size (default). Each resize clears the cache.",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.prompt_moe_expert_cache_slots = -1;
+                return;
+            }
+            const int n = std::stoi(value);
+            if (n < 0) {
+                throw std::invalid_argument("prompt MoE cache size must be non-negative");
+            }
+            params.prompt_moe_expert_cache_slots = n;
+        }
+    ).set_env("LLAMA_ARG_PROMPT_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
         {"--recurrent-state-offload"},
         {"--no-recurrent-state-offload"},
         string_format("offload recurrent state independently of attention KV storage (default: %s)",

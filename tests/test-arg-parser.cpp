@@ -330,6 +330,21 @@ static void test(void) {
     assert(common_context_params_to_llama(params).moe_expert_split == LLAMA_MOE_EXPERT_SPLIT_OFF);
     assert(common_context_params_to_llama(params).moe_expert_store_gpu_cache == LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL);
     params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-size", "40", "--prompt-moe-expert-cache-size", "32"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(common_context_params_to_llama(params).prompt_moe_expert_cache_slots == 32);
+    assert(common_context_params_to_llama(params).phase_aware_workspace);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--prompt-moe-expert-cache-size", "auto"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.prompt_moe_expert_cache_slots == -1);
+    assert(common_context_params_to_llama(params).prompt_moe_expert_cache_slots == 0);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--prompt-moe-expert-cache-size", "-1"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(!common_context_params_to_llama(common_params()).phase_aware_workspace);
+
+    params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-store-gpu-cache", "0"};
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.moe_expert_store_gpu_cache == 0);
