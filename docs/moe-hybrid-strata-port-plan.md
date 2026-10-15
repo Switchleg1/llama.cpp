@@ -2555,7 +2555,7 @@ Streamed failure and store check: a test hook fails a chosen prompt group before
 
 A 24 GiB RAM store with file overflow and the 56 / 28 adaptive streamed configuration passes repeat, 24K prompt, prefix reuse, cancellation, stop and restart. Store verification reports 12,594 RAM and 11,982 file experts with zero mismatches; KV page verification checks 7,678,944 rows with zero differences. File reads dominate this run (24K prefill 78.6 s, decode about 10-14 tok/s), so it is correctness evidence only. Artifacts: `build/prefill-fail-test-*.log`, `build/smoke-prefill-store.server.log`.
 
-Gemma 4 26B-A4B check (`gemma-4-26B-A4B-it-UD-Q4_K_XL`, 128 experts / 8 active, fused Q4_K `gate_up`, Q8_0-class `down` with per-expert scale, 1024-token SWA): the expert cache reproduces ordinary `--cpu-moe` output exactly at ub512 and ub2048. The ordinary path itself, however, changes heavily with microbatch size: every pair of sizes from 256 to 4096 gives KLD about 0.52-0.56 at 4K context, CPU-only also shows it, `--swa-full` does not remove it, and original upstream `fcac19079` built CPU-only reproduces it (KLD 0.376). A direct probe shows logits beyond the sliding window depend on later tokens and on batch layout (position 3000: KLD 0.26 prefix-only versus full sequence), while position 600 agrees to about 0.001. This is an upstream Gemma 4 issue, not caused by the cache or streaming; fork and upstream also give different absolute CPU PPL (243.7 versus 210.8 at ub512), to revisit at the upstream merge.
+Gemma 4 26B-A4B check (`gemma-4-26B-A4B-it-UD-Q4_K_XL`, 128 experts / 8 active, fused Q4_K `gate_up`, Q8_0-class `down` with per-expert scale, 1024-token SWA): the expert cache reproduces ordinary `--cpu-moe` output exactly at ub512 and ub2048. The ordinary path itself, however, changes heavily with microbatch size: every pair of sizes from 256 to 4096 gives KLD about 0.52-0.56 at 4K context, CPU-only also shows it, `--swa-full` does not remove it, and original upstream `fcac19079` built CPU-only reproduces it (KLD 0.376). A direct probe shows logits beyond the sliding window depend on later tokens and on batch layout (position 3000: KLD 0.26 prefix-only versus full sequence), while position 600 agrees to about 0.001. Upstream shows the same behaviour; the follow-up below traces it to evaluating an instruction model on raw text.
 
 Streamed prefill against the ordinary path at the same microbatch: KLD 0.026 at 4K/ub2048 and 0.024 at 1K/ub1024 (98.3% same top, median 0, maximum 25.8, first chunk bit-exact). Op-by-op comparison on the real graph shows streamed and ordinary MUL_MAT_ID outputs equal to at most 2.4e-7 absolute, so the KLD comes from rare discrete flips amplified by Gemma's routing and long-range instability, not from wrong arithmetic; the likely source is MMQ stream-k work division changing with experts per launch (not proven; compile-time only). New unit cases cover Q6_K fused `gate_up` and Q8_0 `down` with padded 704-wide per-expert rows, including 128 experts / 512 tokens / capacity 32. Artifacts: `build/gemma-kld-*.log`, `build/causal-probe.cpp`, `build/upstream-cpu/`.
 
@@ -2563,4 +2563,51 @@ Public prompt-processing options: `--moe-prefill-stream` and `--moe-prefill-kv-b
 
 Validation: flags reproduce the environment-driven 7,702-token request (same reply hash; warm alternating prefill 7.29 / 5.67 s versus 6.77 / 5.94 s). A cold OS file cache after downloading other models made both modes 2-3x slower until the model file was cached again. Quality at 4K / ub2048, stream versus the ordinary cached path: IQ3_S KLD 0.0090, IQ4_XS 0.0137, Q4_K_XL 0.0138; the ordinary path against itself gives 0.0088, 0.0138 and 0.0137, so streaming is within the run-to-run noise of the ordinary Qwen path (which is itself not deterministic at 4K, unlike Gemma; to investigate separately). With defaults on, the whole smoke suite (legacy, no-MTP, store, store-gc0, KV-resident, prompt resize, parallel, no-split) passes; ub512 prefill improves, e.g. 4K legacy 11.5 -> 7.7 s and 24K KV-resident 72.2 -> 45.6 s (different sessions). Decode with a 4-token raw prompt is identical in output and speed between auto and off (64.0 / 64.1 and 67.7 / 67.7 tok/s); templated prompts change the generated text and draft acceptance, which confounds decode A/B. Artifacts: `build/pq-*.log`, `build/decode-ab*.json`, `build/smoke-results.json`.
 
-Remaining work: validate bounded chunks at longer occupied contexts; choose launcher chunk sizes. The current graph still has separate gate/up/down consumers and no fused whole-FFN streaming. Large chunks still need validation at long occupied contexts (128K+ deferred). The local 256K launcher now uses `-b 8192 -ub 4096 --live-context-workspace` with both options on auto; the same flags-only smoke passes (ready 36 s, 24K prefill 23.3 s versus 45.6 s at ub512 streamed and 72.2 s before, decode 45-49 tok/s, repeat/cancel/restart exact).
+The local 256K launcher uses `-b 8192 -ub 4096 --live-context-workspace` with both options on auto. The current graph still has separate gate/up/down consumers and no fused whole-FFN streaming.
+
+### Gemma 4 follow-up: evaluation artifact, not a model bug
+
+Upstream ggml-org master (`3e390af18`, 31 commits past `fcac19079`) has no Gemma 4 / SWA causality fix. A layer-by-layer probe (`build/causal-bisect.cpp`, eval callback, row k of every tensor, prefix-only versus full sequence) shows layer 0 identical, first difference at layer-1 `kqv_out` (3.6e-4 relative) with matching Q/K/V, then growth through quantized matmuls and routing (8e-4 input -> 5e-3 after `gate_up` -> 2e-2 after the experts). With F32 KV and flash attention off, attention at row k no longer depends on later tokens; the difference is flash-attention reduction order changing with KV length, not masking. Perplexity sensitivity remains without flash attention (KLD 0.53 ub2048 versus ub512), because any rounding difference flips near-tie decisions.
+
+The cause of the extreme numbers is the evaluation text. The instruction model, scored on raw text, keeps predicting its chat structure (a raw completion starts with `thought
+<channel|>`): README PPL about 190, wikitext 21,630 (upstream CPU 21,453), wikitext as assistant turns in its own template still 611. On the model's own chat-formatted essays (`build/gemma-self-eval.txt`, 9.5K tokens, `--parse-special`), PPL is 1.83 and ub2048 / ub1024 against ub512 give KLD 0.039 / 0.033, close to Qwen's run-to-run level. Streamed prefill at ub2048 is bit-identical to the ordinary path (KLD 0); at ub512 it is 0.025 against an otherwise deterministic baseline. `llama-perplexity` now accepts `--parse-special` (previously imatrix only) so chat-formatted transcripts tokenize as the model sees them. The earlier fork-versus-upstream PPL gap on README is within this rounding sensitivity and is not evidence of a fork bug.
+
+### Long runs (machine unattended)
+
+Configured 256K context, q8_0 host KV with 32K resident cells, MTP 2, split on, auto cache sizing; 'new' is the launcher (`-b 8192 -ub 4096 --live-context-workspace`, both prefill options auto), 'old' is the previous launcher (ub512, both options off).
+
+| Occupied context | Config | Prefill | Decode (2 x 256 tokens) |
+| --- | --- | --- | --- |
+| 131,131 | old | 455.6 s | 38.9 / 41.7 tok/s |
+| 131,131 | new, budget 33554432 | 349.3 s | 38.9 / 41.4 |
+| 131,131 | new, budget 134217728 | 168.2 s | 39.7 / 42.6 |
+| 131,131 | same + `LLAMA_KV_CACHE_VERIFY` | 168.0 s | 34.2 / 33.9 (verifier on) |
+| 250,059 | new, budget 134217728 | 512.8 s | 35.3 / 37.3 |
+
+With budget 33554432, chunks shrink to about 256 tokens at 128K, below the old ub512. Workspace estimates at a fixed product grow mainly with chunk size, so long contexts can afford larger chunks. The `auto` budget is now 134217728 (4K tokens up to 32K cells, 1K at 128K); auto fitting measures its envelope (3673 MiB peak at 32K / ub4096) and selects 56 generation / 19 prompt slots. 268435456 and 536870912 leave 2 and 1 prompt slots, below the active count, and are refused at startup. Short prompts are unchanged (7.7K: 5.93 / 6.05 s versus 5.85 / 5.92 s). The 128K verifier run checks 33,373,872 cached KV rows across 24 page caches with zero differences. Peak server VRAM about 13.2-13.8 GB. Launcher smoke with the new budget: 24K prefill 17.3 s (23.3 s before), restart exact.
+
+Matched ~83K follow-up (81,561-token first turn, 1530-token replies, second turn adds 2,356 tokens): new 47.29 -> 45.15 tok/s (-4.5%), old 48.59 -> 44.78 (-7.8%). Both turns start near 35 tok/s for the first 50 streamed pieces: after every prompt the expert cache returns to generation size cleared and refills, so the slow start is per-prompt rather than follow-up specific. Keeping residents across the prompt-to-generation resize is the improvement target.
+
+RAM-scarce test: a locked 64 GiB ballast (`build/ram-ballast.py`, `SetProcessWorkingSetSizeEx` + `VirtualLock`; an unlocked ballast was paged out) leaves about 20 GB available and under 8 GB of file cache, far below the 47 GB of experts. 24K prompt, new launcher config:
+
+| Config | Cache | Prefill | Decode |
+| --- | --- | --- | --- |
+| no store (mmap) | warm | 18.4 s | 50.1 / 49.7 |
+| 8 GiB store + file | warm | 41.7 s | 10.4 / 15.0 (108K file reads) |
+| 8 GiB store + file | scarce | 537.4 s | 3.2 / 5.9 (117K file reads) |
+| no store (mmap, pageable) | scarce | 607-649 s | 9.8-10.9 / 12.4-13.8 |
+
+The file tier costs about 30x prefill and 4-15x decode when RAM is genuinely short; the store's synchronous per-miss reads decode worse than OS-managed mmap paging. Without a store, startup under scarcity first aborted with a CUDA out-of-memory error: the automatic pinned budget used total RAM (`total - max(2 GiB, 20%)`, 76 GB) and over-pinned. The budget is now also bounded by available memory less the same reserve, sampled once per process so fit probes and the real load resolve the same placement identity (the first per-call version broke `test-moe-placement`). Under scarcity the sources then stay pageable and the server starts; normal runs keep their speed (7.7K: 5.79 s, 52.9 tok/s, same reply hash).
+
+KLD sweep, stream against `--moe-prefill-stream off` at the same microbatch, with the ordinary path against itself as noise floor (README for Qwen at 16K / 2 chunks, Gemma self-eval text at 4K):
+
+| Model | ub | Stream | Noise floor |
+| --- | --- | --- | --- |
+| IQ3_S | 512 / 2048 | 0.0066 / 0.0066 | 0.0063 / 0.0067 |
+| IQ4_XS | 512 / 2048 | 0.0103 / 0.0095 | 0.0094 / 0.0094 |
+| Q4_K_XL | 512 / 2048 | 0.0098 / 0.0105 | 0.0094 / 0.0095 |
+| Gemma Q4_K_XL | 512 / 2048 | 0.025 / 0 | 0 / 0 |
+
+Qwen streaming stays within the run-to-run noise of the ordinary path; that path itself is not deterministic at 16K. (A first sweep after defaults became auto accidentally streamed in both arms; it was discarded.) One IQ4_XS ub512 streamed run aborted silently (0xC0000409) about 10 s into computation; 15 further streamed runs, including the same sequence after an ordinary run, passed. Open; a similar silent abort was seen earlier with a Q4_0 test model.
+
+Remaining work: keep expert residents across the prompt-to-generation resize; asynchronous or batched store file reads; investigate the intermittent abort and Qwen run-to-run nondeterminism; fused whole-FFN streaming.

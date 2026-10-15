@@ -1998,9 +1998,9 @@ uint32_t common_moe_prefill_stream(const common_params & params) {
 }
 
 uint64_t common_moe_prefill_kv_budget(const common_params & params) {
-    // auto: about 4K tokens over an 8K live KV extent
+    // auto: 4K-token chunks up to 32K occupied cells, 1K at 128K
     if (params.moe_prefill_kv_budget < 0) {
-        return params.live_context_workspace ? 33554432u : 0u;
+        return params.live_context_workspace ? 134217728u : 0u;
     }
     return (uint64_t) params.moe_prefill_kv_budget;
 }

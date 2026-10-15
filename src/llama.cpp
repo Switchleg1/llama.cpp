@@ -385,7 +385,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     ggml_backend_dev_memory(cpu, &free_mem, &total_mem);
                 }
                 const size_t keep_free = std::max<size_t>(size_t(2) << 30, total_mem / 5);
-                const size_t budget = total_mem > keep_free ? total_mem - keep_free : 0;
+                // also bound by available memory, so pinning cannot exhaust RAM that other processes hold;
+                // sampled once, so fit probes and the real load resolve the same budget
+                static const size_t free_at_start = free_mem;
+                const size_t available = free_at_start > keep_free ? free_at_start - keep_free : 0;
+                const size_t budget = std::min(total_mem > keep_free ? total_mem - keep_free : 0, available);
                 if (budget >= (size_t(4) << 30)) {
                     params.moe_expert_cache_host_pinned_size = budget;
                     LLAMA_LOG_INFO("%s: MoE expert cache host-pinned budget = %.0f MiB (automatic, %.0f MiB total RAM)\n",

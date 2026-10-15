@@ -3138,7 +3138,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-prefill-kv-budget"}, "N|auto|off",
         "with --live-context-workspace, shrink prompt chunks so that chunk tokens x occupied KV cells stay within N; "
-        "auto uses 33554432 (about 4K tokens over 8K cells) (default: auto)",
+        "auto uses 134217728 (4K tokens up to 32K cells, 1K at 128K) (default: auto)",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.moe_prefill_kv_budget = -1;
@@ -3611,7 +3611,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.parse_special = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--ids"},
         string_format("only print the token IDs, in a Python-parseable list form like [1, 2, 3] (default: %s)", params.tokenize_ids ? "true" : "false"),
