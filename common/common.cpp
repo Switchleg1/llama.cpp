@@ -1322,9 +1322,10 @@ struct common_init_result::impl {
 // many slots, and prompts shrink the cache to the count that fits next to the prompt workspace.
 static void common_moe_cache_auto_size(common_params & params) {
     const uint32_t prompt_maximum = std::max(1, std::min(params.n_batch, params.n_ubatch));
+    const uint64_t kv_budget = common_moe_prefill_kv_budget(params);
     const bool envelope_requested = params.live_context_workspace && params.n_parallel == 1 && params.n_ctx > 0 &&
         (params.phase_aware_workspace || params.prompt_moe_expert_cache_slots != 0) &&
-        llama_moe_prefill_token_limit(prompt_maximum, params.n_ctx) < prompt_maximum;
+        llama_moe_prefill_token_limit(prompt_maximum, params.n_ctx, kv_budget) < prompt_maximum;
     if (envelope_requested && params.prompt_moe_expert_cache_slots < 0) {
         params.phase_aware_workspace = true;
     }
@@ -1341,13 +1342,13 @@ static void common_moe_cache_auto_size(common_params & params) {
         std::vector<common_joint_workspace_probe> workspaces;
         std::vector<common_joint_measurement> measurements;
         if (envelope) {
-            workspaces.push_back({uint32_t(params.n_ctx), llama_moe_prefill_token_limit(prompt_maximum, params.n_ctx), params.kv_resident});
+            workspaces.push_back({uint32_t(params.n_ctx), llama_moe_prefill_token_limit(prompt_maximum, params.n_ctx, kv_budget), params.kv_resident});
             for (uint32_t extent = std::min<uint32_t>(params.n_ctx, std::max(256u, prompt_maximum));
                     extent < uint32_t(params.n_ctx);
                     extent = uint32_t(std::min<uint64_t>(params.n_ctx, uint64_t(extent) * 2))) {
                 // Keep the host-read path when the real context places KV in mapped RAM.
                 const int32_t resident = params.kv_resident > 0 && params.kv_resident < params.n_ctx ? 1 : params.kv_resident;
-                workspaces.push_back({extent, llama_moe_prefill_token_limit(prompt_maximum, extent), resident});
+                workspaces.push_back({extent, llama_moe_prefill_token_limit(prompt_maximum, extent, kv_budget), resident});
             }
             measurements = common_measure_joint_workspaces(probe, workspaces, GGML_LOG_LEVEL_ERROR, true);
         } else {
@@ -1986,8 +1987,22 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_expert_store_adapt    = params.moe_expert_store_adapt;
     cparams.moe_expert_store_gpu_cache = params.moe_expert_store_gpu_cache;
     cparams.moe_expert_profile        = params.moe_expert_profile.empty() ? nullptr : params.moe_expert_profile.c_str();
+    cparams.moe_prefill_stream        = common_moe_prefill_stream(params);
+    cparams.moe_prefill_kv_budget     = common_moe_prefill_kv_budget(params);
 
     return cparams;
+}
+
+uint32_t common_moe_prefill_stream(const common_params & params) {
+    return params.moe_prefill_stream < 0 ? 32u : (uint32_t) params.moe_prefill_stream;
+}
+
+uint64_t common_moe_prefill_kv_budget(const common_params & params) {
+    // auto: about 4K tokens over an 8K live KV extent
+    if (params.moe_prefill_kv_budget < 0) {
+        return params.live_context_workspace ? 33554432u : 0u;
+    }
+    return (uint64_t) params.moe_prefill_kv_budget;
 }
 
 //

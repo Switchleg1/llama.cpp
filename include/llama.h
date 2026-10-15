@@ -501,6 +501,10 @@ extern "C" {
         bool         moe_expert_store_adapt;    // promote experts read from the file tier into the store
         int32_t      moe_expert_store_gpu_cache; // GPU experts per layer the store also holds, or _GPU_CACHE_ALL
         const char * moe_expert_profile;        // expert usage profile, read for ranking and updated at exit; NULL: none
+
+        // MoE prompt processing [EXPERIMENTAL]
+        uint32_t     moe_prefill_stream;        // experts per uploaded group in large cached expert matmuls, 0: off
+        uint64_t     moe_prefill_kv_budget;     // with live-context workspace, bound prompt chunks to tokens x KV cells, 0: off
     };
 
     struct llama_model_tensor_override {

@@ -230,8 +230,8 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
 #ifdef CUB_TOP_K_AVAILABLE
-    const char * segmented = nrows > 1 ? std::getenv("GGML_CUDA_TOPK_SEGMENTED") : nullptr;
-    if (segmented == nullptr || segmented[0] != '1' || segmented[1] != '\0') {
+    // decode-sized batches keep the per-row path
+    if (nrows <= 8 || !ggml_cuda_prefill_topk_segmented()) {
         for (int i = 0; i < nrows; i++) {
             top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
         }

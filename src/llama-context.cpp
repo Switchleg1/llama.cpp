@@ -708,6 +708,16 @@ const ggml_backend_moe_candidate_snapshot_v2 & llama_moe_candidate_snapshot::get
     return snapshot;
 }
 
+static uint64_t llama_moe_prefill_kv_budget_env() {
+    const char * text = ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_KV_BUDGET");
+    if (text == nullptr || text[0] == '-') {
+        return 0;
+    }
+    char * end = nullptr;
+    const uint64_t budget = std::strtoull(text, &end, 10);
+    return end != text && *end == '\0' ? budget : 0;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -785,6 +795,22 @@ llama_context::llama_context(
     cparams.moe_expert_store_adapt   = params.moe_expert_store_adapt;
     cparams.moe_expert_store_gpu_cache = params.moe_expert_store_gpu_cache;
     moe_expert_profile       = params.moe_expert_profile ? params.moe_expert_profile : "";
+    cparams.moe_prefill_stream    = params.moe_prefill_stream;
+    cparams.moe_prefill_kv_budget = params.moe_prefill_kv_budget > 0 ? params.moe_prefill_kv_budget : llama_moe_prefill_kv_budget_env();
+    if (cparams.moe_prefill_stream > 0 && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_enabled()) {
+        ggml_backend_moe_prefill_configure_t configure = nullptr;
+        for (size_t i = 0; i < ggml_backend_reg_count() && configure == nullptr; ++i) {
+            configure = (ggml_backend_moe_prefill_configure_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_reg_get(i), GGML_BACKEND_MOE_PREFILL_CONFIGURE_PROC_NAME);
+        }
+        const ggml_backend_moe_prefill_config config = { cparams.moe_prefill_stream, true, true };
+        if (configure == nullptr || !configure(&config)) {
+            LLAMA_LOG_WARN("%s: MoE prompt streaming is not supported by the loaded backends; disabled\n", __func__);
+            cparams.moe_prefill_stream = 0;
+        } else {
+            LLAMA_LOG_INFO("%s: MoE prompt streaming on (%u experts per group)\n", __func__, cparams.moe_prefill_stream);
+        }
+    }
     if (cparams.moe_expert_split) {
         ggml_backend_moe_hybrid_configure_t configure = nullptr;
         for (size_t i = 0; i < ggml_backend_reg_count() && configure == nullptr; ++i) {
@@ -1506,14 +1532,8 @@ static uint32_t llama_workspace_kv_growth_bound(uint32_t required, uint32_t capa
     return result;
 }
 
-uint32_t llama_moe_prefill_token_limit(uint32_t maximum, uint32_t n_kv) {
-    const char * text = ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_KV_BUDGET");
-    if (text == nullptr || n_kv == 0 || text[0] == '-') {
-        return maximum;
-    }
-    char * end = nullptr;
-    const uint64_t budget = std::strtoull(text, &end, 10);
-    if (end == text || *end != '\0' || budget == 0) {
+uint32_t llama_moe_prefill_token_limit(uint32_t maximum, uint32_t n_kv, uint64_t budget) {
+    if (n_kv == 0 || budget == 0) {
         return maximum;
     }
     const uint64_t tokens = std::min<uint64_t>(maximum, budget / n_kv);
@@ -1563,7 +1583,8 @@ llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
     if (plan.live_kv && cparams.phase_aware_workspace && cparams.n_seq_max == 1 &&
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_slots() > 0 &&
             n_tokens_req > plan.n_tokens_decode) {
-        plan.n_tokens = std::max(plan.n_tokens_decode, std::min(plan.n_tokens, llama_moe_prefill_token_limit(plan.n_tokens_max, plan.n_kv)));
+        plan.n_tokens = std::max(plan.n_tokens_decode, std::min(plan.n_tokens,
+            llama_moe_prefill_token_limit(plan.n_tokens_max, plan.n_kv, cparams.moe_prefill_kv_budget)));
     }
     return plan;
 }
@@ -4169,7 +4190,7 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
     uint32_t n_ubatch = cparams.n_ubatch;
     if (live_exact_batch_plan && cparams.phase_aware_workspace && cparams.n_seq_max == 1 &&
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_slots() > 0 &&
-            ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_KV_BUDGET") != nullptr &&
+            cparams.moe_prefill_kv_budget > 0 &&
             n_tokens_all > std::max(cparams.n_seq_max, sched_decode_outputs)) {
         const uint32_t extent = memory->get_attn_reserve_upper_bound(n_tokens_all);
         n_ubatch = std::min(n_ubatch, make_sched_reserve_plan(n_tokens_all, extent).n_tokens);
@@ -6260,6 +6281,8 @@ llama_context_params llama_context_default_params() {
         /*.moe_expert_store_adapt      =*/ true,
         /*.moe_expert_store_gpu_cache  =*/ LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL,
         /*.moe_expert_profile          =*/ nullptr,
+        /*.moe_prefill_stream          =*/ 0,
+        /*.moe_prefill_kv_budget       =*/ 0,
     };
 
     return result;

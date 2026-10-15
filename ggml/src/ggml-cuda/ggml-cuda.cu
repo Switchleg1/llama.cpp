@@ -3195,6 +3195,56 @@ static void ggml_cuda_moe_record_legacy_op(
 // either isn't initialized or its slot size doesn't match this op's expert
 // stride. Same approach as iteration 1: stage every unique expert touched by
 // this op into a pool scratch buffer, run the impl, free the scratch.
+struct ggml_cuda_prefill_runtime_config {
+    std::atomic<bool>     configured{false};
+    std::atomic<uint32_t> stream_experts{0};
+    std::atomic<bool>     kv_host_bulk_store{false};
+    std::atomic<bool>     topk_segmented{false};
+};
+
+static ggml_cuda_prefill_runtime_config & ggml_cuda_prefill_config() {
+    static ggml_cuda_prefill_runtime_config config;
+    return config;
+}
+
+static bool ggml_backend_cuda_moe_prefill_configure(const ggml_backend_moe_prefill_config * config) {
+    if (config == nullptr) {
+        return false;
+    }
+    auto & runtime = ggml_cuda_prefill_config();
+    runtime.stream_experts.store(config->stream_experts, std::memory_order_relaxed);
+    runtime.kv_host_bulk_store.store(config->kv_host_bulk_store, std::memory_order_relaxed);
+    runtime.topk_segmented.store(config->topk_segmented, std::memory_order_relaxed);
+    runtime.configured.store(true, std::memory_order_release);
+    return true;
+}
+
+uint32_t ggml_cuda_prefill_stream_experts() {
+    auto & runtime = ggml_cuda_prefill_config();
+    if (runtime.configured.load(std::memory_order_acquire)) {
+        return runtime.stream_experts.load(std::memory_order_relaxed);
+    }
+    const char * value = ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS");
+    return value != nullptr ? static_cast<uint32_t>(std::max(0, std::atoi(value))) : 0;
+}
+
+bool ggml_cuda_prefill_kv_host_bulk_store() {
+    auto & runtime = ggml_cuda_prefill_config();
+    if (runtime.configured.load(std::memory_order_acquire)) {
+        return runtime.kv_host_bulk_store.load(std::memory_order_relaxed);
+    }
+    return ggml_moe_debug_getenv("LLAMA_KV_HOST_BULK_STORE") != nullptr;
+}
+
+bool ggml_cuda_prefill_topk_segmented() {
+    auto & runtime = ggml_cuda_prefill_config();
+    if (runtime.configured.load(std::memory_order_acquire)) {
+        return runtime.topk_segmented.load(std::memory_order_relaxed);
+    }
+    const char * value = std::getenv("GGML_CUDA_TOPK_SEGMENTED");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
 static std::atomic<int> ggml_cuda_moe_prefill_stream_fail_group{-1};
 
 void ggml_cuda_moe_prefill_stream_fail_for_test(int group) {
@@ -3596,8 +3646,7 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
     if (expert_stride == 0 || unique_experts.size() > (SIZE_MAX - source_padding) / expert_stride) {
         return false;
     }
-    const char * stream_experts_env = ids->ne[1] > 8 ? ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS") : nullptr;
-    const int stream_experts = stream_experts_env != nullptr ? std::atoi(stream_experts_env) : 0;
+    const uint32_t stream_experts = ids->ne[1] > 8 ? ggml_cuda_prefill_stream_experts() : 0;
     if (stream_experts > 0 && runtime.consumer == GGML_CUDA_MMID_CONSUMER_MMQ) {
         return ggml_cuda_moe_prefill_stream(ctx, dst, cache, unique_experts, expert_to_pos,
             ids_values, source_padding, static_cast<size_t>(stream_experts), telemetry_is_decode);
@@ -3854,9 +3903,8 @@ static bool ggml_cuda_mul_mat_id_cached(
     if (ids_host_bytes == nullptr) {
         return false;
     }
-    const char * stream_experts_env = ids->ne[1] > 8 && ids->ne[2] == 1 && ids->ne[3] == 1 ?
-        ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS") : nullptr;
-    const int stream_experts = stream_experts_env != nullptr ? std::atoi(stream_experts_env) : 0;
+    const uint32_t stream_experts = ids->ne[1] > 8 && ids->ne[2] == 1 && ids->ne[3] == 1 ?
+        ggml_cuda_prefill_stream_experts() : 0;
     if (stream_experts > 0 && cache != nullptr && use_mmq &&
             (ggml_cuda_mmid_source_capability_for(src0->type).flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0) {
         std::vector<int32_t> positions(src0->ne[2], -1);
@@ -4509,7 +4557,7 @@ static bool ggml_cuda_set_rows_host_bulk(ggml_backend_cuda_context & ctx, ggml_t
             values->ne[2] != 1 || values->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
             indices->ne[0] != values->ne[1] || indices->ne[1] != 1 || indices->ne[2] != 1 || indices->ne[3] != 1 ||
             (indices->type != GGML_TYPE_I32 && indices->type != GGML_TYPE_I64) || !ggml_is_contiguous(indices) ||
-            ggml_moe_debug_getenv("LLAMA_KV_HOST_BULK_STORE") == nullptr) {
+            !ggml_cuda_prefill_kv_host_bulk_store()) {
         return false;
     }
     cudaStreamCaptureStatus capture;
@@ -9259,6 +9307,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_SET_COLD_HANDLER_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_hybrid_set_cold_handler;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_PREFILL_CONFIGURE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_prefill_configure;
     }
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_CONFIGURE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_hybrid_configure;

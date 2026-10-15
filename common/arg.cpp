@@ -3118,6 +3118,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_PROFILE"));
     add_opt(common_arg(
+        {"--moe-prefill-stream"}, "N|auto|off",
+        "MoE expert cache: during prompt processing, upload the experts of each layer in groups of N while earlier "
+        "groups compute, and store mapped q8_0 KV in bulk; auto uses 32 with an expert cache (default: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_prefill_stream = -1;
+            } else if (value == "off") {
+                params.moe_prefill_stream = 0;
+            } else {
+                const int n = std::stoi(value);
+                if (n < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_prefill_stream = n;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_STREAM"));
+    add_opt(common_arg(
+        {"--moe-prefill-kv-budget"}, "N|auto|off",
+        "with --live-context-workspace, shrink prompt chunks so that chunk tokens x occupied KV cells stay within N; "
+        "auto uses 33554432 (about 4K tokens over 8K cells) (default: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_prefill_kv_budget = -1;
+            } else if (value == "off") {
+                params.moe_prefill_kv_budget = 0;
+            } else {
+                const long long n = std::stoll(value);
+                if (n < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_prefill_kv_budget = n;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_KV_BUDGET"));
+    add_opt(common_arg(
         {"--moe-early-router"},
         "MoE expert cache: predict the next layer's routed experts and prepack eligible adjacent groups (default: disabled)",
         [](common_params & params) {

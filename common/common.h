@@ -556,6 +556,8 @@ struct common_params {
     bool    moe_expert_store_adapt    = true; // --moe-expert-store-adapt
     int32_t moe_expert_store_gpu_cache = LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL; // --moe-expert-store-gpu-cache
     std::string moe_expert_profile;           // --moe-expert-profile
+    int32_t moe_prefill_stream    = -1;       // --moe-prefill-stream, < 0: auto
+    int64_t moe_prefill_kv_budget = -1;       // --moe-prefill-kv-budget, < 0: auto
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -991,6 +993,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+
+// effective MoE prompt settings after resolving auto
+uint32_t common_moe_prefill_stream(const common_params & params);
+uint64_t common_moe_prefill_kv_budget(const common_params & params);
 
 // Apply model metadata and vocabulary-dependent adjustments that affect the
 // sampler chain before common_sampler_init(). This is shared by normal runtime

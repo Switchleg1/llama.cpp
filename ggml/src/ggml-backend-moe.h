@@ -92,6 +92,17 @@ struct ggml_backend_moe_hybrid_config {
 };
 typedef bool (*ggml_backend_moe_hybrid_configure_t)(const struct ggml_backend_moe_hybrid_config * config);
 
+// Prompt processing configuration, process-wide. stream_experts > 0 uploads the experts of a large cached
+// MUL_MAT_ID in groups of this size; kv_host_bulk_store writes large mapped q8_0 KV stores in bulk;
+// topk_segmented sorts multi-row top-k in one launch. Without a call, debug environment variables apply.
+#define GGML_BACKEND_MOE_PREFILL_CONFIGURE_PROC_NAME "ggml_backend_moe_prefill_configure"
+struct ggml_backend_moe_prefill_config {
+    uint32_t stream_experts;
+    bool     kv_host_bulk_store;
+    bool     topk_segmented;
+};
+typedef bool (*ggml_backend_moe_prefill_configure_t)(const struct ggml_backend_moe_prefill_config * config);
+
 // Strict mode: a refused or failed cold packet is not recomputed from the backend's own bank pointers.
 // The cumulative failure count covers strict refusals and device wait timeouts. Unplanned packets carry no
 // routes for the current token and are not failures.
