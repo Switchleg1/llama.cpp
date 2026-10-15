@@ -3608,6 +3608,31 @@ static int test_moe_joint_measurement(const size_t seed, const float stdev, cons
               wrapped_mtp.configuration_record == wrapped_mtp_repeat.configuration_record,
           "wrapper-generated MTP sampler identity was not stable");
 
+    auto workspace_params = wrapped_mtp_params;
+    workspace_params.sampling.backend_sampling = true;
+    const std::vector<common_joint_workspace_probe> workspace_probes = {{32, 16, 0}, {64, 8, 0}, {0, 8, 0}, {32, 16, 0}};
+    const auto workspace_results = common_measure_joint_workspaces(workspace_params, workspace_probes);
+    check(workspace_results.size() == workspace_probes.size(), "workspace measurement dropped a probe");
+    for (size_t i = 0; i < workspace_results.size(); ++i) {
+        if (workspace_probes[i].n_ctx == 0) {
+            check(workspace_results[i].completeness == COMMON_JOINT_COMPLETENESS_ERROR &&
+                      !workspace_results[i].admission_qualified,
+                  "invalid workspace probe did not fail closed");
+            continue;
+        }
+        auto independent_params = workspace_params;
+        independent_params.n_ctx = workspace_probes[i].n_ctx;
+        independent_params.n_ubatch = workspace_probes[i].n_ubatch;
+        independent_params.kv_resident = workspace_probes[i].kv_resident;
+        const auto independent = common_measure_joint_configuration(independent_params);
+        check(workspace_results[i].completeness == COMMON_JOINT_COMPLETENESS_COMPLETE &&
+                  common_joint_measurement_json(workspace_results[i]) == common_joint_measurement_json(independent),
+              "reused-model workspace measurement differs from an independent probe");
+    }
+    check(workspace_results.front().configuration_id == workspace_results.back().configuration_id &&
+              workspace_params.n_ctx == wrapped_mtp_params.n_ctx && workspace_params.n_ubatch == wrapped_mtp_params.n_ubatch,
+          "workspace probes retained context state or changed caller geometry");
+
     auto unsupported_backend_draft = wrapped_mtp_params;
     unsupported_backend_draft.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 };
     unsupported_backend_draft.speculative.draft.mparams.path = target_path.string();

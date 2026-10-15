@@ -222,6 +222,18 @@ common_joint_measurement common_measure_joint_configuration(const common_params 
                                                             ggml_log_level        log_level = GGML_LOG_LEVEL_ERROR,
                                                             bool                  observe_device_capacity = false);
 
+struct common_joint_workspace_probe {
+    uint32_t n_ctx;
+    uint32_t n_ubatch;
+    int32_t kv_resident;
+};
+
+// Reuse allocation-only models with frozen model parameters; each probe gets fresh contexts and samplers.
+// The logger thread-safety restriction of common_measure_joint_configuration also applies here.
+std::vector<common_joint_measurement> common_measure_joint_workspaces(
+        const common_params & params, const std::vector<common_joint_workspace_probe> & probes,
+        ggml_log_level log_level = GGML_LOG_LEVEL_ERROR, bool observe_device_capacity = false);
+
 std::string common_joint_measurement_json(const common_joint_measurement & measurement);
 std::string common_joint_measurement_human(const common_joint_measurement & measurement);
 

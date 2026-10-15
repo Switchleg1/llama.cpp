@@ -582,6 +582,30 @@ struct common_owned_model_params {
     }
 };
 
+struct common_joint_probe_model {
+    // Keep parameter arrays alive until the model is destroyed.
+    std::unique_ptr<common_owned_model_params> params;
+    llama_model_ptr model;
+};
+
+struct common_joint_probe_models {
+    // Borrowed extras must be destroyed before their target.
+    common_joint_probe_model target;
+    std::vector<common_joint_probe_model> extras;
+};
+
+static llama_model * common_joint_load_probe_model(common_joint_probe_model & probe, const std::string & path,
+                                                   const llama_model_params & params, llama_model * shared = nullptr) {
+    if (!probe.params) {
+        probe.params = std::make_unique<common_owned_model_params>(params);
+        probe.params->params.model_shared = shared;
+    }
+    if (!probe.model) {
+        probe.model.reset(llama_model_load_from_file(path.c_str(), probe.params->params));
+    }
+    return probe.model.get();
+}
+
 struct common_owned_context_params {
     llama_context_params                  params;
     std::vector<llama_sampler_ptr>        owned_samplers;
@@ -813,7 +837,8 @@ static common_json common_joint_memory_json(const common_joint_memory & memory) 
     return result;
 }
 
-common_joint_measurement common_measure_joint_configuration(const common_joint_measurement_request & request) {
+static common_joint_measurement common_measure_joint_configuration_impl(
+        const common_joint_measurement_request & request, common_joint_probe_models * reused_models) {
     common_joint_measurement result;
     if (request.target.role != COMMON_JOINT_ROLE_TARGET || request.target.path_model.empty()) {
         result.diagnostics.push_back("joint measurement requires a non-empty target model");
@@ -822,13 +847,15 @@ common_joint_measurement common_measure_joint_configuration(const common_joint_m
 
     try {
         common_scoped_log_filter  log_filter(request.log_level);
-        common_owned_model_params target_params(request.target.mparams);
-        llama_model_ptr           target_model(
-            llama_model_load_from_file(request.target.path_model.c_str(), target_params.params));
-        if (!target_model) {
+        common_joint_probe_models local_models;
+        auto & models = reused_models ? *reused_models : local_models;
+        models.extras.resize(request.extras.size());
+        if (!common_joint_load_probe_model(models.target, request.target.path_model, request.target.mparams)) {
             result.diagnostics.push_back("failed to load required target metadata probe");
             return result;
         }
+        auto & target_params = *models.target.params;
+        auto & target_model = models.target.model;
         common_owned_context_params target_context_params(request.target.cparams);
         llama_context_params &      target_cparams = target_context_params.params;
         llama_context_ptr           target_context(llama_init_from_model(target_model.get(), target_cparams));
@@ -962,7 +989,8 @@ common_joint_measurement common_measure_joint_configuration(const common_joint_m
             return result;
         }
 
-        for (const auto & extra : request.extras) {
+        for (size_t ei = 0; ei < request.extras.size(); ++ei) {
+            const auto & extra = request.extras[ei];
             common_joint_component_measurement component;
             component.role     = extra.role;
             component.sharing  = extra.sharing;
@@ -989,15 +1017,13 @@ common_joint_measurement common_measure_joint_configuration(const common_joint_m
                     if (extra.path_model.empty()) {
                         throw std::runtime_error("separate extra model path is empty");
                     }
-                    common_owned_model_params extra_params(extra.mparams);
-                    if (extra.sharing == COMMON_JOINT_SHARING_BORROW_TARGET) {
-                        extra_params.params.model_shared = target_model.get();
-                    }
-                    llama_model_ptr extra_model(
-                        llama_model_load_from_file(extra.path_model.c_str(), extra_params.params));
-                    if (!extra_model) {
+                    auto & extra_probe = models.extras[ei];
+                    auto * shared = extra.sharing == COMMON_JOINT_SHARING_BORROW_TARGET ? target_model.get() : nullptr;
+                    if (!common_joint_load_probe_model(extra_probe, extra.path_model, extra.mparams, shared)) {
                         throw std::runtime_error("failed to load extra model metadata probe");
                     }
+                    auto & extra_params = *extra_probe.params;
+                    auto & extra_model = extra_probe.model;
                     llama_context_ptr extra_context(llama_init_from_model(extra_model.get(), extra_cparams));
                     if (!extra_context) {
                         throw std::runtime_error("failed to create extra context probe");
@@ -1246,11 +1272,11 @@ common_joint_measurement common_measure_joint_configuration(const common_joint_m
     return result;
 }
 
+common_joint_measurement common_measure_joint_configuration(const common_joint_measurement_request & request) {
+    return common_measure_joint_configuration_impl(request, nullptr);
+}
+
 struct common_joint_sampler_bundle {
-    // Model-dependent sampler implementations may retain vocabulary pointers.
-    // Keep their allocation-only model alive until the measurement has cloned
-    // and destroyed every sampler attachment.
-    llama_model_ptr                          model;
     std::vector<common_sampler_ptr>        common;
     std::vector<llama_sampler_ptr>         raw;
     std::vector<llama_sampler_seq_config>  configs;
@@ -1361,24 +1387,24 @@ static bool common_joint_attach_target_samplers(
         common_params &                         params,
         common_joint_component_request &        target,
         common_joint_sampler_bundle &           bundle,
-        std::string &                           error) {
+        std::string &                           error,
+        common_joint_probe_models &             models) {
     if (!params.sampling.backend_sampling) {
         return true;
     }
 
     try {
-        common_owned_model_params sampler_model_params(target.mparams);
-        bundle.model.reset(llama_model_load_from_file(target.path_model.c_str(), sampler_model_params.params));
-        if (!bundle.model) {
+        llama_model * model = common_joint_load_probe_model(models.target, target.path_model, target.mparams);
+        if (!model) {
             error = "failed to load target sampler configuration probe";
             return false;
         }
 
-        common_params_sampling_prepare(bundle.model.get(), params.sampling);
+        common_params_sampling_prepare(model, params.sampling);
         bundle.common.reserve(target.cparams.n_seq_max);
         bundle.configs.reserve(target.cparams.n_seq_max);
         for (llama_seq_id seq = 0; seq < static_cast<llama_seq_id>(target.cparams.n_seq_max); ++seq) {
-            common_sampler_ptr sampler(common_sampler_init(bundle.model.get(), params.sampling));
+            common_sampler_ptr sampler(common_sampler_init(model, params.sampling));
             if (!sampler) {
                 error = "failed to initialize target backend sampler probe";
                 return false;
@@ -1389,7 +1415,6 @@ static bool common_joint_attach_target_samplers(
         if (!params.sampling.backend_sampling) {
             bundle.configs.clear();
             bundle.common.clear();
-            bundle.model.reset();
             return true;
         }
 
@@ -1458,9 +1483,9 @@ static bool common_joint_attach_draft_samplers(
     }
 }
 
-common_joint_measurement common_measure_joint_configuration(const common_params & params,
-                                                            ggml_log_level        log_level,
-                                                            bool                  observe_device_capacity) {
+static common_joint_measurement common_measure_joint_configuration_impl(
+        const common_params & params, ggml_log_level log_level, bool observe_device_capacity,
+        common_joint_probe_models & models) {
     common_params                    target_params = params;
     common_joint_measurement_request request;
     request.target.path_model       = params.model.path;
@@ -1476,7 +1501,7 @@ common_joint_measurement common_measure_joint_configuration(const common_params 
 
     common_joint_sampler_bundle target_samplers;
     std::string                 sampler_error;
-    if (!common_joint_attach_target_samplers(target_params, request.target, target_samplers, sampler_error)) {
+    if (!common_joint_attach_target_samplers(target_params, request.target, target_samplers, sampler_error, models)) {
         common_joint_measurement result;
         result.diagnostics.push_back(std::move(sampler_error));
         return result;
@@ -1504,7 +1529,35 @@ common_joint_measurement common_measure_joint_configuration(const common_params 
         }
         request.extras.push_back(std::move(extra));
     }
-    return common_measure_joint_configuration(request);
+    return common_measure_joint_configuration_impl(request, &models);
+}
+
+common_joint_measurement common_measure_joint_configuration(const common_params & params,
+                                                            ggml_log_level log_level, bool observe_device_capacity) {
+    common_joint_probe_models models;
+    return common_measure_joint_configuration_impl(params, log_level, observe_device_capacity, models);
+}
+
+std::vector<common_joint_measurement> common_measure_joint_workspaces(
+        const common_params & params, const std::vector<common_joint_workspace_probe> & probes,
+        ggml_log_level log_level, bool observe_device_capacity) {
+    common_joint_probe_models models;
+    std::vector<common_joint_measurement> results;
+    results.reserve(probes.size());
+    for (const auto & probe : probes) {
+        if (probe.n_ctx == 0 || probe.n_ctx > INT32_MAX || probe.n_ubatch == 0 || probe.n_ubatch > INT32_MAX || probe.kv_resident < 0) {
+            common_joint_measurement invalid;
+            invalid.diagnostics.push_back("invalid workspace probe geometry");
+            results.push_back(std::move(invalid));
+            continue;
+        }
+        common_params sample = params;
+        sample.n_ctx = probe.n_ctx;
+        sample.n_ubatch = probe.n_ubatch;
+        sample.kv_resident = probe.kv_resident;
+        results.push_back(common_measure_joint_configuration_impl(sample, log_level, observe_device_capacity, models));
+    }
+    return results;
 }
 
 std::string common_joint_measurement_json(const common_joint_measurement & measurement) {

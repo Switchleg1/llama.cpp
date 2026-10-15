@@ -1338,10 +1338,22 @@ static void common_moe_cache_auto_size(common_params & params) {
             probe.n_ubatch = std::min(probe.n_ubatch, 8);
         }
         const bool envelope = !decode && envelope_requested;
+        std::vector<common_joint_workspace_probe> workspaces;
+        std::vector<common_joint_measurement> measurements;
         if (envelope) {
-            probe.n_ubatch = llama_moe_prefill_token_limit(prompt_maximum, params.n_ctx);
+            workspaces.push_back({uint32_t(params.n_ctx), llama_moe_prefill_token_limit(prompt_maximum, params.n_ctx), params.kv_resident});
+            for (uint32_t extent = std::min<uint32_t>(params.n_ctx, std::max(256u, prompt_maximum));
+                    extent < uint32_t(params.n_ctx);
+                    extent = uint32_t(std::min<uint64_t>(params.n_ctx, uint64_t(extent) * 2))) {
+                // Keep the host-read path when the real context places KV in mapped RAM.
+                const int32_t resident = params.kv_resident > 0 && params.kv_resident < params.n_ctx ? 1 : params.kv_resident;
+                workspaces.push_back({extent, llama_moe_prefill_token_limit(prompt_maximum, extent), resident});
+            }
+            measurements = common_measure_joint_workspaces(probe, workspaces, GGML_LOG_LEVEL_ERROR, true);
+        } else {
+            measurements.push_back(common_measure_joint_configuration(probe, GGML_LOG_LEVEL_ERROR, true));
         }
-        const auto measurement = common_measure_joint_configuration(probe, GGML_LOG_LEVEL_ERROR, true);
+        const auto & measurement = measurements.front();
         for (const auto & owner : measurement.owners) {
             if (!owner.host && owner.capacity_available) {
                 required = owner.required_upper_bytes;
@@ -1354,16 +1366,9 @@ static void common_moe_cache_auto_size(common_params & params) {
                 }
                 size_t peak_compute = owner.memory.compute;
                 uint32_t peak_extent = params.n_ctx;
-                uint32_t peak_chunk = probe.n_ubatch;
-                size_t samples = 1;
-                for (uint32_t extent = std::min<uint32_t>(params.n_ctx, std::max(256u, prompt_maximum));
-                        extent < uint32_t(params.n_ctx);
-                        extent = uint32_t(std::min<uint64_t>(params.n_ctx, uint64_t(extent) * 2))) {
-                    probe.n_ctx = extent;
-                    probe.n_ubatch = llama_moe_prefill_token_limit(prompt_maximum, extent);
-                    // Keep the host-read path when the real context places KV in mapped RAM.
-                    probe.kv_resident = params.kv_resident > 0 && params.kv_resident < params.n_ctx ? 1 : params.kv_resident;
-                    const auto sample = common_measure_joint_configuration(probe, GGML_LOG_LEVEL_ERROR, true);
+                uint32_t peak_chunk = workspaces.front().n_ubatch;
+                for (size_t i = 1; i < measurements.size(); ++i) {
+                    const auto & sample = measurements[i];
                     if (sample.completeness != COMMON_JOINT_COMPLETENESS_COMPLETE) {
                         return false;
                     }
@@ -1375,10 +1380,9 @@ static void common_moe_cache_auto_size(common_params & params) {
                     }
                     if (match->memory.compute > peak_compute) {
                         peak_compute = match->memory.compute;
-                        peak_extent = extent;
-                        peak_chunk = probe.n_ubatch;
+                        peak_extent = workspaces[i].n_ctx;
+                        peak_chunk = workspaces[i].n_ubatch;
                     }
-                    ++samples;
                 }
                 // Model and KV costs come from the full context, not the smaller probe contexts.
                 const size_t extra = peak_compute - owner.memory.compute;
@@ -1388,7 +1392,7 @@ static void common_moe_cache_auto_size(common_params & params) {
                 required += extra;
                 slack -= int64_t(extra);
                 COM_INF("MoE prompt workspace envelope: %zu probes, %.0f MiB compute at context=%u, ubatch=%u\n",
-                    samples, peak_compute / 1048576.0, peak_extent, peak_chunk);
+                    measurements.size(), peak_compute / 1048576.0, peak_extent, peak_chunk);
                 return true;
             }
         }
