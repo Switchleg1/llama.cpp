@@ -1506,7 +1506,7 @@ static uint32_t llama_workspace_kv_growth_bound(uint32_t required, uint32_t capa
     return result;
 }
 
-static uint32_t llama_moe_prefill_token_limit(uint32_t maximum, uint32_t n_kv) {
+uint32_t llama_moe_prefill_token_limit(uint32_t maximum, uint32_t n_kv) {
     const char * text = ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_KV_BUDGET");
     if (text == nullptr || n_kv == 0 || text[0] == '-') {
         return maximum;

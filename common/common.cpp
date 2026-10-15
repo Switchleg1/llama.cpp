@@ -1321,6 +1321,13 @@ struct common_init_result::impl {
 // With --prompt-moe-expert-cache-size auto it also measures with a decode-sized workspace: generation keeps that
 // many slots, and prompts shrink the cache to the count that fits next to the prompt workspace.
 static void common_moe_cache_auto_size(common_params & params) {
+    const uint32_t prompt_maximum = std::max(1, std::min(params.n_batch, params.n_ubatch));
+    const bool envelope_requested = params.live_context_workspace && params.n_parallel == 1 && params.n_ctx > 0 &&
+        (params.phase_aware_workspace || params.prompt_moe_expert_cache_slots != 0) &&
+        llama_moe_prefill_token_limit(prompt_maximum, params.n_ctx) < prompt_maximum;
+    if (envelope_requested && params.prompt_moe_expert_cache_slots < 0) {
+        params.phase_aware_workspace = true;
+    }
     const auto measure = [&](int32_t slots, bool decode, size_t & required, int64_t & slack) {
         common_params probe = params;
         probe.n_moe_expert_cache_slots = slots;
@@ -1330,11 +1337,58 @@ static void common_moe_cache_auto_size(common_params & params) {
             probe.n_batch = std::min(probe.n_batch, 8);
             probe.n_ubatch = std::min(probe.n_ubatch, 8);
         }
+        const bool envelope = !decode && envelope_requested;
+        if (envelope) {
+            probe.n_ubatch = llama_moe_prefill_token_limit(prompt_maximum, params.n_ctx);
+        }
         const auto measurement = common_measure_joint_configuration(probe, GGML_LOG_LEVEL_ERROR, true);
         for (const auto & owner : measurement.owners) {
             if (!owner.host && owner.capacity_available) {
                 required = owner.required_upper_bytes;
                 slack = owner.slack_bytes;
+                if (!envelope) {
+                    return true;
+                }
+                if (measurement.completeness != COMMON_JOINT_COMPLETENESS_COMPLETE) {
+                    return false;
+                }
+                size_t peak_compute = owner.memory.compute;
+                uint32_t peak_extent = params.n_ctx;
+                uint32_t peak_chunk = probe.n_ubatch;
+                size_t samples = 1;
+                for (uint32_t extent = std::min<uint32_t>(params.n_ctx, std::max(256u, prompt_maximum));
+                        extent < uint32_t(params.n_ctx);
+                        extent = uint32_t(std::min<uint64_t>(params.n_ctx, uint64_t(extent) * 2))) {
+                    probe.n_ctx = extent;
+                    probe.n_ubatch = llama_moe_prefill_token_limit(prompt_maximum, extent);
+                    // Keep the host-read path when the real context places KV in mapped RAM.
+                    probe.kv_resident = params.kv_resident > 0 && params.kv_resident < params.n_ctx ? 1 : params.kv_resident;
+                    const auto sample = common_measure_joint_configuration(probe, GGML_LOG_LEVEL_ERROR, true);
+                    if (sample.completeness != COMMON_JOINT_COMPLETENESS_COMPLETE) {
+                        return false;
+                    }
+                    const auto match = std::find_if(sample.owners.begin(), sample.owners.end(), [&](const auto & candidate) {
+                        return candidate.canonical_id == owner.canonical_id && !candidate.host;
+                    });
+                    if (match == sample.owners.end()) {
+                        return false;
+                    }
+                    if (match->memory.compute > peak_compute) {
+                        peak_compute = match->memory.compute;
+                        peak_extent = extent;
+                        peak_chunk = probe.n_ubatch;
+                    }
+                    ++samples;
+                }
+                // Model and KV costs come from the full context, not the smaller probe contexts.
+                const size_t extra = peak_compute - owner.memory.compute;
+                if (extra > size_t(INT64_MAX) || required > SIZE_MAX - extra || slack < INT64_MIN + int64_t(extra)) {
+                    return false;
+                }
+                required += extra;
+                slack -= int64_t(extra);
+                COM_INF("MoE prompt workspace envelope: %zu probes, %.0f MiB compute at context=%u, ubatch=%u\n",
+                    samples, peak_compute / 1048576.0, peak_extent, peak_chunk);
                 return true;
             }
         }

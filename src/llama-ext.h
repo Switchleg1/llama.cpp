@@ -171,6 +171,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // Returns false without changes if the CPU extension is unavailable or staged inputs were already checked.
 LLAMA_API bool llama_set_ple_prefetch(struct llama_context * ctx, bool enabled);
 
+// Shared by runtime chunk selection and no-allocation fit probes.
+LLAMA_API uint32_t llama_moe_prefill_token_limit(uint32_t maximum, uint32_t n_kv);
+
 LLAMA_API bool llama_recurrent_sparse_snapshots_supported(const struct llama_context * ctx);
 LLAMA_API bool llama_recurrent_set_sparse_snapshot_mode(
         struct llama_context * ctx, bool enabled, int32_t selected_token);
