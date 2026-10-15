@@ -3195,6 +3195,12 @@ static void ggml_cuda_moe_record_legacy_op(
 // either isn't initialized or its slot size doesn't match this op's expert
 // stride. Same approach as iteration 1: stage every unique expert touched by
 // this op into a pool scratch buffer, run the impl, free the scratch.
+static std::atomic<int> ggml_cuda_moe_prefill_stream_fail_group{-1};
+
+void ggml_cuda_moe_prefill_stream_fail_for_test(int group) {
+    ggml_cuda_moe_prefill_stream_fail_group.store(group, std::memory_order_relaxed);
+}
+
 static bool ggml_cuda_moe_prefill_stream(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_moe_cache * cache,
         const std::vector<int32_t> & unique_experts, const std::vector<int32_t> & expert_to_pos,
@@ -3248,6 +3254,10 @@ static bool ggml_cuda_moe_prefill_stream(
             char * weights = expert_buffer.get() + buffer * buffer_bytes;
             for (size_t i = 0; i < count; ++i) {
                 sources[i] = source + static_cast<size_t>(unique_experts[first + i]) * expert_stride;
+            }
+            int fail_group = static_cast<int>(first / capacity);
+            if (ggml_cuda_moe_prefill_stream_fail_group.compare_exchange_strong(fail_group, -1, std::memory_order_relaxed)) {
+                return false;
             }
             if (!ggml_cuda_moe_cache_copy_to_staging(cache, sources.data(), static_cast<int>(count),
                     expert_stride, weights, ctx.stream(), telemetry_is_decode, lifetime.join_events[buffer]) ||
@@ -7410,6 +7420,12 @@ static bool ggml_cuda_graph_evaluate_and_capture(
                             (moe_execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED ||
                                 moe_execution->find_group(node, nullptr) != nullptr || moe_execution->rejects_cached_mmid(node))) {
                         GGML_ASSERT(!use_cuda_graph && !cuda_graph_update_required);
+                        return false;
+                    }
+                    // Uncaptured cached experts fail the graph; the caller must discard its outputs.
+                    const ggml_tensor * weights = node->src[0];
+                    if (!use_cuda_graph && node->op == GGML_OP_MUL_MAT_ID && weights != nullptr && weights->buffer != nullptr &&
+                            ggml_backend_buft_is_cuda_moe_cached(weights->buffer->buft)) {
                         return false;
                     }
                 }

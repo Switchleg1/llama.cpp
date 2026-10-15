@@ -414,7 +414,36 @@ void test_cached_mmid_prefill_and_overflow() {
         const auto second = run_cached_mmid_path_test(
             cuda_backend.get(), reference_backend.get(), cuda_chunk, reference_chunk, chunk_ids);
         CHECK(first == second);
+
+        // A failed streamed group must fail the graph; the next run must recover exact output.
+        const char * old_debug = std::getenv("LLAMA_MOE_DEBUG");
+        const char * old_stream = std::getenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS");
+        const std::string saved_debug = old_debug != nullptr ? old_debug : "";
+        const std::string saved_stream = old_stream != nullptr ? old_stream : "";
+        const auto set_env = [](const char * name, const char * value) {
+#ifdef _WIN32
+            CHECK(_putenv_s(name, value != nullptr ? value : "") == 0);
+#else
+            CHECK(value != nullptr ? setenv(name, value, 1) == 0 : unsetenv(name) == 0);
+#endif
+        };
+        set_env("LLAMA_MOE_DEBUG", "1");
+        set_env("LLAMA_MOE_PREFILL_STREAM_EXPERTS", "3");
+        const auto streamed = run_cached_mmid_path_test(
+            cuda_backend.get(), reference_backend.get(), cuda_chunk, reference_chunk, chunk_ids);
+        const std::vector<float> poison(ggml_nelements(cuda_chunk.output), 1234.0f);
+        ggml_backend_tensor_set(cuda_chunk.output, poison.data(), 0, ggml_nbytes(cuda_chunk.output));
+        ggml_cuda_moe_prefill_stream_fail_for_test(1);
+        CHECK(ggml_backend_graph_compute(cuda_backend.get(), cuda_chunk.graph) != GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(cuda_backend.get());
+        ggml_cuda_moe_prefill_stream_fail_for_test(-1);
+        const auto recovered = run_cached_mmid_path_test(
+            cuda_backend.get(), reference_backend.get(), cuda_chunk, reference_chunk, chunk_ids);
+        CHECK(recovered == streamed);
+        set_env("LLAMA_MOE_DEBUG", old_debug != nullptr ? saved_debug.c_str() : nullptr);
+        set_env("LLAMA_MOE_PREFILL_STREAM_EXPERTS", old_stream != nullptr ? saved_stream.c_str() : nullptr);
     }
+    fprintf(stderr, "test-moe-cache: streamed prompt group failure fails closed OK\n");
 
     for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         auto cuda_fp4 = build_cached_mmid_path_test_graph(

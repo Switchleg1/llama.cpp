@@ -1129,6 +1129,8 @@ private:
 
 ggml_cuda_moe_grouped_context * ggml_cuda_moe_grouped_context_for_test(ggml_backend_t backend);
 size_t ggml_cuda_moe_ids_cache_count_for_test(ggml_backend_t backend);
+// Fails the next streamed prompt group with this index before its copy is submitted.
+void ggml_cuda_moe_prefill_stream_fail_for_test(int group);
 
 // Splits routed ids against a residency map, in route order, without a host round-trip.
 // All pointers are device memory. counts[0] is the hot count, counts[1] the cold count, both -1 on refusal.
