@@ -722,7 +722,8 @@ cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         int64_t n_tokens,
         int64_t n_experts = 8,
         bool per_expert_input = false,
-        bool strided_ids = false);
+        bool strided_ids = false,
+        int64_t n_in = 256);
 
 cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         ggml_backend_t backend,

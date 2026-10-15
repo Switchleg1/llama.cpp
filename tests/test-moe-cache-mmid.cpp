@@ -198,8 +198,9 @@ cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         int64_t n_tokens,
         int64_t n_experts,
         bool per_expert_input,
-        bool strided_ids) {
-    constexpr int64_t N_IN = 256;
+        bool strided_ids,
+        int64_t n_in) {
+    const int64_t N_IN = n_in;
     const ggml_init_params weight_params = {
         /* .mem_size = */ ggml_tensor_overhead() * 8,
         /* .mem_base = */ nullptr,
@@ -444,6 +445,49 @@ void test_cached_mmid_prefill_and_overflow() {
         set_env("LLAMA_MOE_PREFILL_STREAM_EXPERTS", old_stream != nullptr ? saved_stream.c_str() : nullptr);
     }
     fprintf(stderr, "test-moe-cache: streamed prompt group failure fails closed OK\n");
+
+    // Gemma-like banks: Q6_K fused gate/up, Q8_0 down with padded 704-wide rows and per-expert inputs.
+    struct stream_case { ggml_type type; int64_t n_in, n_out; bool per_expert; int64_t n_experts, n_used, n_tokens; const char * capacity; };
+    for (const stream_case & sc : {stream_case{GGML_TYPE_Q6_K, 2816, 128, false, 8, 4, 32, "3"}, stream_case{GGML_TYPE_Q8_0, 704, 128, true, 8, 4, 32, "3"},
+                                   stream_case{GGML_TYPE_Q8_0, 768, 128, true, 8, 4, 32, "3"}, stream_case{GGML_TYPE_Q6_K, 768, 128, true, 8, 4, 32, "3"},
+                                   stream_case{GGML_TYPE_Q8_0, 704, 256, true, 128, 8, 512, "32"}, stream_case{GGML_TYPE_Q6_K, 2816, 256, false, 128, 8, 512, "32"}}) {
+        for (const char * capacity : {"", sc.capacity}) {
+            const char * old_debug = std::getenv("LLAMA_MOE_DEBUG");
+            const char * old_stream = std::getenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS");
+            const std::string saved_debug = old_debug != nullptr ? old_debug : "";
+            const std::string saved_stream = old_stream != nullptr ? old_stream : "";
+#ifdef _WIN32
+            CHECK(_putenv_s("LLAMA_MOE_DEBUG", capacity[0] ? "1" : "") == 0);
+            CHECK(_putenv_s("LLAMA_MOE_PREFILL_STREAM_EXPERTS", capacity) == 0);
+#else
+            CHECK(capacity[0] ? setenv("LLAMA_MOE_DEBUG", "1", 1) == 0 : unsetenv("LLAMA_MOE_DEBUG") == 0);
+            CHECK(capacity[0] ? setenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS", capacity, 1) == 0 : unsetenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS") == 0);
+#endif
+            auto cuda_case = build_cached_mmid_path_test_graph(
+                cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), sc.type, sc.n_out, sc.n_used, sc.n_tokens, sc.n_experts, sc.per_expert, false, sc.n_in);
+            auto reference_case = build_cached_mmid_path_test_graph(
+                reference_backend.get(), ggml_backend_cuda_buffer_type(0), sc.type, sc.n_out, sc.n_used, sc.n_tokens, sc.n_experts, sc.per_expert, false, sc.n_in);
+            initialize_cached_mmid_path_test_graphs(cuda_case, reference_case);
+            std::vector<int32_t> case_ids(sc.n_used * sc.n_tokens);
+            for (int64_t token = 0; token < sc.n_tokens; ++token) {
+                for (int64_t route = 0; route < sc.n_used; ++route) {
+                    case_ids[token * sc.n_used + route] = int32_t((token * 7 + route * (sc.n_experts / sc.n_used + 1)) % sc.n_experts);
+                }
+            }
+            fprintf(stderr, "test-moe-cache: stream case type=%s n_in=%lld experts=%lld tokens=%lld per_expert=%d capacity=%s\n",
+                ggml_type_name(sc.type), (long long) sc.n_in, (long long) sc.n_experts, (long long) sc.n_tokens, sc.per_expert ? 1 : 0, capacity[0] ? capacity : "off");
+            (void) run_cached_mmid_path_test(
+                cuda_backend.get(), reference_backend.get(), cuda_case, reference_case, case_ids);
+#ifdef _WIN32
+            CHECK(_putenv_s("LLAMA_MOE_DEBUG", saved_debug.c_str()) == 0);
+            CHECK(_putenv_s("LLAMA_MOE_PREFILL_STREAM_EXPERTS", saved_stream.c_str()) == 0);
+#else
+            CHECK(old_debug ? setenv("LLAMA_MOE_DEBUG", saved_debug.c_str(), 1) == 0 : unsetenv("LLAMA_MOE_DEBUG") == 0);
+            CHECK(old_stream ? setenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS", saved_stream.c_str(), 1) == 0 : unsetenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS") == 0);
+#endif
+        }
+    }
+    fprintf(stderr, "test-moe-cache: streamed Gemma-like bank shapes OK\n");
 
     for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         auto cuda_fp4 = build_cached_mmid_path_test_graph(

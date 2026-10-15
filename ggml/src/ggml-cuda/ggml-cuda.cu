@@ -3214,6 +3214,15 @@ static bool ggml_cuda_moe_prefill_stream(
             capacity > (SIZE_MAX - source_padding) / expert_stride) {
         return false;
     }
+    // Debug: fail group 1 of the N-th streamed call once.
+    static const long fail_call = [] {
+        const char * call = ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_STREAM_FAIL_ONCE");
+        return call != nullptr ? std::atol(call) : 0L;
+    }();
+    static std::atomic<long> stream_calls{0};
+    if (fail_call > 0 && stream_calls.fetch_add(1, std::memory_order_relaxed) + 1 == fail_call) {
+        ggml_cuda_moe_prefill_stream_fail_group.store(1, std::memory_order_relaxed);
+    }
     GGML_LOG_DEBUG("moe-prefill-stream: %s rows=%lld experts=%zu capacity=%zu\n", src0->name,
         static_cast<long long>(ids->ne[1]), unique_experts.size(), capacity);
     const size_t buffer_bytes = capacity * expert_stride + source_padding;
