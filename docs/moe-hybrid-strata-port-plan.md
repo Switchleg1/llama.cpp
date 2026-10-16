@@ -2610,4 +2610,56 @@ KLD sweep, stream against `--moe-prefill-stream off` at the same microbatch, wit
 
 Qwen streaming stays within the run-to-run noise of the ordinary path; that path itself is not deterministic at 16K. (A first sweep after defaults became auto accidentally streamed in both arms; it was discarded.) One IQ4_XS ub512 streamed run aborted silently (0xC0000409) about 10 s into computation; 15 further streamed runs, including the same sequence after an ordinary run, passed. Open; a similar silent abort was seen earlier with a Q4_0 test model.
 
-Remaining work: keep expert residents across the prompt-to-generation resize; asynchronous or batched store file reads; investigate the intermittent abort and Qwen run-to-run nondeterminism; fused whole-FFN streaming.
+Gemma 4 launcher (`run-gemma4-26b-256k.bat`, local): Q4_K_XL, 256K context, q8_0 KV, Q8_0 MTP head with 2 drafts, fixed 50 cache slots, `-b 8192 -ub 4096 --live-context-workspace`, prefill streaming auto, no expert split. Chat decode by slots (MTP 2): auto 48 slots 125-126 tok/s, 50 142-145, 52 149, 54 151; 24K prefill 5.2 s throughout. 52 slots at 200K occupied: prefill 96.3 s, decode 58-63 tok/s; at 254K: prefill 143 s, decode 54 tok/s, peak dedicated VRAM 15.9 GB (0.7 GB held by other processes), hence the 50-slot default. MTP 3 drafts is slower on short replies; the decode-overlap options give no measurable gain here. Smoke with the launcher arguments passes (24K prefill 5.1 s, repeat/cancel/restart exact).
+
+Gemma bugs found: (1) `--moe-expert-split on` is accepted, then the first decode fails with "1 cold expert packets failed" (strict, rolled back), so the CPU half does not support this layout but is not refused when the context is created. (2) `--prompt-moe-expert-cache-size auto` (50 -> 48 slots) makes a 24K prefill take 88 s instead of 5 s, probably repeated cache rebuilds during prefill. (3) `--moe-expert-cache-size 72` fails model load with "invalid vector subscript" instead of a clear error.
+
+### Nsight of the launcher configuration (Qwen IQ3_S) and next steps
+
+Trace: launcher flags (`build/long-fast.json`), 7,702-token document prompt plus 256-token reply, `--cuda-graph-trace=node` (`build/nsight-launcher-7k.*`, `build/analyze-phases.py`). Profiled prefill 7.79 s (about 5.9 s unprofiled), decode 46.2 tok/s.
+
+Prefill (window 6.77 s): GPU busy 69.6% (kernels 52.3%, H2D 29.1%, 862 ms overlapped). H2D 85.4 GiB in 133K copies: each chunk uploads essentially every expert, because 512+ tokens x 10 routes over 512 experts touch all of them. Kernels: `mul_mat_q` 1,467 ms, `gated_delta_net` 432 ms, `rms_norm` 204 ms, flash attention 164 ms, f16 conversions 156 ms, `mm_ids_helper` 126 ms, hyper-connection pre/post 206 ms. Host: `cudaMemcpy2DAsync` 1,726 ms over 705 calls (the per-layer ids readback, which waits for the GPU), `cudaEventSynchronize` 1,311 ms (stream group buffer reuse). The 30% idle GPU time is these per-layer host round-trips.
+
+Decode (5.5 s, 21.5 ms/token; Strata about 11.5): GPU busy 75%. `moe_grouped_gather_decode` (in-kernel zero-copy fills) 1,080 ms, `moe_grouped_admit_wait` (GPU waiting for CPU cold experts) 507 ms, matrix-vector kernels about 1,300 ms, 483K kernels (about 1,900 per token, inside 406 graph launches). By quarter the first runs at half speed (59 versus 99-128 launches): after the prompt, decode reallocates (`cudaMallocHost`/`cudaFreeHost` 184 ms, 817 `cudaMalloc`/`cudaFree`, `cudaGraphInstantiate` 119 ms) and refills an emptied cache. Steady state, fills take about 18% and CPU waits about 9%; the remaining idle 25% is host-side and needs a CPU-sampled trace to attribute.
+
+Next steps, in order:
+- Prefill P1: when a chunk routes most experts (routes >> experts), upload each layer's full bank in fixed order on the copy stream, prefetching the next layer while the current one computes, and keep routing on the device. Removes the per-layer ids readback and its idle time; expected 7.7K prefill about 4 s.
+- Decode D1: keep expert residents and buffers across the prompt-to-generation switch (no reallocation, no graph re-instantiation, no cleared cache); about 0.7 s per request.
+- Decode D2 / prefill P2: merge upstream (its Qwen4exp pooled k-pool selection with optimized mask construction, `4e2713c16`, `e7268bf6a`). This reduces the attention workspace that limits long-context chunk size (128K prefill is upload-bound at 1K chunks) and frees memory for more cache slots, which cut fills and CPU waits.
+- Decode D3: CPU-sampled Nsight of decode to attribute the 25% host idle (sampling, MTP, cold expert compute, launches).
+- Later: kernel fusion (hyper-connections, norms, elementwise), `gated_delta_net` prefill kernel.
+
+### Portability
+
+Compile check (`build/arch-compile-check.py`, CUDA 13.3, PTX): every fork CUDA file compiles for sm_75, 80, 86 and 89; the build itself targets sm_120a. CUDA 13 no longer supports sm_50/61/70, so Maxwell, Pascal and Volta need a CUDA 12 toolkit and are untested; `cuda::atomic_ref` (used in `moe-cache.cu` and `ggml-cuda.cu`) needs sm_60+, so Maxwell would not compile. `cudaMemcpyBatchAsync` is guarded (12.8+ with a fallback loop); stream memory operations are probed at runtime and skipped for HIP/MUSA; native FP4 is Blackwell-only behind the existing check. Runtime has only been exercised on one RTX 5070 Ti under Windows WDDM; Linux, TCC and other cards are untested. HIP/MUSA: `moe-cache.cu` uses `cuda::atomic_ref` five times without the HIP/MUSA guard that its include has, so ROCm and MUSA builds of this file cannot compile as is.
+
+Vulkan: the llama-level parts (expert store and file readers, auto sizing and fit envelope, adaptive chunking, public flags) are backend-neutral and reach the backend through `ggml_backend_moe_*` proc hooks. The CUDA side (expert-cache buffer type and slot pools, device-side planning and gather kernels, GPU spin-waits on host memory for CPU cold experts, stream memory operations, captured graphs with certificates, the mapped KV page cache) would need Vulkan implementations: a transfer queue for streamed uploads, host-visible or imported host memory for zero-copy, and timeline semaphores instead of GPU spin-waits (shaders have no forward-progress guarantee for polling host memory). Streamed prefill and the host KV cache map reasonably; the decode split's GPU/CPU handshake does not, and would need per-layer submissions.
+
+Remaining work: Gemma bugs above; keep expert residents across the prompt-to-generation resize; asynchronous or batched store file reads; investigate the intermittent abort and Qwen run-to-run nondeterminism; fused whole-FFN streaming.
+
+### Rebasing onto upstream/moe-cache (GenerelSchwerz)
+
+Direction: track `upstream/moe-cache` (GenerelSchwerz/llama.cpp), which merges ggml-org master itself (batch_ext, k-pool QSA up to 2026-10-08) and keeps the fork base (shared-target MTP sidecar, decode intents, MTP rollback planes, decode overlap, live/phase workspaces). A direct ggml-org merge was abandoned: `llama_batch_ext` replaced the decode input type under the fork's whole decode/MTP stack. Our MTP sidecar is a fork format (`nextn_shared_target_tensors`); the downloaded targets (ISTA-DASLab IQ3_S, Unsloth IQ4_XS) ship without the MTP block, so plain upstream cannot run MTP with them.
+
+Baselines, same session, 32K context, q8_0 KV, 7,702-token document + 512 reply / short prompt + 512 (`build/next-baseline.py`, `build/next-baseline-summary.jsonl`):
+
+| Build / config | Prefill | Decode doc / short |
+| --- | --- | --- |
+| ggml-org master, `--cpu-moe` | 123 tok/s | 7.4 / 7.2 |
+| ggml-org master, `--moe-cache-mib 6144` | 131 | 25.9 / 19.4 |
+| upstream/moe-cache `f3f31a788`, cache 85 | 129 | 20.7 / 19.8 |
+| upstream/moe-cache, cache 62 + MTP | 121 | 22.0 / 18.7 (306/409) |
+| upstream/moe-cache, `--moe-hybrid on` (+phase-aware) | 110 | 7.6 / 7.2 |
+| upstream/moe-cache, hybrid + MTP + ub4096/live/borrow | 208 | 6.7 / 7.0 |
+| fork moe-cache, cache only (auto 85) | 350 | 42.7 / 46.7 |
+| fork + CPU split | 350 | 46.6 / 52.1 |
+| fork + split + MTP | 339 | 58.9 / 63.1 (313/396) |
+| fork launcher (streamed prefill, ub4096, live, prompt resize) | 1,246 | 56.6 / 62.8 |
+
+upstream/moe-cache needed two MSVC fixes to build on Windows (`= {}` with an explicit member default constructor in `common/speculative.cpp`; a lambda-captured constexpr as `std::array` size in `tests/test-backend-ops.cpp`) and `BUILD_SHARED_LIBS=OFF` (the DLL build misses exports). Its hybrid executor runs here but decodes at ~7 tok/s with default tuning.
+
+Rebase status: a squash merge of our 33 commits (15K lines, 66 files) onto `f3f31a788` conflicts in 31 files; `moe-cache.cu` alone has 54 diff3 hunks. Upstream rewrote that file (+12,360/-6,945 lines) and moved logic into ~9K lines of new modules (`moe-source-core`, `moe-source-ordinary`, `moe-fidelity-executor`, `moe-fidelity`, `moe-reference`, `moe-caller-schedule`, `src/llama-moe-cache`, `src/llama-draft-vocab`), so our features must be re-expressed in the new architecture rather than conflict-resolved. Worktrees: `../llama.cpp-gs` (branch `moe-cache-rebase` at upstream tip + MSVC fixes), `../llama.cpp-merge` (abandoned ggml-org merge, reference), `../llama.cpp-next` (ggml-org master baseline build).
+
+Decision (owner): stay on this fork for now and re-sync later, once upstream/moe-cache settles; the experimental worktrees and branches were removed. Next: keep expert residents across the prompt-to-generation cache resize, then prefill P1.
+
+Decode resize memo (tried, reverted): kept each group's residents (most recent first) when the cache shrank for a prompt and preloaded them into the larger decode resource (clocks 1..k; the planner rejects a resident with clock 0). Same-session A/B, 8K prompt + 1.6K follow-up, 768 tokens, two rounds each: off 51.0/50.1 and 53.0/48.5 tok/s, on 48.4/48.2 and 53.1/47.9; first windows unchanged. Finer timing shows the slow start is about 0.4 s (first 100 tokens at 43 vs 53 tok/s) plus a 0.2-0.3 s first-piece delay. A 56-slot cache refills within a few tokens, so empty residents are not the cause; remaining suspects are graph capture/instantiation and the prompt-to-decode resource rebuild.
