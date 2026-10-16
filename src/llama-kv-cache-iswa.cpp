@@ -265,6 +265,10 @@ uint32_t llama_kv_cache_iswa::get_attn_reserve_capacity() const {
     return std::max(kv_base->get_attn_reserve_capacity(), kv_swa->get_attn_reserve_capacity());
 }
 
+uint32_t llama_kv_cache_iswa::get_attn_reserve_upper_bound(uint32_t n_tokens) const {
+    return std::max(kv_base->get_attn_reserve_upper_bound(n_tokens), kv_swa->get_attn_reserve_upper_bound(n_tokens));
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_iswa_context>(this, lctx, optimize);
 }

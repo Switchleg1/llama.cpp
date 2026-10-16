@@ -3558,7 +3558,17 @@ static void ggml_cuda_moe_prefill_ring_begin(ggml_backend_cuda_context & ctx, co
         ring.n_jobs += op.n_groups;
     }
     slot_bytes = GGML_PAD(slot_bytes, 256);
-    const uint32_t n_slots = slot_bytes != 0 ? static_cast<uint32_t>(std::min<size_t>(budget / slot_bytes, 1024)) : 0;
+    // On WDDM an allocation past free memory pages instead of failing; keep room for the pool to grow.
+    size_t usable = budget;
+    if (ring.data == nullptr) {
+        size_t free_bytes = 0, total_bytes = 0;
+        constexpr size_t margin = size_t(768) << 20;
+        usable = cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess && free_bytes > margin ?
+            std::min(budget, free_bytes - margin) : 0;
+    } else {
+        usable = std::min(budget, ring.slot_bytes * ring.n_slots);
+    }
+    const uint32_t n_slots = slot_bytes != 0 ? static_cast<uint32_t>(std::min<size_t>(usable / slot_bytes, 1024)) : 0;
     if (ring.ops.empty() || n_slots < 2) {
         ring.ops.clear();
         ring.op_of_node.clear();

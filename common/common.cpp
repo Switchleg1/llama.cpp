@@ -1465,7 +1465,7 @@ static void common_moe_cache_auto_size(common_params & params) {
                 params.prompt_moe_expert_cache_slots = slots;
                 // Streamed prompts barely use cache slots: keep the active experts and load upcoming groups ahead
                 // in 3/4 of the freed memory; the rest stays as margin, as overcommit pages on WDDM.
-                if (common_moe_prefill_stream(params) > 0 && top_k > 0 && (int32_t) top_k < slots &&
+                if (params.moe_prefill_ring < 0 && common_moe_prefill_stream(params) > 0 && top_k > 0 && (int32_t) top_k < slots &&
                         params.moe_expert_cache_host_pinned_size != LLAMA_MOE_HOST_PINNED_OFF) {
                     params.prompt_moe_expert_cache_slots = (int32_t) top_k;
                     params.moe_prefill_ring = (int64_t) ((size_t) (slots - (int32_t) top_k) * per_slot / 4 * 3);
@@ -1473,7 +1473,7 @@ static void common_moe_cache_auto_size(common_params & params) {
             }
             COM_INF("%s: MoE expert cache auto: %d slots for generation, %d while a prompt is processed, %.0f MiB "
                 "prompt load-ahead ring\n", __func__, params.n_moe_expert_cache_slots, params.prompt_moe_expert_cache_slots,
-                params.moe_prefill_ring / 1048576.0);
+                std::max<int64_t>(params.moe_prefill_ring, 0) / 1048576.0);
         }
     }
 }

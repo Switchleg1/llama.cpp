@@ -3154,6 +3154,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFILL_KV_BUDGET"));
     add_opt(common_arg(
+        {"--moe-prefill-ring"}, "N|auto|off",
+        "VRAM in MiB for loading the expert groups of upcoming streamed prompt operations ahead of use; with a smaller "
+        "--prompt-moe-expert-cache-size, memory the prompt does not use. auto: with --prompt-moe-expert-cache-size auto, "
+        "run prompts with the active experts as cache slots and use 3/4 of the freed memory (default: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_prefill_ring = -1;
+            } else if (value == "off") {
+                params.moe_prefill_ring = 0;
+            } else {
+                const long long n = std::stoll(value);
+                if (n < 0 || n > (1ll << 30)) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_prefill_ring = n << 20;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_RING"));
+    add_opt(common_arg(
         {"--moe-early-router"},
         "MoE expert cache: predict the next layer's routed experts and prepack eligible adjacent groups (default: disabled)",
         [](common_params & params) {

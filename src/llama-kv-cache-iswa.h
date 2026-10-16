@@ -66,6 +66,7 @@ public:
     llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
 
     uint32_t get_attn_reserve_capacity() const override;
+    uint32_t get_attn_reserve_upper_bound(uint32_t n_tokens) const override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 

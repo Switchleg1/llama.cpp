@@ -558,7 +558,7 @@ struct common_params {
     std::string moe_expert_profile;           // --moe-expert-profile
     int32_t moe_prefill_stream    = -1;       // --moe-prefill-stream, < 0: auto
     int64_t moe_prefill_kv_budget = -1;       // --moe-prefill-kv-budget, < 0: auto
-    int64_t moe_prefill_ring      = 0;        // load-ahead ring bytes for streamed prompts; set by the cache auto size
+    int64_t moe_prefill_ring      = -1;       // --moe-prefill-ring in bytes, < 0: auto (set by the cache auto size)
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
