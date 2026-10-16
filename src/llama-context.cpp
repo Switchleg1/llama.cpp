@@ -797,18 +797,20 @@ llama_context::llama_context(
     moe_expert_profile       = params.moe_expert_profile ? params.moe_expert_profile : "";
     cparams.moe_prefill_stream    = params.moe_prefill_stream;
     cparams.moe_prefill_kv_budget = params.moe_prefill_kv_budget > 0 ? params.moe_prefill_kv_budget : llama_moe_prefill_kv_budget_env();
+    cparams.moe_prefill_ring      = params.moe_prefill_ring;
     if (cparams.moe_prefill_stream > 0 && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_enabled()) {
         ggml_backend_moe_prefill_configure_t configure = nullptr;
         for (size_t i = 0; i < ggml_backend_reg_count() && configure == nullptr; ++i) {
             configure = (ggml_backend_moe_prefill_configure_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_reg_get(i), GGML_BACKEND_MOE_PREFILL_CONFIGURE_PROC_NAME);
         }
-        const ggml_backend_moe_prefill_config config = { cparams.moe_prefill_stream, true, true };
+        const ggml_backend_moe_prefill_config config = { cparams.moe_prefill_stream, true, true, cparams.moe_prefill_ring };
         if (configure == nullptr || !configure(&config)) {
             LLAMA_LOG_WARN("%s: MoE prompt streaming is not supported by the loaded backends; disabled\n", __func__);
             cparams.moe_prefill_stream = 0;
         } else {
-            LLAMA_LOG_INFO("%s: MoE prompt streaming on (%u experts per group)\n", __func__, cparams.moe_prefill_stream);
+            LLAMA_LOG_INFO("%s: MoE prompt streaming on (%u experts per group, %.0f MiB load-ahead ring)\n", __func__,
+                cparams.moe_prefill_stream, cparams.moe_prefill_ring / 1048576.0);
         }
     }
     if (cparams.moe_expert_split) {
@@ -6283,6 +6285,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_expert_profile          =*/ nullptr,
         /*.moe_prefill_stream          =*/ 0,
         /*.moe_prefill_kv_budget       =*/ 0,
+        /*.moe_prefill_ring            =*/ 0,
     };
 
     return result;

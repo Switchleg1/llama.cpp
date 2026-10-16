@@ -1309,6 +1309,19 @@ bool ggml_cuda_moe_cache_copy_to_staging(
     bool                  is_decode,
     ggml_cuda_moe_event_t  buffer_reusable = nullptr);
 
+// Like copy_to_staging, but the copy stream first waits on wait_a/wait_b, zeroes trailing_zero_bytes after the
+// copied experts, and records done instead of making a compute stream wait. Prompt-phase copies.
+bool ggml_cuda_moe_cache_copy_async(
+    struct ggml_cuda_moe_cache * cache,
+    const void * const * host_srcs,
+    int                  n_host_srcs,
+    size_t               byte_count,
+    void *               dst,
+    size_t               trailing_zero_bytes,
+    ggml_cuda_moe_event_t wait_a,
+    ggml_cuda_moe_event_t wait_b,
+    ggml_cuda_moe_event_t done);
+
 bool ggml_cuda_moe_cache_prepare_split_staging(
     struct ggml_cuda_moe_cache * cache,
     const void * const * host_srcs,
@@ -1406,6 +1419,8 @@ void * ggml_cuda_moe_cache_slot_ptr(
 size_t       ggml_cuda_moe_cache_slot_size_bytes(const struct ggml_cuda_moe_cache * cache);
 int          ggml_cuda_moe_cache_n_slots(const struct ggml_cuda_moe_cache * cache);
 ggml_cuda_moe_stream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * cache);
+// True when host copies of this cache bounce through pageable staging, which blocks the host per copy.
+bool ggml_cuda_moe_cache_pageable_staging(const struct ggml_cuda_moe_cache * cache);
 
 bool ggml_cuda_moe_cache_mark_used(
     struct ggml_cuda_moe_cache * cache,

@@ -2472,6 +2472,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
     cuda_graphs.clear();
+    moe_prefill_ring.reset();
     delete moe_grouped_context;
 
     if (copy_event != nullptr) {
@@ -3201,6 +3202,7 @@ struct ggml_cuda_prefill_runtime_config {
     std::atomic<uint32_t> stream_experts{0};
     std::atomic<bool>     kv_host_bulk_store{false};
     std::atomic<bool>     topk_segmented{false};
+    std::atomic<uint64_t> ring_bytes{0};
 };
 
 static ggml_cuda_prefill_runtime_config & ggml_cuda_prefill_config() {
@@ -3216,6 +3218,7 @@ static bool ggml_backend_cuda_moe_prefill_configure(const ggml_backend_moe_prefi
     runtime.stream_experts.store(config->stream_experts, std::memory_order_relaxed);
     runtime.kv_host_bulk_store.store(config->kv_host_bulk_store, std::memory_order_relaxed);
     runtime.topk_segmented.store(config->topk_segmented, std::memory_order_relaxed);
+    runtime.ring_bytes.store(config->ring_bytes, std::memory_order_relaxed);
     runtime.configured.store(true, std::memory_order_release);
     return true;
 }
@@ -3252,6 +3255,18 @@ void ggml_cuda_moe_prefill_stream_fail_for_test(int group) {
     ggml_cuda_moe_prefill_stream_fail_group.store(group, std::memory_order_relaxed);
 }
 
+// Debug: fail group 1 of the N-th streamed call once.
+static void ggml_cuda_moe_prefill_stream_count_call() {
+    static const long fail_call = [] {
+        const char * call = ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_STREAM_FAIL_ONCE");
+        return call != nullptr ? std::atol(call) : 0L;
+    }();
+    static std::atomic<long> stream_calls{0};
+    if (fail_call > 0 && stream_calls.fetch_add(1, std::memory_order_relaxed) + 1 == fail_call) {
+        ggml_cuda_moe_prefill_stream_fail_group.store(1, std::memory_order_relaxed);
+    }
+}
+
 static bool ggml_cuda_moe_prefill_stream(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_moe_cache * cache,
         const std::vector<int32_t> & unique_experts, const std::vector<int32_t> & expert_to_pos,
@@ -3266,15 +3281,7 @@ static bool ggml_cuda_moe_prefill_stream(
             capacity > (SIZE_MAX - source_padding) / expert_stride) {
         return false;
     }
-    // Debug: fail group 1 of the N-th streamed call once.
-    static const long fail_call = [] {
-        const char * call = ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_STREAM_FAIL_ONCE");
-        return call != nullptr ? std::atol(call) : 0L;
-    }();
-    static std::atomic<long> stream_calls{0};
-    if (fail_call > 0 && stream_calls.fetch_add(1, std::memory_order_relaxed) + 1 == fail_call) {
-        ggml_cuda_moe_prefill_stream_fail_group.store(1, std::memory_order_relaxed);
-    }
+    ggml_cuda_moe_prefill_stream_count_call();
     GGML_LOG_DEBUG("moe-prefill-stream: %s rows=%lld experts=%zu capacity=%zu\n", src0->name,
         static_cast<long long>(ids->ne[1]), unique_experts.size(), capacity);
     const size_t buffer_bytes = capacity * expert_stride + source_padding;
@@ -3345,6 +3352,260 @@ static bool ggml_cuda_moe_prefill_stream(
     const cudaError_t copy_status = cudaStreamSynchronize(ggml_cuda_moe_cache_copy_stream(cache));
     const cudaError_t compute_status = cudaStreamSynchronize(ctx.stream());
     return completed && copy_status == cudaSuccess && compute_status == cudaSuccess;
+}
+
+// Prompt-phase ring of streamed expert groups. The streamed ops of one graph form one job sequence (one job per
+// expert group), and copies run up to n_slots jobs ahead, so the next ops' weights load during the non-MoE work.
+struct ggml_cuda_moe_prefill_ring {
+    struct op {
+        const ggml_tensor * src0 = nullptr;
+        size_t capacity = 0;
+        size_t n_groups = 0;
+        size_t padding = 0;
+        uint64_t first_job = 0;
+        uint32_t top_k = 1;
+    };
+    struct entry {
+        const ggml_tensor * src0 = nullptr;
+        uint64_t job = UINT64_MAX;
+    };
+
+    int device = -1;
+    char * data = nullptr;
+    size_t slot_bytes = 0;
+    uint32_t n_slots = 0;
+    std::vector<cudaEvent_t> copied;
+    std::vector<cudaEvent_t> freed;
+    std::vector<entry> entries;
+    std::vector<op> ops;
+    std::unordered_map<const ggml_tensor *, size_t> op_of_node;
+    std::unordered_map<const ggml_tensor *, ggml_cuda_moe_legacy_cache_lease> leases;
+    uint64_t n_jobs = 0;
+    uint64_t issued = 0;
+    bool active = false;
+
+    ~ggml_cuda_moe_prefill_ring() {
+        free_storage();
+    }
+
+    void free_storage() {
+        leases.clear();
+        if (device < 0) {
+            return;
+        }
+        ggml_cuda_set_device(device);
+        (void) cudaDeviceSynchronize();
+        for (cudaEvent_t event : copied) {
+            (void) cudaEventDestroy(event);
+        }
+        for (cudaEvent_t event : freed) {
+            (void) cudaEventDestroy(event);
+        }
+        copied.clear();
+        freed.clear();
+        entries.clear();
+        if (data != nullptr) {
+            (void) cudaFree(data);
+        }
+        data = nullptr;
+        slot_bytes = 0;
+        n_slots = 0;
+        device = -1;
+    }
+};
+
+static bool ggml_cuda_moe_prefill_ring_issue(
+        ggml_backend_cuda_context & ctx, ggml_cuda_moe_prefill_ring & ring, uint64_t job, ggml_cuda_moe_cache * own_cache) {
+    const auto next = std::upper_bound(ring.ops.begin(), ring.ops.end(), job,
+        [](uint64_t value, const ggml_cuda_moe_prefill_ring::op & op) { return value < op.first_job; });
+    if (next == ring.ops.begin()) {
+        return false;
+    }
+    const auto & op = *(next - 1);
+    const uint32_t slot = static_cast<uint32_t>(job % ring.n_slots);
+    ring.entries[slot] = {};
+    ggml_cuda_moe_cache * cache = own_cache;
+    if (cache == nullptr) {
+        auto found = ring.leases.find(op.src0);
+        if (found == ring.leases.end()) {
+            if (ctx.moe_grouped_context == nullptr) {
+                return false;
+            }
+            found = ring.leases.emplace(op.src0, ctx.moe_grouped_context->acquire_legacy_cache(
+                op.src0, nullptr, nullptr, ctx.stream(), op.top_k)).first;
+        }
+        cache = found->second.get();
+    }
+    if (cache == nullptr || ggml_cuda_moe_cache_pageable_staging(cache)) {
+        return false;
+    }
+    const size_t first = (job - op.first_job) * op.capacity;
+    const size_t count = std::min(op.capacity, static_cast<size_t>(op.src0->ne[2]) - first);
+    const size_t stride = op.src0->nb[2];
+    std::vector<const void *> sources(count);
+    for (size_t i = 0; i < count; ++i) {
+        sources[i] = static_cast<const char *>(op.src0->data) + (first + i) * stride;
+    }
+    if (!ggml_cuda_moe_cache_copy_async(cache, sources.data(), static_cast<int>(count), stride,
+            ring.data + slot * ring.slot_bytes, op.padding, ring.freed[slot], ring.copied[slot], ring.copied[slot])) {
+        return false;
+    }
+    ring.entries[slot] = { op.src0, job };
+    return true;
+}
+
+// Identity-order streamed op through the ring. Never blocks the host: copies and compute meet through events.
+static bool ggml_cuda_moe_prefill_stream_ring(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_moe_cache * cache,
+        ggml_cuda_moe_prefill_ring & ring, const ggml_cuda_moe_prefill_ring::op & op) {
+    ggml_tensor * src0 = dst->src[0];
+    ggml_tensor * ids = dst->src[2];
+    const size_t expert_stride = src0->nb[2];
+    ggml_cuda_moe_prefill_stream_count_call();
+    ggml_cuda_mmq_id_input input(ctx.pool());
+    ggml_cuda_mmq_prepare_id_input(ctx, src0, dst->src[1], ids, input);
+    for (size_t group = 0; group < op.n_groups; ++group) {
+        int fail_group = static_cast<int>(group);
+        if (ggml_cuda_moe_prefill_stream_fail_group.compare_exchange_strong(fail_group, -1, std::memory_order_relaxed)) {
+            return false;
+        }
+        const uint64_t job = op.first_job + group;
+        const uint64_t ahead = std::min<uint64_t>(ring.n_jobs, job + ring.n_slots);
+        for (; ring.issued < ahead; ++ring.issued) {
+            (void) ggml_cuda_moe_prefill_ring_issue(ctx, ring, ring.issued, nullptr);
+        }
+        const uint32_t slot = static_cast<uint32_t>(job % ring.n_slots);
+        if ((ring.entries[slot].job != job || ring.entries[slot].src0 != src0) &&
+                !ggml_cuda_moe_prefill_ring_issue(ctx, ring, job, cache)) {
+            return false;
+        }
+        if (cudaStreamWaitEvent(ctx.stream(), ring.copied[slot], 0) != cudaSuccess) {
+            return false;
+        }
+        const size_t first = group * op.capacity;
+        const size_t count = std::min(op.capacity, static_cast<size_t>(src0->ne[2]) - first);
+        ggml_tensor source_view = *src0;
+        source_view.ne[2] = count;
+        source_view.nb[3] = count * expert_stride;
+        source_view.data = ring.data + slot * ring.slot_bytes;
+        ggml_cuda_mul_mat_q_prepared(ctx, &source_view, dst->src[1], ids, dst, input, first);
+        if (cudaEventRecord(ring.freed[slot], ctx.stream()) != cudaSuccess) {
+            return false;
+        }
+    }
+    ring.leases.erase(src0);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+static size_t ggml_cuda_moe_prefill_ring_bytes() {
+    const char * value = ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_RING_MB");
+    if (value != nullptr) {
+        return static_cast<size_t>(std::max(0, std::atoi(value))) << 20;
+    }
+    auto & runtime = ggml_cuda_prefill_config();
+    return runtime.configured.load(std::memory_order_acquire) ? runtime.ring_bytes.load(std::memory_order_relaxed) : 0;
+}
+
+// Streamed prompt ops that take the identity path in ggml_cuda_mul_mat_id_cached.
+static bool ggml_cuda_moe_identity_stream_candidate(const ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    const ggml_tensor * ids = node->src[2];
+    return src0 != nullptr && src1 != nullptr && ids != nullptr && src0->buffer != nullptr &&
+        ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft) && src0->ne[2] > 0 && src0->data != nullptr &&
+        ids->ne[1] > 8 && ids->ne[2] == 1 && ids->ne[3] == 1 && ids->nb[0] == sizeof(int32_t) &&
+        static_cast<size_t>(ids->ne[0] * ids->ne[1]) >= 32 * static_cast<size_t>(src0->ne[2]) &&
+        ggml_cuda_moe_use_mmq(src0, src1->ne[2]) &&
+        (ggml_cuda_mmid_source_capability_for(src0->type).flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0;
+}
+
+static void ggml_cuda_moe_prefill_ring_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    const size_t budget = ggml_cuda_moe_prefill_ring_bytes();
+    const uint32_t stream_experts = ggml_cuda_prefill_stream_experts();
+    if (budget == 0 || stream_experts == 0 || cgraph == nullptr || ctx.moe_grouped_context == nullptr ||
+            ggml_moe_debug_getenv("LLAMA_MOE_PREFILL_NO_IDENTITY") != nullptr ||
+            ggml_moe_debug_getenv("LLAMA_MOE_ROUTE_DUMP") != nullptr) {
+        return;
+    }
+    if (ctx.moe_prefill_ring == nullptr) {
+        ctx.moe_prefill_ring = std::make_unique<ggml_cuda_moe_prefill_ring>();
+    }
+    auto & ring = *ctx.moe_prefill_ring;
+    ring.ops.clear();
+    ring.op_of_node.clear();
+    ring.n_jobs = 0;
+    size_t slot_bytes = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!ggml_cuda_moe_identity_stream_candidate(node)) {
+            continue;
+        }
+        const ggml_tensor * src0 = node->src[0];
+        ggml_cuda_moe_prefill_ring::op op;
+        op.src0 = src0;
+        op.capacity = std::min<size_t>(stream_experts, static_cast<size_t>(src0->ne[2]));
+        op.n_groups = (static_cast<size_t>(src0->ne[2]) + op.capacity - 1) / op.capacity;
+        const int64_t remainder = src0->ne[0] % MATRIX_ROW_PADDING;
+        op.padding = remainder != 0 ? ggml_row_size(src0->type, MATRIX_ROW_PADDING - remainder) : 0;
+        op.first_job = ring.n_jobs;
+        op.top_k = static_cast<uint32_t>(node->src[2]->ne[0]);
+        slot_bytes = std::max(slot_bytes, op.capacity * static_cast<size_t>(src0->nb[2]) + op.padding);
+        ring.op_of_node[node] = ring.ops.size();
+        ring.ops.push_back(op);
+        ring.n_jobs += op.n_groups;
+    }
+    slot_bytes = GGML_PAD(slot_bytes, 256);
+    const uint32_t n_slots = slot_bytes != 0 ? static_cast<uint32_t>(std::min<size_t>(budget / slot_bytes, 1024)) : 0;
+    if (ring.ops.empty() || n_slots < 2) {
+        ring.ops.clear();
+        ring.op_of_node.clear();
+        return;
+    }
+    if (ring.slot_bytes != slot_bytes || ring.n_slots != n_slots || ring.device != ctx.device) {
+        ring.free_storage();
+        ring.device = ctx.device;
+        if (cudaMalloc(reinterpret_cast<void **>(&ring.data), slot_bytes * n_slots) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ring.data = nullptr;
+            ring.free_storage();
+            ring.ops.clear();
+            ring.op_of_node.clear();
+            return;
+        }
+        ring.slot_bytes = slot_bytes;
+        ring.n_slots = n_slots;
+        ring.copied.resize(n_slots);
+        ring.freed.resize(n_slots);
+        for (uint32_t i = 0; i < n_slots; ++i) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ring.copied[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ring.freed[i], cudaEventDisableTiming));
+        }
+        GGML_LOG_INFO("moe-prefill-ring: %u slots of %.1f MiB\n", n_slots, slot_bytes / 1048576.0);
+    }
+    ring.entries.assign(n_slots, {});
+    ring.issued = 0;
+    ring.active = true;
+}
+
+void ggml_cuda_moe_prefill_ring_release(ggml_backend_cuda_context & ctx) {
+    ctx.moe_prefill_ring.reset();
+}
+
+static void ggml_cuda_moe_prefill_ring_end(ggml_backend_cuda_context & ctx) {
+    if (ctx.moe_prefill_ring == nullptr) {
+        return;
+    }
+    auto & ring = *ctx.moe_prefill_ring;
+    ring.leases.clear();
+    ring.ops.clear();
+    ring.op_of_node.clear();
+    ring.entries.assign(ring.n_slots, {});
+    ring.n_jobs = 0;
+    ring.issued = 0;
+    ring.active = false;
 }
 
 static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
@@ -3904,8 +4165,18 @@ static bool ggml_cuda_mul_mat_id_cached(
         std::iota(experts.begin(), experts.end(), 0);
         const int64_t remainder = src0->ne[0] % MATRIX_ROW_PADDING;
         const size_t padding = remainder != 0 ? ggml_row_size(src0->type, MATRIX_ROW_PADDING - remainder) : 0;
-        if (ggml_cuda_moe_prefill_stream(ctx, dst, cache, experts, {}, {}, padding,
-                static_cast<size_t>(stream_experts), telemetry_is_decode, true)) {
+        auto * ring = ctx.moe_prefill_ring != nullptr && ctx.moe_prefill_ring->active ? ctx.moe_prefill_ring.get() : nullptr;
+        const ggml_cuda_moe_prefill_ring::op * planned = nullptr;
+        if (ring != nullptr && !ggml_cuda_moe_cache_pageable_staging(cache)) {
+            const auto found = ring->op_of_node.find(dst);
+            if (found != ring->op_of_node.end() && ring->ops[found->second].src0 == src0 &&
+                    ring->ops[found->second].capacity == std::min<size_t>(stream_experts, static_cast<size_t>(src0->ne[2]))) {
+                planned = &ring->ops[found->second];
+            }
+        }
+        if (planned != nullptr ? ggml_cuda_moe_prefill_stream_ring(ctx, dst, cache, *ring, *planned) :
+                ggml_cuda_moe_prefill_stream(ctx, dst, cache, experts, {}, {}, padding,
+                    static_cast<size_t>(stream_experts), telemetry_is_decode, true)) {
             ggml_cuda_moe_record_legacy_op(leased_owner, telemetry_is_decode, true, false,
                 experts.size() > static_cast<size_t>(ggml_cuda_moe_cache_n_slots(cache)), experts.size(), ggml_nbytes(ids),
                 0, 0, 0, 0, 0, 0, ggml_time_us() - op_start_us, false);
@@ -7998,8 +8269,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    if (!use_cuda_graph) {
+        ggml_cuda_moe_prefill_ring_begin(*cuda_ctx, cgraph);
+    }
     const bool graph_evaluated = ggml_cuda_graph_evaluate_and_capture(
         cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, &moe_execution);
+    ggml_cuda_moe_prefill_ring_end(*cuda_ctx);
     ggml_cuda_kv_host_cache_end_graph(cgraph, cuda_ctx->stream());
 
     if (graph_evaluated && moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE) {

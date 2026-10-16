@@ -1413,6 +1413,7 @@ static void common_moe_cache_auto_size(common_params & params) {
     // The measurement misses what grows after it: prompt processing stages up to a whole expert bank per op in the
     // CUDA memory pool, kernels load on first use, and other processes take memory. Keep room for all three.
     size_t staging = 0;
+    uint32_t top_k = 0;
     {
         common_params probe = params;
         probe.n_moe_expert_cache_slots = low;
@@ -1434,6 +1435,7 @@ static void common_moe_cache_auto_size(common_params & params) {
         llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
         if (model) {
             for (const auto & group : llama_model_moe_placement(model.get()).groups) {
+                top_k = std::max(top_k, group.top_k);
                 for (const auto & bank : group.banks) {
                     staging = std::max<size_t>(staging, std::max<size_t>(bank.tensor_bytes, bank.expert_stride * group.n_experts));
                 }
@@ -1461,9 +1463,17 @@ static void common_moe_cache_auto_size(common_params & params) {
             if (decode_slots > slots) {
                 params.n_moe_expert_cache_slots = decode_slots;
                 params.prompt_moe_expert_cache_slots = slots;
+                // Streamed prompts barely use cache slots: keep the active experts and load upcoming groups ahead
+                // in 3/4 of the freed memory; the rest stays as margin, as overcommit pages on WDDM.
+                if (common_moe_prefill_stream(params) > 0 && top_k > 0 && (int32_t) top_k < slots &&
+                        params.moe_expert_cache_host_pinned_size != LLAMA_MOE_HOST_PINNED_OFF) {
+                    params.prompt_moe_expert_cache_slots = (int32_t) top_k;
+                    params.moe_prefill_ring = (int64_t) ((size_t) (slots - (int32_t) top_k) * per_slot / 4 * 3);
+                }
             }
-            COM_INF("%s: MoE expert cache auto: %d slots for generation, %d while a prompt is processed\n", __func__,
-                params.n_moe_expert_cache_slots, slots);
+            COM_INF("%s: MoE expert cache auto: %d slots for generation, %d while a prompt is processed, %.0f MiB "
+                "prompt load-ahead ring\n", __func__, params.n_moe_expert_cache_slots, params.prompt_moe_expert_cache_slots,
+                params.moe_prefill_ring / 1048576.0);
         }
     }
 }
@@ -1989,6 +1999,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_expert_profile        = params.moe_expert_profile.empty() ? nullptr : params.moe_expert_profile.c_str();
     cparams.moe_prefill_stream        = common_moe_prefill_stream(params);
     cparams.moe_prefill_kv_budget     = common_moe_prefill_kv_budget(params);
+    cparams.moe_prefill_ring          = params.moe_prefill_ring > 0 ? (uint64_t) params.moe_prefill_ring : 0;
 
     return cparams;
 }

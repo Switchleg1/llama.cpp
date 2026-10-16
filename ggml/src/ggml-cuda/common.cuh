@@ -1468,6 +1468,10 @@ struct ggml_cuda_stream_context {
 
 class ggml_cuda_moe_grouped_context;
 struct ggml_cuda_moe_ids_cache_state;
+struct ggml_cuda_moe_prefill_ring;
+struct ggml_backend_cuda_context;
+// Frees the prompt streaming ring; the device must be idle.
+void ggml_cuda_moe_prefill_ring_release(ggml_backend_cuda_context & ctx);
 
 struct ggml_backend_cuda_context {
     int device;
@@ -1480,6 +1484,7 @@ struct ggml_backend_cuda_context {
     uint64_t moe_graph_registry_generation = 0;
     std::vector<std::unique_ptr<ggml_backend_cuda_context>> moe_router_contexts;
     std::unique_ptr<ggml_cuda_moe_ids_cache_state> moe_ids_cache;
+    std::unique_ptr<ggml_cuda_moe_prefill_ring> moe_prefill_ring;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

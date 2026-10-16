@@ -16335,6 +16335,10 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v2(
             // Captured graphs hold cache addresses: retire them before the backing is replaced.
             ggml_cuda_set_device(ctx->device);
             CUDA_CHECK(cudaDeviceSynchronize());
+            // The prompt ring gives its memory back before a larger cache is allocated.
+            if (snapshot->n_slots > previous.n_slots) {
+                ggml_cuda_moe_prefill_ring_release(*ctx);
+            }
 #ifdef USE_CUDA_GRAPH
             ctx->cuda_graphs.clear();
 #endif
@@ -17526,6 +17530,44 @@ void ggml_cuda_moe_cache_release_slots(
 }
 
 extern "C"
+// Copies the sources into consecutive staging slots on the copy stream, merging contiguous runs and taking
+// resident experts from their cache slots. The caller holds cache->mu.
+static bool moe_cache_copy_runs_locked(
+        ggml_cuda_moe_cache * cache, const void * const * host_srcs, int n_host_srcs, size_t byte_count, void * dst,
+        bool is_decode) {
+    for (int i = 0; i < n_host_srcs;) {
+        const auto it = cache->host_to_slot.find(host_srcs[i]);
+        const bool resident = it != cache->host_to_slot.end();
+        const void * src = resident ?
+            (const char *)cache->slot_pool_d + (size_t)it->second * cache->slot_size_bytes : host_srcs[i];
+        int run = 1;
+        while (i + run < n_host_srcs) {
+            const auto next_it = cache->host_to_slot.find(host_srcs[i + run]);
+            const bool next_resident = next_it != cache->host_to_slot.end();
+            const void * next_src = next_resident ?
+                (const char *)cache->slot_pool_d + (size_t)next_it->second * cache->slot_size_bytes : host_srcs[i + run];
+            if (next_resident != resident || (uintptr_t)next_src != (uintptr_t)src + (size_t)run * byte_count) {
+                break;
+            }
+            ++run;
+        }
+        if (resident) {
+            if (cudaMemcpyAsync((char *) dst + (size_t) i * byte_count, src, (size_t) run * byte_count,
+                    cudaMemcpyDeviceToDevice, cache->copy_stream) != cudaSuccess) {
+                return false;
+            }
+        } else {
+            if (moe_cache_copy_source(
+                    cache, (char *) dst + (size_t) i * byte_count, src, (size_t) run * byte_count,
+                    cache->copy_stream, is_decode) != cudaSuccess) {
+                return false;
+            }
+        }
+        i += run;
+    }
+    return true;
+}
+
 bool ggml_cuda_moe_cache_copy_to_staging(
     struct ggml_cuda_moe_cache * cache,
     const void * const * host_srcs,
@@ -17559,37 +17601,49 @@ bool ggml_cuda_moe_cache_copy_to_staging(
         CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
     }
 
-    for (int i = 0; i < n_host_srcs;) {
-        const auto it = cache->host_to_slot.find(host_srcs[i]);
-        const bool resident = it != cache->host_to_slot.end();
-        const void * src = resident ?
-            (const char *)cache->slot_pool_d + (size_t)it->second * cache->slot_size_bytes : host_srcs[i];
-        int run = 1;
-        while (i + run < n_host_srcs) {
-            const auto next_it = cache->host_to_slot.find(host_srcs[i + run]);
-            const bool next_resident = next_it != cache->host_to_slot.end();
-            const void * next_src = next_resident ?
-                (const char *)cache->slot_pool_d + (size_t)next_it->second * cache->slot_size_bytes : host_srcs[i + run];
-            if (next_resident != resident || (uintptr_t)next_src != (uintptr_t)src + (size_t)run * byte_count) {
-                break;
-            }
-            ++run;
-        }
-        if (resident) {
-            CUDA_CHECK(cudaMemcpyAsync((char *) dst + (size_t) i * byte_count, src, (size_t) run * byte_count, cudaMemcpyDeviceToDevice, cache->copy_stream));
-        } else {
-            if (moe_cache_copy_source(
-                    cache, (char *) dst + (size_t) i * byte_count, src, (size_t) run * byte_count,
-                    cache->copy_stream, is_decode) != cudaSuccess) {
-                return false;
-            }
-        }
-        i += run;
+    if (!moe_cache_copy_runs_locked(cache, host_srcs, n_host_srcs, byte_count, dst, is_decode)) {
+        return false;
     }
 
     CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
     CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
     return true;
+}
+
+bool ggml_cuda_moe_cache_copy_async(
+    struct ggml_cuda_moe_cache * cache,
+    const void * const * host_srcs,
+    int                  n_host_srcs,
+    size_t               byte_count,
+    void *               dst,
+    size_t               trailing_zero_bytes,
+    cudaEvent_t          wait_a,
+    cudaEvent_t          wait_b,
+    cudaEvent_t          done) {
+    if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || !dst || !done) {
+        return false;
+    }
+    for (int i = 0; i < n_host_srcs; ++i) {
+        if (!host_srcs[i]) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lk(cache->mu);
+    if (cache->host_staging_failed || byte_count > cache->slot_size_bytes) {
+        return false;
+    }
+    if ((wait_a != nullptr && cudaStreamWaitEvent(cache->copy_stream, wait_a, 0) != cudaSuccess) ||
+            (wait_b != nullptr && cudaStreamWaitEvent(cache->copy_stream, wait_b, 0) != cudaSuccess)) {
+        return false;
+    }
+    if (!moe_cache_copy_runs_locked(cache, host_srcs, n_host_srcs, byte_count, dst, false)) {
+        return false;
+    }
+    if (trailing_zero_bytes != 0 && cudaMemsetAsync((char *) dst + (size_t) n_host_srcs * byte_count, 0,
+            trailing_zero_bytes, cache->copy_stream) != cudaSuccess) {
+        return false;
+    }
+    return cudaEventRecord(done, cache->copy_stream) == cudaSuccess;
 }
 
 extern "C"
@@ -17948,6 +18002,10 @@ bool ggml_cuda_moe_cache_trailing_padding_zero_for_test(struct ggml_cuda_moe_cac
 }
 
 extern "C"
+bool ggml_cuda_moe_cache_pageable_staging(const struct ggml_cuda_moe_cache * cache) {
+    return cache != nullptr && cache->source != nullptr && cache->source->device_alias == nullptr;
+}
+
 cudaStream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * cache) {
     return cache ? cache->copy_stream : nullptr;
 }

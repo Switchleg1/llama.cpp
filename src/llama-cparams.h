@@ -72,6 +72,7 @@ struct llama_cparams {
     bool live_context_workspace;
     uint32_t moe_prefill_stream;
     uint64_t moe_prefill_kv_budget;
+    uint64_t moe_prefill_ring;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

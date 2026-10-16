@@ -94,12 +94,14 @@ typedef bool (*ggml_backend_moe_hybrid_configure_t)(const struct ggml_backend_mo
 
 // Prompt processing configuration, process-wide. stream_experts > 0 uploads the experts of a large cached
 // MUL_MAT_ID in groups of this size; kv_host_bulk_store writes large mapped q8_0 KV stores in bulk;
-// topk_segmented sorts multi-row top-k in one launch. Without a call, debug environment variables apply.
+// topk_segmented sorts multi-row top-k in one launch; ring_bytes of VRAM let the expert groups of upcoming streamed
+// ops load ahead of their use. Without a call, debug environment variables apply.
 #define GGML_BACKEND_MOE_PREFILL_CONFIGURE_PROC_NAME "ggml_backend_moe_prefill_configure"
 struct ggml_backend_moe_prefill_config {
     uint32_t stream_experts;
     bool     kv_host_bulk_store;
     bool     topk_segmented;
+    uint64_t ring_bytes;
 };
 typedef bool (*ggml_backend_moe_prefill_configure_t)(const struct ggml_backend_moe_prefill_config * config);
 
