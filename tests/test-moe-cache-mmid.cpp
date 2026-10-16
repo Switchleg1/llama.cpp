@@ -451,7 +451,10 @@ void test_cached_mmid_prefill_and_overflow() {
     for (const stream_case & sc : {stream_case{GGML_TYPE_Q6_K, 2816, 128, false, 8, 4, 32, "3"}, stream_case{GGML_TYPE_Q8_0, 704, 128, true, 8, 4, 32, "3"},
                                    stream_case{GGML_TYPE_Q8_0, 768, 128, true, 8, 4, 32, "3"}, stream_case{GGML_TYPE_Q6_K, 768, 128, true, 8, 4, 32, "3"},
                                    stream_case{GGML_TYPE_Q8_0, 704, 256, true, 128, 8, 512, "32"}, stream_case{GGML_TYPE_Q6_K, 2816, 256, false, 128, 8, 512, "32"}}) {
-        for (const char * capacity : {"", sc.capacity}) {
+        for (const char * capacity : {"", sc.capacity, "readback"}) {
+            // "readback": same capacity, but remap the read-back ids instead of streaming the bank in expert order
+            const bool readback = strcmp(capacity, "readback") == 0;
+            capacity = readback ? sc.capacity : capacity;
             const char * old_debug = std::getenv("LLAMA_MOE_DEBUG");
             const char * old_stream = std::getenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS");
             const std::string saved_debug = old_debug != nullptr ? old_debug : "";
@@ -459,9 +462,11 @@ void test_cached_mmid_prefill_and_overflow() {
 #ifdef _WIN32
             CHECK(_putenv_s("LLAMA_MOE_DEBUG", capacity[0] ? "1" : "") == 0);
             CHECK(_putenv_s("LLAMA_MOE_PREFILL_STREAM_EXPERTS", capacity) == 0);
+            CHECK(_putenv_s("LLAMA_MOE_PREFILL_NO_IDENTITY", readback ? "1" : "") == 0);
 #else
             CHECK(capacity[0] ? setenv("LLAMA_MOE_DEBUG", "1", 1) == 0 : unsetenv("LLAMA_MOE_DEBUG") == 0);
             CHECK(capacity[0] ? setenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS", capacity, 1) == 0 : unsetenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS") == 0);
+            CHECK(readback ? setenv("LLAMA_MOE_PREFILL_NO_IDENTITY", "1", 1) == 0 : unsetenv("LLAMA_MOE_PREFILL_NO_IDENTITY") == 0);
 #endif
             auto cuda_case = build_cached_mmid_path_test_graph(
                 cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), sc.type, sc.n_out, sc.n_used, sc.n_tokens, sc.n_experts, sc.per_expert, false, sc.n_in);
@@ -474,14 +479,16 @@ void test_cached_mmid_prefill_and_overflow() {
                     case_ids[token * sc.n_used + route] = int32_t((token * 7 + route * (sc.n_experts / sc.n_used + 1)) % sc.n_experts);
                 }
             }
-            fprintf(stderr, "test-moe-cache: stream case type=%s n_in=%lld experts=%lld tokens=%lld per_expert=%d capacity=%s\n",
-                ggml_type_name(sc.type), (long long) sc.n_in, (long long) sc.n_experts, (long long) sc.n_tokens, sc.per_expert ? 1 : 0, capacity[0] ? capacity : "off");
+            fprintf(stderr, "test-moe-cache: stream case type=%s n_in=%lld experts=%lld tokens=%lld per_expert=%d capacity=%s%s\n",
+                ggml_type_name(sc.type), (long long) sc.n_in, (long long) sc.n_experts, (long long) sc.n_tokens, sc.per_expert ? 1 : 0, capacity[0] ? capacity : "off", readback ? " readback" : "");
             (void) run_cached_mmid_path_test(
                 cuda_backend.get(), reference_backend.get(), cuda_case, reference_case, case_ids);
 #ifdef _WIN32
             CHECK(_putenv_s("LLAMA_MOE_DEBUG", saved_debug.c_str()) == 0);
             CHECK(_putenv_s("LLAMA_MOE_PREFILL_STREAM_EXPERTS", saved_stream.c_str()) == 0);
+            CHECK(_putenv_s("LLAMA_MOE_PREFILL_NO_IDENTITY", "") == 0);
 #else
+            CHECK(unsetenv("LLAMA_MOE_PREFILL_NO_IDENTITY") == 0);
             CHECK(old_debug ? setenv("LLAMA_MOE_DEBUG", saved_debug.c_str(), 1) == 0 : unsetenv("LLAMA_MOE_DEBUG") == 0);
             CHECK(old_stream ? setenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS", saved_stream.c_str(), 1) == 0 : unsetenv("LLAMA_MOE_PREFILL_STREAM_EXPERTS") == 0);
 #endif
