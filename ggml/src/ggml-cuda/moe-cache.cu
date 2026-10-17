@@ -4085,8 +4085,13 @@ static __device__ uint32_t moe_grouped_warp_min_slot(uint32_t frequency, unsigne
     for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
         min_age = min(min_age, __shfl_xor_sync(0xffffffff, min_age, offset, WARP_SIZE));
     }
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    const auto candidates = __ballot(frequency == min_frequency && age == min_age);
+    return candidates != 0 ? __ffsll(candidates) - 1 : UINT32_MAX;
+#else
     const uint32_t candidates = __ballot_sync(0xffffffff, frequency == min_frequency && age == min_age);
     return candidates != 0 ? __ffs(candidates) - 1 : UINT32_MAX;
+#endif
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -4205,15 +4210,17 @@ static __global__ void moe_grouped_admit_copy(
     if (route < 0 || route >= n_routes || route >= routes_per_row) {
         return;
     }
-    // __ldcv: one uncached 16-byte read each. A volatile float4 split into four ordered 4-byte PCIe round trips
-    // and cost about 300 us per layer.
-    // One float4 per thread across blockIdx.y slices: every PCIe read is in flight at once, so the copy costs
-    // about one round trip rather than one per loop iteration.
+    // Read each CPU publication without reusing a cached host value.
     const float4 * src = (const float4 *) (publication->results + (size_t) index * MOE_GROUPED_ADMIT_WIDTH);
     float4 * dst = (float4 *) (down_output + (size_t) route * n_embd);
     const int64_t i = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
     if (i < n_embd / 4) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        const volatile float * values = (const volatile float *) (src + i);
+        dst[i] = make_float4(values[0], values[1], values[2], values[3]);
+#else
         dst[i] = __ldcv(src + i);
+#endif
     }
 }
 
@@ -6115,7 +6122,11 @@ static __global__ void moe_early_router_compact(
     for (int first = 0; first < experts; first += WARP_SIZE) {
         const int expert = first + threadIdx.x;
         const bool selected = expert < experts && positions[expert] >= 0;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        const uint32_t selected_mask = (uint32_t) __ballot(selected);
+#else
         const uint32_t selected_mask = __ballot_sync(0xffffffff, selected);
+#endif
         const uint32_t rank = count + __popc(selected_mask & ((1u << threadIdx.x) - 1));
         if (selected) {
             if (rank < prediction_capacity) {
@@ -17533,7 +17544,6 @@ void ggml_cuda_moe_cache_release_slots(
     }
 }
 
-extern "C"
 // Copies the sources into consecutive staging slots on the copy stream, merging contiguous runs and taking
 // resident experts from their cache slots. The caller holds cache->mu.
 static bool moe_cache_copy_runs_locked(

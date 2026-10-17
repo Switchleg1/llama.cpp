@@ -46,6 +46,7 @@ struct layer_fixture {
     ggml_tensor *                                     gate_up[2] = {};
     ggml_tensor *                                     down[2]    = {};
     ggml_tensor *                                     down_bias[2] = {};
+    ggml_tensor *                                     down_scale[2] = {};
     ggml_tensor *                                     output[2]  = {};
     std::vector<ggml_backend_moe_candidate_group_v2>  groups;
     std::vector<ggml_backend_moe_candidate_tensor_v2> tensors;
@@ -122,7 +123,7 @@ struct layer_fixture {
         build_graph();
     }
 
-    void build_graph(llm_ffn_op_type activation = LLM_FFN_SILU, float clamp = 0.0f, bool scaled = false, bool external = false, int n_tokens = 1) {
+    void build_graph(llm_ffn_op_type activation = LLM_FFN_SILU, float clamp = 0.0f, bool scaled = false, bool external = false, int n_tokens = 1, bool scaled_down = false) {
         result.reset();
         auto * ctx = result.get_ctx();
         input      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_dim, n_tokens);
@@ -146,12 +147,17 @@ struct layer_fixture {
             logits[layer] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_experts, n_tokens);
             ggml_set_input(logits[layer]);
             auto * scale = scaled ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_experts) : nullptr;
+            down_scale[layer] = scaled_down ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_experts) : nullptr;
+            if (down_scale[layer]) {
+                ggml_set_input(down_scale[layer]);
+                ggml_set_output(down_scale[layer]);
+            }
             auto * route = external ? ggml_argsort_top_k(ctx, logits[layer], n_used) : nullptr;
             cur = output[layer] =
                 builder.build_moe_ffn(cur, nullptr, nullptr, up[layer], nullptr, gate[layer], nullptr, down[layer],
                                       down_bias[layer], nullptr, n_experts, n_used, activation, true, 1.0f,
                                       LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, layer, logits[layer], gate_up[layer],
-                                      nullptr, scale, nullptr, nullptr, route);
+                                      nullptr, scale, nullptr, down_scale[layer], route);
             auto & region         = result.get_moe_regions().back();
             region.semantic_group = layer;
             region.domain         = GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY;
@@ -194,6 +200,13 @@ struct layer_fixture {
                 scores[i] = (i % n_experts + iteration + 3 * layer + 2 * ((i / n_experts) % 2)) % n_experts;
             }
             ggml_backend_tensor_set(logits[layer], scores.data(), 0, scores.size() * sizeof(float));
+            if (down_scale[layer]) {
+                std::vector<float> scales(n_experts);
+                for (size_t e = 0; e < scales.size(); ++e) {
+                    scales[e] = 0.5f + 0.125f * e;
+                }
+                ggml_backend_tensor_set(down_scale[layer], scales.data(), 0, scales.size() * sizeof(float));
+            }
         }
     }
 };
@@ -864,10 +877,12 @@ void test_hybrid_ffn_insertion() {
                         GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED}) {
         for (auto activation : {LLM_FFN_SILU, LLM_FFN_GELU}) {
             for (int n_rows : {1, 4}) {
+              const int variants = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && activation == LLM_FFN_GELU && probe_type == GGML_TYPE_Q4_0 ? 2 : 1;
+              for (int variant = 0; variant < variants; ++variant) {
                 layer_fixture host(0, layout, probe_type);
                 layer_fixture gpu(0, layout, probe_type, false, {0, 0}, 0);
-                host.build_graph(activation, 0.0f, false, false, n_rows);
-                gpu.build_graph(activation, 0.0f, false, false, n_rows);
+                host.build_graph(activation, 0.0f, false, false, n_rows, variant != 0);
+                gpu.build_graph(activation, 0.0f, false, false, n_rows, variant != 0);
                 const auto & host_region = host.result.get_moe_regions().front();
                 ggml_set_output(host_region.hybrid_ffn.down_output);
                 ggml_set_output(host_region.route);
@@ -878,6 +893,7 @@ void test_hybrid_ffn_insertion() {
                 auto * graph = gpu.result.get_gf();
                 auto * masked = ggml_new_tensor_2d(gpu.result.get_ctx(), GGML_TYPE_I32, n_used, n_rows);
                 ggml_set_input(masked);
+                ggml_set_output(masked);
                 ggml_set_output(region.route);
                 ggml_set_output(ffn.input);
                 ggml_set_output(ffn.down_output);
@@ -1016,6 +1032,7 @@ void test_hybrid_ffn_insertion() {
                     }
                 }
                 CUDA_OK(cudaFreeHost(staging));
+              }
             }
         }
     }

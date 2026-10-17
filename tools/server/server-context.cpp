@@ -3768,7 +3768,10 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold || (has_mtp_state && n_past < slot.prompt.n_tokens())) {
+                                // Shared-KV MTP can rebuild its carry state if the target supports partial removal.
+                                const bool mtp_needs_replay = has_mtp_state &&
+                                    (llama_get_ctx_other(ctx_dft) != ctx_tgt || ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+                                if (pos_min >= pos_min_thold || (mtp_needs_replay && n_past < slot.prompt.n_tokens())) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),

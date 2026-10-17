@@ -67,6 +67,7 @@
 #define cudaHostUnregister musaHostUnregister
 #define cudaLaunchCooperativeKernel musaLaunchCooperativeKernel
 #define cudaLaunchHostFunc musaLaunchHostFunc
+#define CUDART_CB
 #define cudaMalloc musaMalloc
 #define cudaMallocHost musaMallocHost
 #define cudaMallocManaged musaMallocManaged

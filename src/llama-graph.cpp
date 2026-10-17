@@ -3077,7 +3077,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * expert_activation = cur;
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
-    ggml_tensor * expert_down_output = experts;
+    // a down scale multiplies the matmul output; the CPU split fills the raw output and the graph scales it
+    ggml_tensor * expert_down_output = down_exps_s && experts->op == GGML_OP_MUL && experts->src[0] != nullptr &&
+        experts->src[0]->op == GGML_OP_MUL_MAT_ID && experts->src[0]->src[0] == down_exps &&
+        experts->src[0]->src[2] == selected_experts ? experts->src[0] : experts;
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
@@ -3136,7 +3139,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Record only plain expert arithmetic. Runtime placement and shape checks are separate.
     bool hybrid_simple = !weight_before_ffn && !selected_experts_in &&
         !up_exps_b && !gate_exps_b && !gate_up_exps_b && !down_exps_b &&
-        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        !up_exps_s && !gate_exps_s && (!down_exps_s || expert_down_output->op == GGML_OP_MUL_MAT_ID) &&
         (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
     if (type_op == LLM_FFN_SILU && gate_exps && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
         hybrid_simple = false;

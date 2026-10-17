@@ -1582,6 +1582,10 @@ llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
         }
     }
 
+    if (plan.live_kv && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.ctx_other != nullptr) {
+        plan.n_tokens = std::min(plan.n_tokens, std::max(plan.n_tokens_decode, n_tokens_req));
+    }
+
     if (plan.live_kv && cparams.phase_aware_workspace && cparams.n_seq_max == 1 &&
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_slots() > 0 &&
             n_tokens_req > plan.n_tokens_decode) {
