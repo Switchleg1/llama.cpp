@@ -2013,6 +2013,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_prefill_stream        = common_moe_prefill_stream(params);
     cparams.moe_prefill_kv_budget     = common_moe_prefill_kv_budget(params);
     cparams.moe_prefill_ring          = params.moe_prefill_ring > 0 ? (uint64_t) params.moe_prefill_ring : 0;
+    cparams.moe_prefill_kv_budget_auto = params.moe_prefill_kv_budget < 0;
 
     return cparams;
 }

@@ -3138,7 +3138,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-prefill-kv-budget"}, "N|auto|off",
         "with --live-context-workspace, shrink prompt chunks so that chunk tokens x occupied KV cells stay within N; "
-        "auto uses 134217728 (4K tokens up to 32K cells, 1K at 128K) (default: auto)",
+        "auto starts at 134217728 (4K tokens up to 32K cells, 1K at 128K) and grows into free VRAM measured during the prompt (default: auto)",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.moe_prefill_kv_budget = -1;

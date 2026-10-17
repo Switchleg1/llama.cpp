@@ -506,6 +506,7 @@ extern "C" {
         uint32_t     moe_prefill_stream;        // experts per uploaded group in large cached expert matmuls, 0: off
         uint64_t     moe_prefill_kv_budget;     // with live-context workspace, bound prompt chunks to tokens x KV cells, 0: off
         uint64_t     moe_prefill_ring;          // VRAM bytes for loading upcoming streamed expert groups ahead, 0: off
+        bool         moe_prefill_kv_budget_auto; // raise moe_prefill_kv_budget while measured free VRAM allows
     };
 
     struct llama_model_tensor_override {

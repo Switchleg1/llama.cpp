@@ -3899,6 +3899,7 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
                 ggml_row_size(src0->type, MATRIX_ROW_PADDING - row_remainder) : 0;
             std::vector<int32_t> all_experts(static_cast<size_t>(n_experts));
             std::iota(all_experts.begin(), all_experts.end(), 0);
+            owner->mark_host_staged_slots_written(lease);
             return ggml_cuda_moe_prefill_stream(ctx, dst, cache, all_experts, {}, {}, source_padding,
                 static_cast<size_t>(stream_experts), telemetry_is_decode, true);
         }
@@ -3945,8 +3946,77 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
         return false;
     }
     if (stream_experts > 0 && runtime.consumer == GGML_CUDA_MMID_CONSUMER_MMQ) {
+        owner->mark_host_staged_slots_written(lease);
         return ggml_cuda_moe_prefill_stream(ctx, dst, cache, unique_experts, expert_to_pos,
             ids_values, source_padding, static_cast<size_t>(stream_experts), telemetry_is_decode);
+    }
+
+    // Fits the slots: fill the misses into LRU slots and read the slot pool in place, like grouped decode.
+    const int n_cache_slots = ggml_cuda_moe_cache_n_slots(cache);
+    ggml_cuda_moe_host_staging_runtime_capability pool_runtime;
+    if (stream_experts == 0 && n_cache_slots > 1 && unique_experts.size() <= static_cast<size_t>(n_cache_slots) &&
+            static_cast<const char *>(ggml_cuda_moe_cache_slot_ptr(cache, 1)) -
+                static_cast<const char *>(ggml_cuda_moe_cache_slot_ptr(cache, 0)) == static_cast<ptrdiff_t>(expert_stride) &&
+            ggml_cuda_moe_host_staging_capability(dst, lease.capability(), n_cache_slots, &pool_runtime) &&
+            pool_runtime.consumer == runtime.consumer && pool_runtime.mapping == runtime.mapping) {
+        std::vector<const void *> sources;
+        sources.reserve(unique_experts.size());
+        for (int32_t expert : unique_experts) {
+            sources.push_back(static_cast<const char *>(src0->data) + static_cast<size_t>(expert) * expert_stride);
+        }
+        std::vector<int> slots(unique_experts.size(), -1);
+        owner->mark_host_staged_slots_written(lease);
+        if (ggml_cuda_moe_cache_acquire_pinned(cache, sources.data(), static_cast<int>(sources.size()), expert_stride,
+                slots.data(), ctx.stream(), telemetry_is_decode)) {
+            const bool use_mmq = ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]);
+            ggml_tensor source_view = *src0;
+            source_view.data = ggml_cuda_moe_cache_slot_ptr(cache, 0);
+            ggml_tensor * original_source = dst->src[0];
+            bool dispatched = false;
+            if (pool_runtime.mapping == GGML_CUDA_MMID_MAPPING_DIRECT) {
+                std::vector<int32_t> remapped_ids;
+                remapped_ids.reserve(n_ids);
+                for (int32_t expert : ids_values) {
+                    remapped_ids.push_back(slots[expert_to_pos[expert]]);
+                }
+                ggml_cuda_pool_alloc<int32_t> scratch_ids(ctx.pool(), n_ids);
+                if (cudaMemcpyAsync(scratch_ids.get(), remapped_ids.data(), n_ids * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, ctx.stream()) == cudaSuccess) {
+                    source_view.ne[2] = n_cache_slots;
+                    source_view.nb[3] = source_view.nb[2] * static_cast<size_t>(n_cache_slots);
+                    ggml_tensor ids_view = *ids;
+                    ids_view.data = scratch_ids.get();
+                    ids_view.nb[0] = sizeof(int32_t);
+                    ids_view.nb[1] = static_cast<size_t>(ids->ne[0]) * sizeof(int32_t);
+                    ids_view.nb[2] = n_ids * sizeof(int32_t);
+                    ids_view.nb[3] = ids_view.nb[2];
+                    ggml_tensor * original_ids = dst->src[2];
+                    dst->src[0] = &source_view;
+                    dst->src[2] = &ids_view;
+                    dispatched = ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, nullptr, pool_runtime.consumer);
+                    dst->src[0] = original_source;
+                    dst->src[2] = original_ids;
+                }
+            } else {
+                std::vector<int32_t> expert_source(static_cast<size_t>(n_experts), -1);
+                for (size_t i = 0; i < unique_experts.size(); ++i) {
+                    expert_source[unique_experts[i]] = slots[i];
+                }
+                const ggml_cuda_mul_mat_id_host_route host_route = {
+                    ids_host.bytes->data(), ids_host.nb0, ids_host.nb1, expert_source.data(),
+                };
+                dst->src[0] = &source_view;
+                dispatched = ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, &host_route, pool_runtime.consumer);
+                dst->src[0] = original_source;
+            }
+            const bool released = ggml_cuda_moe_cache_release_split_slots(
+                cache, slots.data(), static_cast<int>(slots.size()), ctx.stream());
+            if (!dispatched || !released) {
+                return false;
+            }
+            owner->record_host_staged_op(false);
+            return true;
+        }
     }
 
     const size_t staged_expert_bytes = unique_experts.size() * expert_stride;
@@ -4032,8 +4102,10 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
         }
         int n_resident = 0;
         int n_wait_classes = 1;
-        if (unique_experts.size() > static_cast<size_t>(n_slots) &&
+        // with known grouped residents the full copy reads them device to device and keeps the slots intact
+        if (unique_experts.size() > static_cast<size_t>(n_slots) && !group->host_staged_residents &&
                 src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {
+            owner->mark_host_staged_slots_written(lease);
             const int min_resident = n_slots / 6 + (n_slots % 6 != 0);
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_sources.data(), static_cast<int>(unique_experts.size()), expert_stride, source_padding, min_resident,

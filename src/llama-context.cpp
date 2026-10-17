@@ -798,6 +798,8 @@ llama_context::llama_context(
     cparams.moe_prefill_stream    = params.moe_prefill_stream;
     cparams.moe_prefill_kv_budget = params.moe_prefill_kv_budget > 0 ? params.moe_prefill_kv_budget : llama_moe_prefill_kv_budget_env();
     cparams.moe_prefill_ring      = params.moe_prefill_ring;
+    cparams.moe_prefill_kv_budget_auto = params.moe_prefill_kv_budget_auto && cparams.moe_prefill_kv_budget > 0;
+    moe_prefill_kv_budget_live = cparams.moe_prefill_kv_budget;
     if (cparams.moe_prefill_stream > 0 && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_enabled()) {
         ggml_backend_moe_prefill_configure_t configure = nullptr;
         for (size_t i = 0; i < ggml_backend_reg_count() && configure == nullptr; ++i) {
@@ -1590,9 +1592,52 @@ llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_slots() > 0 &&
             n_tokens_req > plan.n_tokens_decode) {
         plan.n_tokens = std::max(plan.n_tokens_decode, std::min(plan.n_tokens,
-            llama_moe_prefill_token_limit(plan.n_tokens_max, plan.n_kv, cparams.moe_prefill_kv_budget)));
+            llama_moe_prefill_token_limit(plan.n_tokens_max, plan.n_kv, moe_prefill_kv_budget_live)));
     }
     return plan;
+}
+
+void llama_context::update_moe_prefill_kv_budget() {
+    const uint64_t previous = moe_prefill_kv_budget_live;
+    moe_prefill_kv_budget_live = cparams.moe_prefill_kv_budget;
+    // measure only against a reserved prompt workspace; the first batch of each prompt uses the floor
+    if (!cparams.moe_prefill_kv_budget_auto || !sched || sched_reserved_kv == 0 ||
+            sched_reserved_tokens <= std::max(cparams.n_seq_max, sched_decode_outputs)) {
+        return;
+    }
+    // same margin as the prefill ring; on WDDM an overrun pages instead of failing. The ring is already allocated.
+    constexpr uint64_t margin = uint64_t(768) << 20;
+    const double cells = double(sched_reserved_tokens) * double(sched_reserved_kv);
+    double budget = 0.0;
+    bool measured = false;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        const uint64_t used = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        // the decode workspace approximates the part that does not scale with tokens x cells
+        const uint64_t fixed = i < moe_decode_workspace_bytes.size() ? moe_decode_workspace_bytes[i] : 0;
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (used <= fixed) {
+            continue;
+        }
+        // workspace = fixed + cells x (per-token cost / kv + attention cost); a larger kv lowers the cost per cell
+        const uint64_t room = used + free > margin + fixed ? used + free - margin - fixed : 0;
+        const double fit = double(room) / double(used - fixed) * cells;
+        budget = measured ? std::min(budget, fit) : fit;
+        measured = true;
+    }
+    if (measured && budget > double(moe_prefill_kv_budget_live)) {
+        moe_prefill_kv_budget_live = budget >= double(UINT64_MAX / 2) ? UINT64_MAX / 2 : uint64_t(budget);
+    }
+    if (moe_prefill_kv_budget_live / 8 * 7 > previous || previous / 8 * 7 > moe_prefill_kv_budget_live) {
+        LLAMA_LOG_INFO("moe-prefill-budget: %.1f M cells (floor %.1f M, workspace tokens = %u, kv = %u)\n",
+            moe_prefill_kv_budget_live / 1048576.0, cparams.moe_prefill_kv_budget / 1048576.0,
+            sched_reserved_tokens, sched_reserved_kv);
+    }
 }
 
 llama_context * llama_context::shared_workspace_peer() const {
@@ -1873,6 +1918,10 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
         ggml_backend_buffer_type_t buft    = backend_buft[i];
         if (!model.hparams.no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            if (n_tokens == n_tokens_tg) {
+                moe_decode_workspace_bytes.resize(backend_ptrs.size());
+                moe_decode_workspace_bytes[i] = backend_buf_exp_size[i];
+            }
         }
         if (backend_buf_exp_size[i] > 1) {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
@@ -4221,6 +4270,7 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.moe_expert_cache_slots() > 0 &&
             cparams.moe_prefill_kv_budget > 0 &&
             n_tokens_all > std::max(cparams.n_seq_max, sched_decode_outputs)) {
+        update_moe_prefill_kv_budget();
         const uint32_t extent = memory->get_attn_reserve_upper_bound(n_tokens_all);
         n_ubatch = std::min(n_ubatch, make_sched_reserve_plan(n_tokens_all, extent).n_tokens);
         LLAMA_LOG_DEBUG("moe-prefill-chunk: tokens=%u kv_bound=%u maximum=%u\n", n_ubatch, extent, cparams.n_ubatch);
@@ -6313,6 +6363,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_prefill_stream          =*/ 0,
         /*.moe_prefill_kv_budget       =*/ 0,
         /*.moe_prefill_ring            =*/ 0,
+        /*.moe_prefill_kv_budget_auto  =*/ false,
     };
 
     return result;

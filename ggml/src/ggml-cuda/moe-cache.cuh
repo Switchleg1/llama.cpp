@@ -440,6 +440,8 @@ struct ggml_cuda_moe_graph_group_dispatch {
     uint32_t n_slots = 0;
     uint32_t n_auxiliary_shadows = 0;
     bool defer_completion = false;
+    // host-staged caches know the grouped residents; read them in place and do not write slots
+    bool host_staged_residents = false;
 };
 
 using ggml_cuda_moe_graph_stream_resolver = ggml_cuda_moe_stream_t (*)(void * data, const ggml_tensor * node);
@@ -933,6 +935,8 @@ public:
             uint64_t total_time_us,
             bool ids_cache_hit);
     void record_host_staged_op(bool split_staged);
+    // the call overwrote grouped slot data, so the grouped residency must reset before reuse
+    void mark_host_staged_slots_written(const ggml_cuda_moe_grouped_host_staging_lease & lease);
     void record_required_grouped_failure();
     // One owner namespace per context. Fresh submission ids are required within each owner generation.
     bool begin_split_routes(const ggml_cgraph * source, const ggml_graph_execution_certificate & certificate, uint64_t submission_id);
@@ -1378,6 +1382,17 @@ bool ggml_cuda_moe_cache_can_overlap_staging(
 bool ggml_cuda_moe_cache_finish_split_staging(
     struct ggml_cuda_moe_cache * cache,
     ggml_cuda_moe_stream_t compute_stream);
+
+// Fills the missing sources into LRU slots and pins all of them; compute waits for the fills.
+// Release with ggml_cuda_moe_cache_release_split_slots. Fails when the sources do not fit the slots.
+bool ggml_cuda_moe_cache_acquire_pinned(
+    struct ggml_cuda_moe_cache * cache,
+    const void * const * host_srcs,
+    int                  n_host_srcs,
+    size_t               byte_count,
+    int *                slot_ids,
+    ggml_cuda_moe_stream_t compute_stream,
+    bool                  is_decode);
 
 bool ggml_cuda_moe_cache_release_split_slots(
     struct ggml_cuda_moe_cache * cache,

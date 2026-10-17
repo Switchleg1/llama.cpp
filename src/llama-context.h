@@ -516,6 +516,10 @@ private:
     bool sched_need_reserve = true;
     uint32_t sched_reserved_tokens = 0;
     uint32_t sched_reserved_kv = 0;
+    // prompt chunk bound in tokens x KV cells; auto raises it into measured free VRAM
+    uint64_t moe_prefill_kv_budget_live = 0;
+    std::vector<uint64_t> moe_decode_workspace_bytes; // per backend, from the last decode reservation
+    void update_moe_prefill_kv_budget();
     uint32_t sched_decode_outputs = 0;
 
     bool recurrent_sparse_snapshot_ops_supported = false;

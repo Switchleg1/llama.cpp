@@ -1990,8 +1990,8 @@ static void test_active_grouped_speculative_route_limit_transition(
         telemetry.host_staged_split_ops <= telemetry.host_staged_ops &&
         telemetry.strategy_switches == (sequential_fits ? 0 : 2) &&
         telemetry.required_unsupported == 0);
-    CHECK(telemetry.reset_host_staged_handoff == (sequential_fits ? 0 : 1));
-    CHECK(sequential_fits || telemetry.invalidation_refills != 0);
+    // host staging reads the grouped residents in place, so the grouped residency survives the handoff
+    CHECK(telemetry.reset_host_staged_handoff == 0 && telemetry.invalidation_refills == 0);
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
     if (domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT) {
         const uint64_t legacy_before = active_grouped_legacy_op_count(candidate_backend.get());

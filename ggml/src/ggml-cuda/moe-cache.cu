@@ -6445,6 +6445,8 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
 
 static bool ggml_cuda_moe_cache_prepare_legacy(ggml_cuda_moe_cache * cache, cudaEvent_t grouped_done);
 static bool ggml_cuda_moe_cache_prepare_host_staged(ggml_cuda_moe_cache * cache, cudaEvent_t grouped_done);
+static bool ggml_cuda_moe_cache_seed_residents(
+        ggml_cuda_moe_cache * cache, const char * base, size_t stride, const int32_t * slots, uint32_t n_experts);
 static bool ggml_cuda_moe_cache_handoff_grouped(ggml_cuda_moe_cache * cache, cudaStream_t grouped_stream);
 static bool ggml_cuda_moe_cache_abort_host_staged(ggml_cuda_moe_cache * cache, cudaStream_t compute_stream);
 
@@ -6669,6 +6671,9 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (slot_for_expert != nullptr) {
                 (void) cudaFree(slot_for_expert);
             }
+            if (host_staged_residents != nullptr) {
+                (void) cudaFree(host_staged_residents);
+            }
             if (admit_slot_for_expert != nullptr) {
                 (void) cudaFree(admit_slot_for_expert);
             }
@@ -6764,6 +6769,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint64_t prefill_auxiliary_cross_stream_waits = 0;
         uint64_t prefill_auxiliary_pending_declines = 0;
         int32_t * slot_for_expert = nullptr;
+        int32_t * host_staged_residents = nullptr;
         int32_t * expert_for_slot = nullptr;
         int32_t * admit_slot_for_expert = nullptr;
         uint32_t * admit_cold_score = nullptr;
@@ -6811,6 +6817,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint32_t active_host_staging_leases = 0;
         bool retire_host_staging_on_last_release = false;
         bool legacy_dirty = false;
+        bool host_staged_slots_written = false;
         bool building_device = false;
     };
 
@@ -8824,6 +8831,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             return false;
         }
         device_resource.clock_bound = 0;
+        resource.host_staged_slots_written = false;
         // Captured planners keep using the same device counters after a logical reset.
         device_resource.has_completion = true;
         device_resource.completion_stream = compute_stream;
@@ -11891,6 +11899,13 @@ void ggml_cuda_moe_grouped_context::record_legacy_op(
     stats.copy_wait_event_count.fetch_add(copy_wait_event_count, std::memory_order_relaxed);
     stats.copy_wait_event_time_us.fetch_add(copy_wait_event_time_us, std::memory_order_relaxed);
     stats.total_time_us.fetch_add(total_time_us, std::memory_order_relaxed);
+}
+
+void ggml_cuda_moe_grouped_context::mark_host_staged_slots_written(const ggml_cuda_moe_grouped_host_staging_lease & lease) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto * resource = impl_->find_resource(lease.transaction_);
+    GGML_ASSERT(resource != nullptr);
+    resource->host_staged_slots_written = true;
 }
 
 void ggml_cuda_moe_grouped_context::record_host_staged_op(bool split_staged) {
@@ -15232,7 +15247,8 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
                     }
                 }
                 if (resource != nullptr && resource->device != nullptr &&
-                        (resource->legacy_dirty || current_authority == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED_HOST_STAGED)) {
+                        (resource->legacy_dirty || (current_authority == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED_HOST_STAGED &&
+                            resource->host_staged_slots_written))) {
                     grouped_resets.push_back({resource, execution->groups_[record_index].stream,
                         resource->legacy_dirty ? MOE_GROUPED_RESET_LEGACY_HANDOFF :
                             MOE_GROUPED_RESET_HOST_STAGED_HANDOFF});
@@ -15733,6 +15749,52 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_host_
     if (!caches_ready) {
         (void) end_group_transaction(transaction);
         return fail();
+    }
+
+    group->host_staged_residents = false;
+    {
+        auto & device = *resource->device;
+        const auto & snapshot = resource->snapshot;
+        // Exchange residency and slot auxiliaries keep the old full reset after host staging.
+        if (device.exchange_host != nullptr || snapshot.n_slot_auxiliaries != 0) {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            resource->host_staged_slots_written = true;
+        }
+        // After host staging writes a slot, its caches track the slots themselves; keep them.
+        std::vector<int32_t> residents;
+        const bool attempt = !resource->host_staged_slots_written;
+        bool seeded = attempt && device.has_completion &&
+            device.plan_capacity == snapshot.n_slots && device.n_experts > 0;
+        if (seeded && device.host_staged_residents == nullptr) {
+            seeded = moe_grouped_cuda_success(cudaMalloc(&device.host_staged_residents, device.n_experts * sizeof(int32_t)));
+        }
+        if (seeded) {
+            residents.resize(device.n_experts);
+            seeded = (device.completion_stream == stream ||
+                    moe_grouped_cuda_success(cudaStreamWaitEvent(stream, device.completion, 0)));
+            if (seeded) {
+                moe_grouped_snapshot_residents<<<(device.n_experts + 255) / 256, 256, 0, stream>>>(
+                    device.slot_for_expert, device.expert_for_slot, device.plan, device.n_experts, snapshot.n_slots,
+                    device.host_staged_residents);
+                seeded = moe_grouped_cuda_success(cudaGetLastError()) &&
+                    moe_grouped_cuda_success(cudaMemcpyAsync(residents.data(), device.host_staged_residents,
+                        device.n_experts * sizeof(int32_t), cudaMemcpyDeviceToHost, stream)) &&
+                    moe_grouped_cuda_success(cudaStreamSynchronize(stream));
+            }
+            seeded = seeded && std::none_of(residents.begin(), residents.end(), [](int32_t slot) { return slot < -1; });
+        }
+        for (uint32_t bank_index = 0; seeded && bank_index < snapshot.banks.size(); ++bank_index) {
+            const auto & bank = snapshot.banks[bank_index];
+            seeded = ggml_cuda_moe_cache_seed_residents(resource->host_staging_caches[bank_index],
+                static_cast<const char *>(bank.tensor->data), bank.expert_stride, residents.data(), device.n_experts);
+        }
+        if (attempt && !seeded) {
+            // A partial seed leaves stale entries; the next call starts from empty caches.
+            for (uint32_t bank_index = 0; bank_index < snapshot.banks.size(); ++bank_index) {
+                (void) ggml_cuda_moe_cache_seed_residents(resource->host_staging_caches[bank_index], nullptr, 0, nullptr, 0);
+            }
+        }
+        group->host_staged_residents = seeded;
     }
 
     group->transaction = transaction;
@@ -17120,6 +17182,41 @@ static void ggml_cuda_moe_cache_clear_slots_locked(ggml_cuda_moe_cache * cache) 
     cache->access_counter = 0;
 }
 
+// Maps the grouped residents into a host-staged cache, so staging copies them device to device. Null base clears.
+static bool ggml_cuda_moe_cache_seed_residents(
+        ggml_cuda_moe_cache * cache, const char * base, size_t stride, const int32_t * slots, uint32_t n_experts) {
+    if (cache == nullptr || cache->owns_slot_pool) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(cache->mu);
+    if (cache->host_staging_failed ||
+            std::any_of(cache->slot_pin_count.begin(), cache->slot_pin_count.end(), [](uint32_t pins) { return pins != 0; })) {
+        return false;
+    }
+    ggml_cuda_moe_cache_clear_slots_locked(cache);
+    if (base == nullptr) {
+        return true;
+    }
+    if (stride == 0 || stride > cache->slot_size_bytes || slots == nullptr) {
+        return false;
+    }
+    for (uint32_t expert = 0; expert < n_experts; ++expert) {
+        const int32_t slot = slots[expert];
+        if (slot < 0) {
+            continue;
+        }
+        if (slot >= cache->n_slots || cache->slot_to_host[slot] != nullptr) {
+            ggml_cuda_moe_cache_clear_slots_locked(cache);
+            return false;
+        }
+        const void * host = base + static_cast<size_t>(expert) * stride;
+        cache->slot_to_host[slot] = host;
+        cache->host_to_slot[host] = slot;
+        cache->last_used[slot] = ++cache->access_counter;
+    }
+    return true;
+}
+
 static bool ggml_cuda_moe_cache_prepare_legacy(ggml_cuda_moe_cache * cache, cudaEvent_t grouped_done) {
     if (cache == nullptr || cache->owns_slot_pool) {
         return false;
@@ -17855,6 +17952,70 @@ bool ggml_cuda_moe_cache_finish_split_staging(
     if (cache->host_staging_failed) {
         return false;
     }
+    CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
+    return true;
+}
+
+extern "C"
+bool ggml_cuda_moe_cache_acquire_pinned(
+    struct ggml_cuda_moe_cache * cache,
+    const void * const * host_srcs,
+    int                  n_host_srcs,
+    size_t               byte_count,
+    int *                slot_ids,
+    cudaStream_t         compute_stream,
+    bool                 is_decode) {
+
+    if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || !slot_ids || !compute_stream) {
+        return false;
+    }
+    for (int i = 0; i < n_host_srcs; ++i) {
+        if (!host_srcs[i]) {
+            return false;
+        }
+        slot_ids[i] = -1;
+    }
+
+    std::lock_guard<std::mutex> lk(cache->mu);
+    if (cache->host_staging_failed || byte_count > cache->slot_size_bytes || n_host_srcs > cache->n_slots) {
+        return false;
+    }
+    if (!ggml_cuda_moe_cache_record_compute_locked(cache, compute_stream)) {
+        return false;
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
+
+    // hits first, so a fill cannot evict an expert this call still needs
+    for (int i = 0; i < n_host_srcs; ++i) {
+        const auto it = cache->host_to_slot.find(host_srcs[i]);
+        if (it != cache->host_to_slot.end()) {
+            slot_ids[i] = ggml_cuda_moe_cache_acquire_locked(
+                cache, host_srcs[i], byte_count, cache->copy_stream, is_decode, false, false);
+            cache->slot_pin_count[slot_ids[i]]++;
+        }
+    }
+    bool ok = true;
+    for (int i = 0; ok && i < n_host_srcs; ++i) {
+        if (slot_ids[i] >= 0) {
+            continue;
+        }
+        slot_ids[i] = ggml_cuda_moe_cache_acquire_locked(
+            cache, host_srcs[i], byte_count, cache->copy_stream, is_decode, false, false);
+        ok = slot_ids[i] >= 0 && !cache->host_staging_failed;
+        if (slot_ids[i] >= 0) {
+            cache->slot_pin_count[slot_ids[i]]++;
+        }
+    }
+    if (!ok) {
+        for (int i = 0; i < n_host_srcs; ++i) {
+            if (slot_ids[i] >= 0) {
+                cache->slot_pin_count[slot_ids[i]]--;
+                slot_ids[i] = -1;
+            }
+        }
+        return false;
+    }
+    CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
     CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
     return true;
 }
