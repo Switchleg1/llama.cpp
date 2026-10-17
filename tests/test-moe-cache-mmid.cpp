@@ -1754,9 +1754,8 @@ void test_mmid_direct_source_view(int device) {
         {GGML_TYPE_Q2_K, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
         {GGML_TYPE_IQ4_NL, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
     }};
-    cudaDeviceProp properties;
-    CUDA_OK(cudaGetDeviceProperties(&properties, device));
-    const bool require_cc12 = properties.major == 12;
+    const int cc = ggml_cuda_device_cc_for_test(device);
+    const bool require_cc12 = cc / 100 == 12;
     direct_source_view_test_state state;
     for (const auto & current : cases) {
         ggml_backend_ptr query_backend(ggml_backend_cuda_init(device));
@@ -1777,7 +1776,7 @@ void test_mmid_direct_source_view(int device) {
         if (!supported) {
             fprintf(stderr, "test-moe-cache: skipping direct MMID view type=%s B%lld consumer=%u on CC%d%d\n",
                 ggml_type_name(current.type), (long long) current.n_tokens, static_cast<unsigned>(current.consumer),
-                properties.major, properties.minor);
+                cc / 100, cc / 10 % 10);
             continue;
         }
         fprintf(stderr, "test-moe-cache: MMID view type=%s rows=%lld used=%lld consumer=%u\n",

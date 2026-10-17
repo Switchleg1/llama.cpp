@@ -1418,7 +1418,8 @@ ggml_cuda_mmid_capability native_mmid_capability(
     memcpy(query.source_nb, weight->nb, sizeof(query.source_nb));
     query.n_tokens = n_rows;
     query.n_experts = weight->ne[2];
-    query.cc = properties.major * 100 + properties.minor * 10;
+    // the capability the backend computes, from its own device info
+    query.cc = ggml_cuda_device_cc_for_test(device);
     query.warp_size = properties.warpSize;
     query.smpbo = std::max(properties.sharedMemPerBlock, properties.sharedMemPerBlockOptin);
     query.phase = n_rows == 1 ? GGML_CUDA_MMID_PHASE_DECODE : GGML_CUDA_MMID_PHASE_PREFILL;

@@ -1463,6 +1463,14 @@ static void common_moe_cache_auto_size(common_params & params) {
             if (decode_slots > slots) {
                 params.n_moe_expert_cache_slots = decode_slots;
                 params.prompt_moe_expert_cache_slots = slots;
+                // a prompt cache must hold the active experts
+                if (top_k > 0 && slots < (int32_t) top_k) {
+                    params.prompt_moe_expert_cache_slots = decode_slots >= (int32_t) top_k ? (int32_t) top_k : 0;
+                    if (params.prompt_moe_expert_cache_slots > 0) {
+                        COM_WRN("%s: prompts need %u MoE cache slots but only %d fit; prompt processing may run short of GPU memory\n",
+                            __func__, top_k, slots);
+                    }
+                }
                 // Streamed prompts barely use cache slots: keep the active experts and load upcoming groups ahead
                 // in 3/4 of the freed memory; the rest stays as margin, as overcommit pages on WDDM.
                 if (params.moe_prefill_ring < 0 && common_moe_prefill_stream(params) > 0 && top_k > 0 && (int32_t) top_k < slots &&
@@ -1475,6 +1483,11 @@ static void common_moe_cache_auto_size(common_params & params) {
                 "prompt load-ahead ring\n", __func__, params.n_moe_expert_cache_slots, params.prompt_moe_expert_cache_slots,
                 std::max<int64_t>(params.moe_prefill_ring, 0) / 1048576.0);
         }
+    }
+    if (top_k > 0 && params.n_moe_expert_cache_slots < (int32_t) top_k) {
+        COM_WRN("%s: GPU memory fits %d MoE cache slots, fewer than the %u active experts; most experts run on the CPU. "
+            "A shorter context (-c), a smaller --moe-prefill-kv-budget or --kv-resident, or --cpu-moe-draft frees GPU memory\n",
+            __func__, params.n_moe_expert_cache_slots, top_k);
     }
 }
 

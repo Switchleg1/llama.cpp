@@ -311,3 +311,50 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
 
     return (ne_any_bit >> 7) * 0xff;
 }
+
+// used by the MoE expert cache and prompt streaming
+#ifndef cudaDeviceScheduleSpin
+#define cudaDeviceScheduleSpin hipDeviceScheduleSpin
+#endif
+#ifndef cudaErrorInvalidValue
+#define cudaErrorInvalidValue hipErrorInvalidValue
+#endif
+#ifndef cudaErrorUnknown
+#define cudaErrorUnknown hipErrorUnknown
+#endif
+#ifndef cudaHostRegisterMapped
+#define cudaHostRegisterMapped hipHostRegisterMapped
+#endif
+#ifndef cudaMemcpyDefault
+#define cudaMemcpyDefault hipMemcpyDefault
+#endif
+#ifndef cudaMemoryTypeDevice
+#define cudaMemoryTypeDevice hipMemoryTypeDevice
+#endif
+#ifndef cudaMemoryTypeHost
+#define cudaMemoryTypeHost hipMemoryTypeHost
+#endif
+#ifndef cudaMemoryTypeUnregistered
+#define cudaMemoryTypeUnregistered hipMemoryTypeUnregistered
+#endif
+#ifndef cudaPointerGetAttributes
+#define cudaPointerGetAttributes hipPointerGetAttributes
+#endif
+#ifndef cudaSetDeviceFlags
+#define cudaSetDeviceFlags hipSetDeviceFlags
+#endif
+#ifndef cudaStreamCaptureModeThreadLocal
+#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+#endif
+#ifndef cudaStreamCaptureStatus
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#endif
+#ifndef cudaStreamCaptureStatusNone
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#endif
+#ifndef cudaStreamIsCapturing
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#endif
+#ifndef cudaPointerAttributes
+#define cudaPointerAttributes hipPointerAttribute_t
+#endif

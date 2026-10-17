@@ -1624,6 +1624,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
     }
 
+    // no device reports free memory (e.g. a full GPU): split evenly instead of dividing by zero
+    if (std::all_of(splits.begin(), splits.end(), [](float x) { return x <= 0.0f; })) {
+        std::fill(splits.begin(), splits.end(), 1.0f);
+    }
+
     // sum and normalize the splits to get the split points
     float split_sum = 0.0f;
     for (size_t i = 0; i < n_devices(); ++i) {

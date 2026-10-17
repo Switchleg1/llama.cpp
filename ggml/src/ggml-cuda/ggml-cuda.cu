@@ -3251,6 +3251,10 @@ bool ggml_cuda_prefill_topk_segmented() {
 
 static std::atomic<int> ggml_cuda_moe_prefill_stream_fail_group{-1};
 
+int ggml_cuda_device_cc_for_test(int device) {
+    return ggml_cuda_info().devices[device].cc;
+}
+
 void ggml_cuda_moe_prefill_stream_fail_for_test(int group) {
     ggml_cuda_moe_prefill_stream_fail_group.store(group, std::memory_order_relaxed);
 }

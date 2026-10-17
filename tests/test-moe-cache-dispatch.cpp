@@ -127,6 +127,17 @@ static void test_active_grouped_dispatch_types_case(
             }
         }
     }
+    // banks without a grouped consumer on this GPU (e.g. single-row BF16 before Ampere) stay on the cached fallback
+    for (const ggml_tensor * bank : first.banks) {
+        const auto native = native_mmid_capability(0, bank, n_rows, GGML_CUDA_MMID_MAPPING_DIRECT);
+        if (native.reason != GGML_CUDA_MMID_CAPABILITY_OK || native.selection == GGML_CUDA_MMID_CONSUMER_GENERIC ||
+                native.selection == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED) {
+            ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+            fprintf(stderr, "test-moe-cache: active grouped types %s/%s/%s skipped (%s has no grouped consumer)\n",
+                ggml_type_name(types[0]), ggml_type_name(types[1]), ggml_type_name(types[2]), ggml_type_name(bank->type));
+            return;
+        }
+    }
     check_active_grouped_contract(first_backend.get(), first, n_slots, original_direct_down_scale);
     check_active_grouped_contract(second_backend.get(), second, n_slots);
 

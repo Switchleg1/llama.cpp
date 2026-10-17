@@ -2289,6 +2289,29 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
         return std::max(1, (int) std::thread::hardware_concurrency() - 1);
     }();
     llama_moe_hybrid_set_threads(n_threads);
+    // The split needs plain expert arithmetic the CPU can repeat; without it cold routes would fail every batch.
+    if (cparams.moe_expert_split && moe_hybrid_cpu.empty()) {
+        const auto & regions = res->get_moe_regions();
+        const bool any_hybrid = std::any_of(regions.begin(), regions.end(), [](const auto & region) {
+            return region.hybrid_ffn.down != nullptr;
+        });
+        if (!regions.empty() && !any_hybrid) {
+            ggml_backend_moe_hybrid_configure_t configure = nullptr;
+            for (size_t i = 0; i < ggml_backend_reg_count() && configure == nullptr; ++i) {
+                configure = (ggml_backend_moe_hybrid_configure_t) ggml_backend_reg_get_proc_address(
+                    ggml_backend_reg_get(i), GGML_BACKEND_MOE_HYBRID_CONFIGURE_PROC_NAME);
+            }
+            ggml_backend_moe_hybrid_config config = {};
+            config.split = false;
+            if (configure != nullptr) {
+                configure(&config);
+            }
+            cparams.moe_expert_split = false;
+            LLAMA_LOG_WARN("%s: MoE expert split disabled: this model's experts use scales, biases or clamps the CPU "
+                "split does not compute; experts run through the GPU cache\n", __func__);
+            return;
+        }
+    }
     std::unique_lock<std::mutex> lock(moe_hybrid_cpu_mutex);
     if (moe_hybrid_cpu_pool == nullptr) {
         auto params = ggml_threadpool_params_default(n_threads);

@@ -39,6 +39,12 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include <cuda/atomic>
+#define MOE_ATOMIC_LOAD_ACQUIRE(scope, T, ref) cuda::atomic_ref<T, cuda::scope>(ref).load(cuda::memory_order_acquire)
+#define MOE_ATOMIC_STORE_RELEASE(scope, T, ref, value) cuda::atomic_ref<T, cuda::scope>(ref).store(value, cuda::memory_order_release)
+#else
+// HIP and MUSA: compiler atomics, which default to system scope
+#define MOE_ATOMIC_LOAD_ACQUIRE(scope, T, ref) __atomic_load_n(&(ref), __ATOMIC_ACQUIRE)
+#define MOE_ATOMIC_STORE_RELEASE(scope, T, ref, value) __atomic_store_n(&(ref), (T) (value), __ATOMIC_RELEASE)
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -3645,7 +3651,7 @@ struct moe_device_prefetch_job {
 
 static __global__ void moe_device_prefetch_complete(uint32_t * completion, uint32_t lane, uint32_t status) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(completion[lane]).store(status, cuda::memory_order_release);
+        MOE_ATOMIC_STORE_RELEASE(thread_scope_device, uint32_t, completion[lane], status);
     }
 }
 
@@ -3745,8 +3751,7 @@ struct moe_device_prefetch {
                 bool progress = false;
                 for (uint32_t lane_index = 0; lane_index < MOE_DEVICE_PREFETCH_LANES; ++lane_index) {
                     auto & lane = lanes[lane_index];
-                    auto request = cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(lane.job_cookie);
-                    const uint64_t job_cookie = request.load(cuda::memory_order_acquire);
+                    const uint64_t job_cookie = MOE_ATOMIC_LOAD_ACQUIRE(thread_scope_system, uint64_t, lane.job_cookie);
                     if (job_cookie == 0) {
                         continue;
                     }
@@ -3754,7 +3759,7 @@ struct moe_device_prefetch {
                     ++this->published;
                     interval_published.fetch_add(1, std::memory_order_relaxed);
                     const auto * job = reinterpret_cast<const moe_device_prefetch_job *>(static_cast<uintptr_t>(job_cookie));
-                    request.store(0, cuda::memory_order_release);
+                    MOE_ATOMIC_STORE_RELEASE(thread_scope_system, uint64_t, lane.job_cookie, 0);
                     const auto signal_completion = [&](uint32_t status) {
                         moe_device_prefetch_complete<<<1, 1, 0, copy_stream>>>(copy_done, lane_index, status);
                         const bool done_ok = cudaGetLastError() == cudaSuccess;
@@ -4113,7 +4118,7 @@ static __global__ void moe_grouped_mark_invalidated_slots(
 
 static __device__ bool moe_device_prefetch_ready(uint32_t * completion) {
     return completion != nullptr &&
-        cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(*completion).load(cuda::memory_order_acquire) == 1;
+        MOE_ATOMIC_LOAD_ACQUIRE(thread_scope_device, uint32_t, *completion) == 1;
 }
 
 // Mapped host memory the planner publishes cold routes into, with Strata's fence then sequence order.
@@ -6141,8 +6146,7 @@ static __global__ void moe_device_prefetch_publish(
     if (threadIdx.x != 0 || count > route_capacity || lane_index >= MOE_DEVICE_PREFETCH_LANES) {
         return;
     }
-    auto completion_ref = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(completion[lane_index]);
-    if (completion_ref.load(cuda::memory_order_acquire) == 0) {
+    if (MOE_ATOMIC_LOAD_ACQUIRE(thread_scope_device, uint32_t, completion[lane_index]) == 0) {
         for (uint32_t expert = 0; expert < n_experts; ++expert) {
             positions[expert] = -1;
         }
@@ -6155,13 +6159,13 @@ static __global__ void moe_device_prefetch_publish(
         experts[size_t(lane_index) * route_capacity + route] = expert;
         valid |= expert >= 0;
     }
-    completion_ref.store(valid ? 0 : 1, cuda::memory_order_release);
+    MOE_ATOMIC_STORE_RELEASE(thread_scope_device, uint32_t, completion[lane_index], valid ? 0u : 1u);
     if (!valid) {
         return;
     }
     lane.count = count;
     __threadfence_system();
-    cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(lane.job_cookie).store(job_cookie, cuda::memory_order_release);
+    MOE_ATOMIC_STORE_RELEASE(thread_scope_system, uint64_t, lane.job_cookie, job_cookie);
 }
 
 template<bool debug_transfers>

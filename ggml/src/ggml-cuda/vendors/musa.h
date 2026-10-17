@@ -149,3 +149,71 @@
 
 typedef __mt_bfloat16 nv_bfloat16;
 typedef __mt_bfloat162 nv_bfloat162;
+
+// used by the MoE expert cache and prompt streaming
+#ifndef cudaDeviceScheduleSpin
+#define cudaDeviceScheduleSpin musaDeviceScheduleSpin
+#endif
+#ifndef cudaErrorInvalidValue
+#define cudaErrorInvalidValue musaErrorInvalidValue
+#endif
+#ifndef cudaErrorUnknown
+#define cudaErrorUnknown musaErrorUnknown
+#endif
+#ifndef cudaHostRegisterMapped
+#define cudaHostRegisterMapped musaHostRegisterMapped
+#endif
+#ifndef cudaMemcpyDefault
+#define cudaMemcpyDefault musaMemcpyDefault
+#endif
+#ifndef cudaMemoryTypeDevice
+#define cudaMemoryTypeDevice musaMemoryTypeDevice
+#endif
+#ifndef cudaMemoryTypeHost
+#define cudaMemoryTypeHost musaMemoryTypeHost
+#endif
+#ifndef cudaMemoryTypeUnregistered
+#define cudaMemoryTypeUnregistered musaMemoryTypeUnregistered
+#endif
+#ifndef cudaPointerGetAttributes
+#define cudaPointerGetAttributes musaPointerGetAttributes
+#endif
+#ifndef cudaSetDeviceFlags
+#define cudaSetDeviceFlags musaSetDeviceFlags
+#endif
+#ifndef cudaStreamCaptureModeThreadLocal
+#define cudaStreamCaptureModeThreadLocal musaStreamCaptureModeThreadLocal
+#endif
+#ifndef cudaStreamCaptureStatus
+#define cudaStreamCaptureStatus musaStreamCaptureStatus
+#endif
+#ifndef cudaStreamCaptureStatusNone
+#define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
+#endif
+#ifndef cudaStreamIsCapturing
+#define cudaStreamIsCapturing musaStreamIsCapturing
+#endif
+#ifndef cudaDevAttrCooperativeLaunch
+#define cudaDevAttrCooperativeLaunch musaDevAttrCooperativeLaunch
+#endif
+#ifndef cudaDeviceGetAttribute
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#endif
+#ifndef cudaHostAlloc
+#define cudaHostAlloc musaHostAlloc
+#endif
+#ifndef cudaHostAllocMapped
+#define cudaHostAllocMapped musaHostAllocMapped
+#endif
+#ifndef cudaHostAllocPortable
+#define cudaHostAllocPortable musaHostAllocPortable
+#endif
+#ifndef cudaHostGetDevicePointer
+#define cudaHostGetDevicePointer musaHostGetDevicePointer
+#endif
+#ifndef cudaMemAdvise
+#define cudaMemAdvise musaMemAdvise
+#endif
+#ifndef cudaPointerAttributes
+#define cudaPointerAttributes musaPointerAttributes
+#endif
