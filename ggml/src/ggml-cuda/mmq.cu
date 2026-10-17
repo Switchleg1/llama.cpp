@@ -304,9 +304,9 @@ void ggml_cuda_mul_mat_q_prepared(
     const mmq_args args = {
         static_cast<const char *>(src0->data), src0->type, reinterpret_cast<const int *>(input.data.ptr),
         input.ids_dst.ptr, input.expert_bounds.ptr + first_expert, static_cast<float *>(dst->data), input.scales.ptr,
-        ne00, ne01, rows, nb01 / ggml_type_size(src0->type), rows, nb1 / sizeof(float),
-        ne02, ne02, nb02 / ggml_type_size(src0->type), stride_y, nb2 / sizeof(float),
-        ne03, ne13, nb03 / ggml_type_size(src0->type), ne12 * stride_y, nb3 / sizeof(float), ne12, ncols_opt};
+        ne00, ne01, rows, static_cast<int64_t>(nb01 / ggml_type_size(src0->type)), rows, static_cast<int64_t>(nb1 / sizeof(float)),
+        ne02, ne02, static_cast<int64_t>(nb02 / ggml_type_size(src0->type)), stride_y, static_cast<int64_t>(nb2 / sizeof(float)),
+        ne03, ne13, static_cast<int64_t>(nb03 / ggml_type_size(src0->type)), ne12 * stride_y, static_cast<int64_t>(nb3 / sizeof(float)), ne12, ncols_opt};
     ggml_cuda_mul_mat_q_switch_type<false>(ctx, args, ctx.stream());
 }
 
