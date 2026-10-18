@@ -791,6 +791,7 @@ llama_context::llama_context(
     cparams.moe_expert_split = params.moe_expert_split == LLAMA_MOE_EXPERT_SPLIT_ON ||
         (params.moe_expert_split == LLAMA_MOE_EXPERT_SPLIT_AUTO && model.moe_expert_cache_enabled());
     cparams.moe_expert_split_threads = params.moe_expert_split_threads;
+    cparams.moe_expert_split_native_dot = params.moe_expert_split_native_dot;
     cparams.moe_expert_store_mib     = params.moe_expert_store_mib;
     cparams.moe_expert_store_adapt   = params.moe_expert_store_adapt;
     cparams.moe_expert_store_gpu_cache = params.moe_expert_store_gpu_cache;
@@ -2349,6 +2350,7 @@ void llama_context::moe_hybrid_register_cpu(llm_graph_result * res) {
         return std::max(1, (int) std::thread::hardware_concurrency() - 1);
     }();
     llama_moe_hybrid_set_threads(n_threads);
+    llama_moe_hybrid_set_native_dot(cparams.moe_expert_split_native_dot);
     // The split needs plain expert arithmetic the CPU can repeat; without it cold routes would fail every batch.
     if (cparams.moe_expert_split && moe_hybrid_cpu.empty()) {
         const auto & regions = res->get_moe_regions();
@@ -5114,7 +5116,9 @@ ggml_status llama_context::graph_compute(
 
     // Store mode trades overlap with the next host step for a checked cold-route result.
     moe_adapt_residency();
-    const bool check_cold = (moe_hybrid_store_required || cparams.moe_expert_split) && moe_hybrid_cold_failures != nullptr;
+    // only a context with CPU expert helpers can produce cold packets
+    const bool check_cold = (moe_hybrid_store_required || (cparams.moe_expert_split && !moe_hybrid_cpu.empty())) &&
+        moe_hybrid_cold_failures != nullptr;
     const uint64_t cold_failures = check_cold ? moe_hybrid_cold_failures() : 0;
     ggml_status status;
     const bool  required_grouped_supported = moe_graph_supports_required_grouped(gf);
@@ -6361,6 +6365,7 @@ llama_context_params llama_context_default_params() {
         /*.ctx_other                   =*/ nullptr,
         /*.moe_expert_split            =*/ LLAMA_MOE_EXPERT_SPLIT_OFF,
         /*.moe_expert_split_threads    =*/ 0,
+        /*.moe_expert_split_native_dot =*/ false,
         /*.moe_expert_promote_budget   =*/ -1,
         /*.moe_expert_promote_misses   =*/ 0,
         /*.moe_expert_store_mib        =*/ LLAMA_MOE_EXPERT_STORE_OFF,

@@ -551,6 +551,7 @@ struct common_params {
     bool moe_early_router = false;
     enum llama_moe_expert_split moe_expert_split = LLAMA_MOE_EXPERT_SPLIT_OFF; // --moe-expert-split
     int32_t moe_expert_split_threads  = 0;  // --moe-expert-split-threads, <= 0: logical cores - 1
+    bool    moe_expert_split_native_dot = false; // --moe-expert-split-native-dot
     int32_t moe_expert_promote_budget = -1; // --moe-expert-promote B[:M], < 0: default
     int32_t moe_expert_promote_misses = 0;
     int64_t moe_expert_store_mib      = LLAMA_MOE_EXPERT_STORE_OFF; // --moe-expert-store-mb

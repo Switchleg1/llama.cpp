@@ -495,6 +495,7 @@ extern "C" {
         // MoE expert split and RAM expert store [EXPERIMENTAL]
         enum llama_moe_expert_split moe_expert_split;
         int32_t      moe_expert_split_threads;  // CPU threads for split experts, <= 0: logical cores - 1
+        bool         moe_expert_split_native_dot; // CPU experts use ggml's activation formats: faster for i-quants, results differ more from the GPU
         int32_t      moe_expert_promote_budget; // in-call promotions per layer call, < 0: default (64)
         int32_t      moe_expert_promote_misses; // CPU calls before an expert may be promoted, <= 0: default (2)
         int64_t      moe_expert_store_mib;      // RAM expert store size, LLAMA_MOE_EXPERT_STORE_OFF or _AUTO

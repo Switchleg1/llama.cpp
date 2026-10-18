@@ -3052,6 +3052,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_SPLIT_THREADS"));
     add_opt(common_arg(
+        {"--moe-expert-split-native-dot"},
+        "MoE expert split: CPU experts use ggml's own activation formats instead of the GPU's Q8_1 bytes; faster for "
+        "i-quant experts, but their results differ more from the GPU's (default: off)",
+        [](common_params & params) {
+            params.moe_expert_split_native_dot = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_SPLIT_NATIVE_DOT"));
+    add_opt(common_arg(
         {"--moe-expert-promote"}, "B[:M]",
         "MoE expert split: promote up to B CPU experts per layer call into the GPU cache, after M CPU calls each "
         "(default: 64:2; 0 disables promotions)",

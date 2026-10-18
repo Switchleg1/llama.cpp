@@ -30,6 +30,8 @@ bool llama_moe_hybrid_q8_1_store_experts(
 
 // Threads of the CPU expert pool. Takes effect only before the first expert computation.
 void llama_moe_hybrid_set_threads(int n_threads);
+// true: banks with a custom Q8_1 kernel use ggml's own vec_dot_type instead (process-wide)
+void llama_moe_hybrid_set_native_dot(bool enabled);
 
 // The CUDA quantize_q8_1 rule, for the intermediate activation.
 void llama_moe_hybrid_quantize_q8_1(const float * x, void * y, int64_t n);

@@ -11,6 +11,7 @@ struct llama_cparams {
     // MoE expert split and RAM expert store, resolved at context creation
     bool        moe_expert_split          = false;
     int32_t     moe_expert_split_threads  = 0;
+    bool        moe_expert_split_native_dot = false;
     int64_t     moe_expert_store_mib      = -1;
     bool        moe_expert_store_adapt    = true;
     int32_t     moe_expert_store_gpu_cache = LLAMA_MOE_EXPERT_STORE_GPU_CACHE_ALL;

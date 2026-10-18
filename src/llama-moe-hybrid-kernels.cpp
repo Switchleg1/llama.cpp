@@ -409,6 +409,15 @@ static dot_fn custom_dot_for(ggml_type type) {
 // the CPU instead, as ggml's CPU path does.
 enum bank_kind { BANK_NONE, BANK_GGML_Q8_1, BANK_GGML_Q8_0, BANK_GGML_Q8_K, BANK_CUSTOM };
 
+static std::atomic<bool> & native_dot() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
+
+void llama_moe_hybrid_set_native_dot(bool enabled) {
+    native_dot().store(enabled, std::memory_order_relaxed);
+}
+
 static bank_kind kind_for(ggml_type type) {
     // Types that already pair with Q8_1 or Q8_0 on the CPU: ggml's SIMD kernels take the GPU's bytes,
     // passed through or with the 2-byte sum dropped. The integer products are then the GPU's.
@@ -419,7 +428,7 @@ static bank_kind kind_for(ggml_type type) {
         if (traits->vec_dot_type == GGML_TYPE_Q8_0) return BANK_GGML_Q8_0;
     }
     // Custom kernels take the GPU's Q8_1 bytes, so they win over a Q8_K requantization.
-    if (custom_dot_for(type) != nullptr) {
+    if (!native_dot().load(std::memory_order_relaxed) && custom_dot_for(type) != nullptr) {
         return BANK_CUSTOM;
     }
     if (traits != nullptr && traits->vec_dot != nullptr && traits->vec_dot_type == GGML_TYPE_Q8_K &&

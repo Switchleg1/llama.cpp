@@ -2004,6 +2004,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.moe_expert_split          = params.moe_expert_split;
     cparams.moe_expert_split_threads  = params.moe_expert_split_threads;
+    cparams.moe_expert_split_native_dot = params.moe_expert_split_native_dot;
     cparams.moe_expert_promote_budget = params.moe_expert_promote_budget;
     cparams.moe_expert_promote_misses = params.moe_expert_promote_misses;
     cparams.moe_expert_store_mib      = params.moe_expert_store_mib;
