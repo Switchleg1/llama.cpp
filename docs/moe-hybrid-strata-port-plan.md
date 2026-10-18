@@ -2985,3 +2985,22 @@ Two costs showed up on the way and are fixed here:
 Result, warm, alternating: 64K prompt 43.0 / 42.8 s against 46.1 / 45.8 s (-7%; the same on the first chunks, the gap grows with context); decode at 64K within noise (47.0 / 49.9 against 47.9 / 49.3). In the 100K decode trace the full-context score expansion fell from 1,021 to 28 us per token. Still per step and context-sized: the pooling copies (1.4 ms per token at 100K), the all-keys gather (0.8 ms), and `set_input_qsa` on the host (about 0.95 ms per step at 64K, 1.5 ms at 100K, before the graph can start). test-moe-cache passes; test-llama-archs only the two known Plamo2 failures.
 
 Next, step 2: keep each complete block's pooled, normed and rotated indexer key, and compute only the blocks a step touches.
+
+### Step 2: pooled indexer keys kept across ubatches
+
+Strata keeps an FP32 `pooled` row per completed block per QSA layer and sequence and pools a block once, in the kernel that appends the cell completing it (`include/strata/kernels/qsa.hpp`). Rewinding is just writing again from a position; only running state is checkpointed. Its selection scores blocks and radix-selects over blocks weighted by cell count (`qsa_select.hpp`), and its prompt attention reads only the selected cells.
+
+Here (`llama_memory_hybrid_idx`): an F32 pool per indexer layer, `[idx_dim, kv_size/r + 2, n_stream]`, row = position block, on the indexer cache's device, cleared to zero (384 MiB at 256K with 12 layers; Strata's figure is the same, 50 MiB at 32K). `get_qsa_pool_plan` turns on pool mode for a ubatch of one stream holding one contiguous sequence (`qsa_contiguous`) with the per-block bias: blocks are numbered by position block from `pb_lo = p0/r`, and the graph pools only the complete blocks the ubatch touches (`pool_cells`, `pool_pos`, `pool_rows`; padded to 4, or to 64s for prompts, the padding written to the last row), writes them with `set_rows`, and scores from a view of the pool taken from the `set_rows` result. Any other ubatch, `clear`, `seq_cp`, `seq_keep`, `seq_add`, `seq_div` and a full state load mark the pool stale for its ratio and stream, and the next pool-mode ubatch pools every complete block. `seq_rm` needs nothing: a block is pooled again by the ubatch that completes it, which covers prompt reuse and MTP rollback. Pool mode fills the inputs in one position-to-cell pass instead of the per-cell grouping, and its per-token bias is a copy of a per-block base row plus a suffix fill.
+
+Check (temporary, a full recompute of every block compared bit for bit with the pool rows, 24K prompt, decode with MTP and two prompt-reuse requests): 8,143,200 rows, 0 different. test-moe-cache passes; test-llama-archs only the two known Plamo2 failures.
+
+Results, warm, alternating against step 1:
+
+| | step 1 | step 2 |
+| --- | --- | --- |
+| 64K prompt | 42.1 / 42.1 s | 44.3 / 44.4 s |
+| decode at 64K | 47.1 / 51.2, 49.6 / 51.4 | 55.8 / 55.6, 55.1 / 58.2 |
+| 100K prompt | 79.7 / 80.2 s | 80.9 / 85.1 s |
+| decode at 100K | 47.2 / 49.3, 46.5 / 51.4 | 49.3 / 54.6, 47.6 / 53.9 |
+
+The prompt loss is the pool's memory: 52 instead of 56 automatic decode slots and a 351 instead of 632 MiB prompt load-ahead ring. The same build decodes 54.9 / 60.6, 53.8 / 56.5 at 8K and 46.9 / 54.6, 50.9 / 53.4 at 100K: about 9% apart, against about 28% before steps 1 and 2. Kernel time per token at 100K (`build/dec100p-nsys.sqlite`) is 15.4 ms, close to short context; what still grows is host time per step (draft calls 3.0 ms instead of 0.66 ms at 8K, other server work about 6.7 instead of 3.6 ms) and about 2 ms of kernels (indexer scores over all blocks, KV page-cache gather, attention).

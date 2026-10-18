@@ -1427,6 +1427,12 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+uint32_t llama_kv_cache::get_seq_stream(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    return seq_to_stream[seq_id];
+}
+
 void llama_kv_cache::seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     v_cells[seq_to_stream[seq_id]].seq_set_last_token(seq_id, pos, token);

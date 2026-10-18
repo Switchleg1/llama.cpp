@@ -2,6 +2,7 @@
 
 #include "llama-memory-hybrid.h"
 
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -91,16 +92,52 @@ llama_memory_placement_options placement,
     // spare_cells I32 / spare_val F32 [n_spare, n_tokens/ns, ns] (optional, blk_bias only): the cells of the
     // spare block that holds the unpooled cells, padded with cell 0 at -inf; their value is the spare block's bias
     // blk_sel F32 [n_blocks, 1, ns] (with spare_cells): -inf at the spare block, which lists no cells, else 0
+    // pool_cells I32 [ratio*cap], pool_pos I32 [4*cap], pool_rows I32 [cap] (pool mode, see qsa_pool_plan): the cells,
+    // rope positions and pool rows of the blocks to pool. In pool mode blocks are numbered by position block from pb_lo.
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, ggml_tensor * spare_cells = nullptr, ggml_tensor * spare_val = nullptr,
-                       ggml_tensor * blk_sel = nullptr) const;
+                       ggml_tensor * blk_sel = nullptr, ggml_tensor * pool_cells = nullptr,
+                       ggml_tensor * pool_pos = nullptr, ggml_tensor * pool_rows = nullptr) const;
 
     // true when each of the ns streams of the ubatch holds one sequence whose cells cover its positions without
     // holes or repeats; then at most 2*(ratio - 1) cells per stream are unpooled
     bool qsa_contiguous(const llama_ubatch & ubatch, uint32_t ns) const;
 
+    // Pooled indexer keys of complete blocks, F32 [idx_dim, n_rows, n_stream] per indexer layer, row = position block.
+    // A ubatch of one contiguous sequence pools only the blocks it completes, so the rows stay valid while the
+    // sequence grows or is cut back. Any other ubatch, a position shift or a state load makes the next one pool all.
+    struct qsa_pool_plan {
+        bool     on       = false;
+        uint32_t stream   = 0;
+        int64_t  pb_lo    = 0;  // position block of view row 0
+        int64_t  n_blocks = 0;  // view rows
+        int64_t  n_rows   = 0;  // pool rows per stream; the last one takes the padding writes
+        int64_t  cap      = 0;  // pooled blocks in the graph, padded
+        std::vector<int64_t> dirty;  // position blocks to pool
+    };
+
+    qsa_pool_plan get_qsa_pool_plan(const llama_ubatch & ubatch, uint32_t ns, uint32_t ratio, int64_t n_kv, bool blk_bias) const;
+
+    // nullptr when the layer has no pool
+    ggml_tensor * get_qsa_pool(int32_t il) const;
+
 private:
+    void qsa_pool_invalidate();
+
+    // pool-mode layout of the QSA inputs, see set_input_qsa
+    void set_input_qsa_pool(const qsa_pool_plan & plan, ggml_tensor * cell_blk, ggml_tensor * blk_cells,
+                            ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                            ggml_tensor * spare_cells, ggml_tensor * spare_val, ggml_tensor * blk_sel,
+                            ggml_tensor * pool_cells, ggml_tensor * pool_pos, ggml_tensor * pool_rows) const;
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_pool_bufs;
+    std::map<int32_t, ggml_tensor *> qsa_pools;
+    std::map<int32_t, uint32_t>      qsa_pool_ratio;
+
+    // per ratio and stream: the pool rows cannot be trusted, so the next pool-mode ubatch pools every complete block
+    mutable std::map<uint32_t, std::vector<uint8_t>> qsa_pool_stale;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -162,9 +199,13 @@ public:
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, ggml_tensor * spare_cells = nullptr, ggml_tensor * spare_val = nullptr,
-                       ggml_tensor * blk_sel = nullptr) const;
+                       ggml_tensor * blk_sel = nullptr, ggml_tensor * pool_cells = nullptr,
+                       ggml_tensor * pool_pos = nullptr, ggml_tensor * pool_rows = nullptr) const;
 
     bool qsa_contiguous(const llama_ubatch & ubatch) const;
+
+    llama_memory_hybrid_idx::qsa_pool_plan get_qsa_pool_plan(const llama_ubatch & ubatch, uint32_t ratio, int64_t n_kv, bool blk_bias) const;
+    ggml_tensor * get_qsa_pool(int32_t il) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
