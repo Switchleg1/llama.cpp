@@ -1839,19 +1839,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         }
 
         // copy the input tensors to the split backend
+        bool user_inputs_ready = false;
+        bool user_inputs_async = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                // inputs from the user must be copied before this returns, so the user can overwrite them afterwards
+                if (!user_inputs_ready) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    user_inputs_ready = true;
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                // host data: queue the upload and wait once for all of them below
+                if (split_backend->iface.set_tensor_async != NULL && input->buffer != NULL &&
+                        ggml_backend_buffer_is_host(input->buffer) && ggml_is_contiguous(input) &&
+                        ggml_is_contiguous(input_cpy) && ggml_nbytes(input) == ggml_nbytes(input_cpy)) {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    user_inputs_async = true;
+                } else {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1975,6 +1988,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                     }
                 }
             }
+        }
+
+        if (user_inputs_async) {
+            ggml_backend_synchronize(split_backend);
         }
 
         if (!sched->callback_eval) {
