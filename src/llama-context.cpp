@@ -1088,6 +1088,13 @@ llama_context::llama_context(
                         LLAMA_LOG_INFO("%s: decode boundary overlap enabled for %s\n", __func__, ggml_backend_name(backend.get()));
                     }
                 }
+                if (!cparams.moe_expert_split && model.moe_expert_cache_enabled()) {
+                    // another context can split; keep this one's misses on the GPU
+                    auto set_split = (ggml_backend_moe_set_split_t) ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_SET_SPLIT_PROC_NAME);
+                    if (set_split != nullptr && set_split(backend.get(), false)) {
+                        LLAMA_LOG_INFO("%s: MoE expert split off for %s\n", __func__, ggml_backend_name(backend.get()));
+                    }
+                }
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);

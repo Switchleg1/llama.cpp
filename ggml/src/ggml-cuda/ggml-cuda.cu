@@ -6705,6 +6705,45 @@ static int ggml_cuda_try_fuse(
         }
     }
 
+    // scale -> sigmoid -> scale -> hc_post with identity comb: the hyper-connection write
+    if (node->op == GGML_OP_SCALE && i + 3 < cgraph->n_nodes) {
+        ggml_tensor * sig  = cgraph->nodes[i + 1];
+        ggml_tensor * sc2  = cgraph->nodes[i + 2];
+        ggml_tensor * post = cgraph->nodes[i + 3];
+        const ggml_op ops[] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+        const int out = i + 3;
+        if (sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->src[0] == node &&
+                sc2->op == GGML_OP_SCALE && sc2->src[0] == sig &&
+                post->op == GGML_OP_DSV4_HC_POST && post->src[2] == sc2 && post->src[3] == nullptr &&
+                node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && sig->type == GGML_TYPE_F32 &&
+                sc2->type == GGML_TYPE_F32 && post->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[0]) && ggml_are_same_shape(node->src[0], sc2) &&
+                ggml_can_fuse_subgraph(cgraph, i, 4, ops, &out, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &out, 1)) {
+            ggml_cuda_op_dsv4_hc_post_inject(*cuda_ctx, node, sc2, post);
+            return 3;
+        }
+    }
+
+    // scale -> silu on the same contiguous shape
+    if (node->op == GGML_OP_SCALE && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * silu = cgraph->nodes[i + 1];
+        if (silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == node &&
+                node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(silu) &&
+                ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY })) {
+            // element-wise: only a partial overlap of output and input is unsafe
+            const char * in_b  = (const char *) node->src[0]->data;
+            const char * out_b = (const char *) silu->data;
+            const size_t bytes = ggml_nbytes(silu);
+            if (in_b != out_b && in_b < out_b + bytes && out_b < in_b + bytes) {
+                return 0;
+            }
+            ggml_cuda_op_scale_silu(*cuda_ctx, node, silu);
+            return 1;
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -9715,6 +9754,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_CONFIGURE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_hybrid_configure;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_SET_SPLIT_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_set_split;
     }
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_SET_COLD_STRICT_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_hybrid_set_cold_strict;

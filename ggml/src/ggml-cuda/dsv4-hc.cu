@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "unary.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -313,4 +314,87 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+}
+
+// fused SCALE + SIGMOID + SCALE + DSV4_HC_POST (identity comb): the post weights come from the raw injection.
+// Same float operations in the same order as the separate kernels.
+static __global__ void dsv4_hc_post_inject_f32(
+        const float * x, const float * residual, const float * inject, float * dst,
+        int64_t n_embd, int64_t hc, int64_t n_tokens,
+        int64_t sx0, int64_t sx1, int64_t sr0, int64_t sr1, int64_t sr2, int64_t si0, int64_t si1,
+        int64_t sd0, int64_t sd1, int64_t sd2, float s1, float b1, float s2, float b2) {
+    ggml_cuda_pdl_lc();
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ir >= n_embd * hc * n_tokens) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    const int64_t i0   = ir % n_embd;
+    const int64_t idst = (ir / n_embd) % hc;
+    const int64_t it   = ir / (n_embd * hc);
+
+    const float scaled = s1 * inject[idst*si0 + it*si1] + b1;
+    const float gate   = 1.0f / (1.0f + expf(-scaled));
+    const float w      = s2 * gate + b2;
+
+    float sum = x[i0*sx0 + it*sx1] * w;
+    sum += residual[i0*sr0 + idst*sr1 + it*sr2];
+    dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+}
+
+void ggml_cuda_op_dsv4_hc_post_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * scale1,
+        const ggml_tensor * scale2, ggml_tensor * dst) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * inject   = scale1->src[0];
+
+    GGML_ASSERT(dst->src[3] == nullptr && dst->src[2] == scale2);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 && inject->type == GGML_TYPE_F32);
+
+    float s1, b1, s2, b2;
+    memcpy(&s1, (const float *) scale1->op_params + 0, sizeof(float));
+    memcpy(&b1, (const float *) scale1->op_params + 1, sizeof(float));
+    memcpy(&s2, (const float *) scale2->op_params + 0, sizeof(float));
+    memcpy(&b2, (const float *) scale2->op_params + 1, sizeof(float));
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t hc       = residual->ne[1];
+
+    const int block_size = 256;
+    const int64_t nr = n_embd * hc * n_tokens;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3((nr + block_size - 1) / block_size, 1, 1), dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(dsv4_hc_post_inject_f32, launch_params,
+            (const float *) x->data, (const float *) residual->data, (const float *) inject->data, (float *) dst->data,
+            n_embd, hc, n_tokens,
+            (int64_t) (x->nb[0] / sizeof(float)), (int64_t) (x->nb[1] / sizeof(float)),
+            (int64_t) (residual->nb[0] / sizeof(float)), (int64_t) (residual->nb[1] / sizeof(float)), (int64_t) (residual->nb[2] / sizeof(float)),
+            (int64_t) (inject->nb[0] / sizeof(float)), (int64_t) (inject->nb[1] / sizeof(float)),
+            (int64_t) (dst->nb[0] / sizeof(float)), (int64_t) (dst->nb[1] / sizeof(float)), (int64_t) (dst->nb[2] / sizeof(float)),
+            s1, b1, s2, b2);
+}
+
+// fused SCALE + SILU on contiguous rows
+static __global__ void scale_silu_f32(const float * x, float * dst, const float scale, const float bias, const int64_t n) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const float scaled = scale * x[i] + bias;
+    dst[i] = ggml_cuda_op_silu_single(scaled);
+}
+
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, ggml_tensor * dst) {
+    float s, b;
+    memcpy(&s, (const float *) scale->op_params + 0, sizeof(float));
+    memcpy(&b, (const float *) scale->op_params + 1, sizeof(float));
+    const int64_t n = ggml_nelements(dst);
+    const int block_size = 256;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3((n + block_size - 1) / block_size, 1, 1), dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(scale_silu_f32, launch_params, (const float *) scale->src[0]->data, (float *) dst->data, s, b, n);
 }

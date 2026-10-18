@@ -1598,9 +1598,9 @@ static bool moe_hybrid_split_configured() {
 // so it can plan a pass with more routes than slots; every reader of a plan uses the same capacity.
 #define MOE_GROUPED_DECIDE_ROUTE_CAPACITY 64
 #define MOE_GROUPED_DECIDE_MAX_ROWS 8
-static uint32_t moe_grouped_plan_capacity(uint32_t n_slots) {
+static uint32_t moe_grouped_plan_capacity(uint32_t n_slots, bool split = true) {
     static const bool env_decide = moe_hybrid_env("LLAMA_MOE_HYBRID_DECIDE") && moe_hybrid_env("LLAMA_MOE_ADMIT_DOORBELL");
-    const bool decide = env_decide || moe_hybrid_split_configured();
+    const bool decide = split && (env_decide || moe_hybrid_split_configured());
     return decide ? std::max<uint32_t>(n_slots, MOE_GROUPED_DECIDE_ROUTE_CAPACITY) : n_slots;
 }
 
@@ -1608,7 +1608,8 @@ static moe_candidate_execution_geometry moe_candidate_execution_geometry_for(
         const ggml_cgraph * cgraph,
         const ggml_tensor * node,
         int64_t n_experts,
-        uint32_t n_slots) {
+        uint32_t n_slots,
+        bool split) {
     moe_candidate_execution_geometry result;
     ggml_graph_execution_certificate certificate;
     result.certificate_valid = moe_candidate_execution_certificate(cgraph, &certificate, &result.semantic_key);
@@ -1665,11 +1666,11 @@ static moe_candidate_execution_geometry moe_candidate_execution_geometry_for(
         certificate.n_sequences < result.n_rows;
     result.grouped_eligible = result.certificate_valid && result.n_rows <= certificate.n_rows &&
         result.n_rows >= 1 && n_slots > 0 && n_slots <= INT32_MAX &&
-        ((main_independent && result.n_routes <= moe_grouped_plan_capacity(n_slots)) || draft_independent || draft_sequential ||
+        ((main_independent && result.n_routes <= moe_grouped_plan_capacity(n_slots, split)) || draft_independent || draft_sequential ||
             mtp_independent || mtp_sequential || target_speculative);
     if (result.grouped_eligible) {
         result.strategy = result.n_routes <= n_slots ||
-                (result.n_routes <= moe_grouped_plan_capacity(n_slots) && result.n_rows <= MOE_GROUPED_DECIDE_MAX_ROWS) ?
+                (result.n_routes <= moe_grouped_plan_capacity(n_slots, split) && result.n_rows <= MOE_GROUPED_DECIDE_MAX_ROWS) ?
             GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT : GGML_CUDA_MOE_EXECUTION_STRATEGY_HOST_STAGED;
     }
     return result;
@@ -6461,6 +6462,11 @@ struct ggml_cuda_moe_grouped_context::impl {
 
     bool frequency_aware = true;
     uint32_t early_max_rows = 1;
+    // Split off: misses fill this context's slots; no CPU half, even when another context splits.
+    bool split_off = false;
+    bool shadow_on() const { return !split_off && moe_grouped_admit_shadow_enabled(); }
+    bool doorbell_on() const { return !split_off && moe_grouped_admit_doorbell_enabled(); }
+    bool decide_on() const { return !split_off && moe_grouped_admit_decide_enabled(); }
 
     ~impl() {
         auto * stats = grouped_debug.load(std::memory_order_acquire);
@@ -8351,7 +8357,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             device_auxiliaries[i].n_values = n_values;
         }
 
-        result->plan_capacity = moe_grouped_plan_capacity(snapshot.n_slots);
+        result->plan_capacity = moe_grouped_plan_capacity(snapshot.n_slots, !split_off);
         if (!moe_grouped_plan_size(result->plan_capacity, n_experts, &result->plan_bytes)) {
             return nullptr;
         }
@@ -8373,7 +8379,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             }
         }
         if (exchange_locations != nullptr && (snapshot.n_slot_auxiliaries != 0 || moe_early_router_enabled() ||
-                !moe_grouped_admit_decide_enabled() || !moe_grouped_admit_doorbell_enabled())) {
+                !decide_on() || !doorbell_on())) {
             GGML_LOG_ERROR("moe-cache: exchange residency needs the decide planner, no slot auxiliaries and no early router\n");
             return nullptr;
         }
@@ -8388,7 +8394,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             const bool partial = std::find(fillable.begin(), fillable.end(), 0) != fillable.end();
             if (!partial && exchange_locations == nullptr) {
                 fillable.clear();
-            } else if (!moe_grouped_admit_decide_enabled() || !moe_grouped_admit_doorbell_enabled()) {
+            } else if (!decide_on() || !doorbell_on()) {
                 use_owner_sources = false;
                 fillable.clear();
             }
@@ -8556,7 +8562,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 result->auxiliary_values_per_miss > SIZE_MAX / snapshot.n_slots) {
             return nullptr;
         }
-        if (moe_grouped_admit_shadow_enabled()) {
+        if (shadow_on()) {
             if (!moe_grouped_cuda_success(cudaMalloc(&result->admit_slot_for_expert, n_experts * sizeof(int32_t))) ||
                     !moe_grouped_cuda_success(cudaMalloc(&result->admit_cold_score, n_experts * sizeof(uint32_t))) ||
 
@@ -8571,7 +8577,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 return nullptr;
             }
             memset(result->admit_publication_host, 0, sizeof(moe_grouped_admit_publication));
-            if (moe_grouped_admit_doorbell_enabled()) {
+            if (doorbell_on()) {
                 moe_grouped_admit_group group;
                 group.packet = result->admit_publication_host;
                 for (const auto & descriptor : snapshot.banks) {
@@ -10387,7 +10393,7 @@ bool ggml_cuda_moe_grouped_context::publish_admit_activation(
         const ggml_cuda_moe_candidate_group_key & key,
         const ggml_tensor * input,
         cudaStream_t stream) {
-    if (!moe_grouped_admit_doorbell_enabled()) {
+    if (!impl_->doorbell_on()) {
         return false;
     }
     moe_grouped_admit_publication * packet = nullptr;
@@ -10417,7 +10423,7 @@ void ggml_cuda_moe_grouped_context::compare_admit_results(
         const ggml_cuda_moe_candidate_group_key & key,
         const ggml_tensor * down_output,
         cudaStream_t stream) {
-    if (!moe_grouped_admit_doorbell_enabled() || down_output == nullptr || stream == nullptr ||
+    if (!impl_->doorbell_on() || down_output == nullptr || stream == nullptr ||
             down_output->type != GGML_TYPE_F32 || !ggml_is_contiguous(down_output)) {
         return;
     }
@@ -10444,7 +10450,7 @@ void ggml_cuda_moe_grouped_context::compare_admit_results(
     const int64_t routes_per_row = n_routes;   // every row's activation is published
     static const bool env_substitute = ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_SUBSTITUTE") != nullptr;
     static const bool env_parity = ggml_moe_debug_getenv("LLAMA_MOE_ADMIT_PARITY") != nullptr;
-    const bool substitute = env_substitute || moe_grouped_admit_decide_enabled();
+    const bool substitute = env_substitute || impl_->decide_on();
     const bool parity = env_parity || !substitute;
     if (parity) {
         // Diagnostic: one thread compares in double, and substitutes if asked. Slow by design.
@@ -11288,7 +11294,7 @@ bool ggml_cuda_moe_grouped_context::publish_split_route(
     for (int i = 0; i < source->n_nodes; ++i) {
         const auto * node = source->nodes[i];
         if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == group.down && node->src[2] == ids) {
-            const auto geometry = moe_candidate_execution_geometry_for(producer, node, group.down->ne[2], impl_->state.n_slots);
+            const auto geometry = moe_candidate_execution_geometry_for(producer, node, group.down->ne[2], impl_->state.n_slots, !impl_->split_off);
             if (!geometry.grouped_eligible || geometry.n_rows != impl_->split_route_certificate.n_rows) {
                 return false;
             }
@@ -11384,7 +11390,7 @@ bool ggml_cuda_moe_grouped_context::split_route_origin_matches_locked(
             continue;
         }
         if (node->src[2] != ids || !moe_candidate_execution_geometry_for(
-                consumer, node, group.down->ne[2], impl_->state.n_slots).grouped_eligible) {
+                consumer, node, group.down->ne[2], impl_->state.n_slots, !impl_->split_off).grouped_eligible) {
             return false;
         }
         bool present = false;
@@ -12960,7 +12966,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             std::lock_guard<std::mutex> lock(impl_->mutex);
             resource = impl_->begin_decode(key, compute_stream, transaction, resource_missing);
         }
-        if (resource == nullptr || n_routes > moe_grouped_plan_capacity(resource->snapshot.n_slots)) {
+        if (resource == nullptr || n_routes > moe_grouped_plan_capacity(resource->snapshot.n_slots, !impl_->split_off)) {
             if (resource != nullptr) {
                 (void) end_group_transaction(transaction);
             }
@@ -13035,7 +13041,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             }
         }
 
-        const bool decide = moe_grouped_admit_decide_enabled() && n_rows <= MOE_GROUPED_ADMIT_MAX_ROWS &&
+        const bool decide = impl_->decide_on() && n_rows <= MOE_GROUPED_ADMIT_MAX_ROWS &&
             n_routes <= MOE_GROUPED_ADMIT_RESULT_ROUTES && device.admit_publication_device != nullptr;
         if (device.fillable != nullptr && !decide) {
             // Only the decide planner can leave unfillable experts to the CPU.
@@ -13044,7 +13050,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         }
         const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
         // The worker must be done with the previous packet before the planner rewrites its routes.
-        if (moe_grouped_admit_doorbell_enabled() && device.admit_publication_device != nullptr) {
+        if (impl_->doorbell_on() && device.admit_publication_device != nullptr) {
             moe_grouped_admit_doorbell<<<1, 1, 0, compute_stream>>>(device.admit_publication_device, 200000000ull);
             CUDA_CHECK(cudaGetLastError());
         }
@@ -13062,7 +13068,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.expert_usage, device.device_banks, (uint32_t) resource->snapshot.banks.size(), device.exchange_device);
         CUDA_CHECK(cudaGetLastError());
         // The CPU half starts now, while the fills below run, instead of after them.
-        device.admit_published_early = impl_->admit_early_input != nullptr && moe_grouped_admit_doorbell_enabled() &&
+        device.admit_published_early = impl_->admit_early_input != nullptr && impl_->doorbell_on() &&
             moe_grouped_admit_publish_input(device.admit_publication_device, device.admit_quantized,
                 impl_->admit_early_input, compute_stream);
         auto * debug = impl_->debug_stats();
@@ -13543,7 +13549,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             observation.unproven = true;
         }
         const ggml_tensor * ids = node->src[2];
-        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots, !impl_->split_off);
         const bool prefill = geometry.phase == MOE_CANDIDATE_EXECUTION_PHASE_PREFILL && !geometry.required_grouped;
         observation.prefill = observation.prefill || prefill;
         observation.decode = observation.decode || !prefill;
@@ -14038,7 +14044,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
                     bank.info.role != reader.role || !moe_candidate_record_matches(bank, node->src[0])) {
                 return false;
             }
-            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots, !impl_->split_off);
             if (!geometry.tensor_valid) {
                 geometry_invalid = true;
             }
@@ -14083,7 +14089,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         if (bank.info.role != reader.role || !moe_candidate_record_matches(bank, node->src[0])) {
             source_invalid = true;
         }
-        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots, !impl_->split_off);
         const bool reader_prefill = geometry.phase == MOE_CANDIDATE_EXECUTION_PHASE_PREFILL && !geometry.required_grouped;
         prefill = prefill || reader_prefill;
         decode = decode || !reader_prefill;
@@ -14440,7 +14446,7 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
             const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
             const auto & bank = group.banks[bank_index];
             const ggml_tensor * ids = node != nullptr ? node->src[2] : nullptr;
-            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots, !impl_->split_off);
             if (node == nullptr || node != record.nodes[role_slot] || node->op != GGML_OP_MUL_MAT_ID ||
                     (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
                     bank.info.role != role || !moe_candidate_record_matches(bank, node->src[0]) || !moe_candidate_ids_valid(ids) ||
@@ -15582,6 +15588,11 @@ bool ggml_cuda_moe_grouped_context::finish_prefill_add_id(
 #endif
 }
 
+void ggml_cuda_moe_grouped_context::set_split(bool enabled) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->split_off = !enabled;
+}
+
 ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_host_staged_group(
         ggml_cuda_moe_graph_group_dispatch * group,
         const ggml_cuda_moe_graph_binding & binding,
@@ -16367,6 +16378,22 @@ void ggml_cuda_moe_grouped_context::shutdown() {
         impl_->shutdown_complete = true;
     }
     impl_->resource_cv.notify_all();
+}
+
+bool ggml_backend_cuda_moe_set_split(ggml_backend_t backend, bool enabled) {
+    if (!ggml_backend_is_cuda(backend) || backend->context == nullptr || backend->device == nullptr) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    try {
+        std::call_once(ctx->moe_grouped_context_once, [&]() {
+            ctx->moe_grouped_context = new ggml_cuda_moe_grouped_context(backend->device, ctx->device, ctx->moe_early_router_max_rows);
+        });
+    } catch (...) {
+        return false;
+    }
+    ctx->moe_grouped_context->set_split(enabled);
+    return true;
 }
 
 extern "C"

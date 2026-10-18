@@ -2901,6 +2901,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_moe_expert_cache_slots = params_spec.n_moe_expert_cache_slots;
         result.moe_expert_cache_layer_ranges = params_spec.moe_expert_cache_layer_ranges;
         result.moe_expert_cache_byte_budgets = params_spec.moe_expert_cache_byte_budgets;
+        if (params_spec.moe_expert_split >= 0) {
+            result.moe_expert_split = (enum llama_moe_expert_split) params_spec.moe_expert_split;
+        }
         const bool draft_cache_enabled = result.n_moe_expert_cache_slots > 0 ||
             std::any_of(result.moe_expert_cache_byte_budgets.begin(), result.moe_expert_cache_byte_budgets.end(),
                 [](size_t budget) { return budget > 0; });

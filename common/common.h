@@ -340,6 +340,7 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
     int32_t n_moe_expert_cache_slots = 0; // MoE expert cache slots for the draft model; 0 = off
+    int32_t moe_expert_split = -1; // llama_moe_expert_split for the draft, < 0: same as the target
     std::vector<llama_model_layer_range> moe_expert_cache_layer_ranges;
     std::vector<size_t> moe_expert_cache_byte_budgets;
 

@@ -4589,6 +4589,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
       .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
+        {"--spec-draft-moe-expert-split"}, "inherit|on|off|auto",
+        "CPU expert split for the draft model; off fills its expert cache misses on the GPU (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            if (value == "inherit") {
+                params.speculative.draft.moe_expert_split = -1;
+            } else if (value == "on") {
+                params.speculative.draft.moe_expert_split = LLAMA_MOE_EXPERT_SPLIT_ON;
+            } else if (value == "off") {
+                params.speculative.draft.moe_expert_split = LLAMA_MOE_EXPERT_SPLIT_OFF;
+            } else if (value == "auto") {
+                params.speculative.draft.moe_expert_split = LLAMA_MOE_EXPERT_SPLIT_AUTO;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_SPLIT"));
+    add_opt(common_arg(
         {"--spec-draft-moe-expert-cache-layers"}, "N[,N-M,...]",
         "select the draft MoE expert layers eligible for caching; absent means all matching expert tensors",
         [](common_params & params, const std::string & value) {

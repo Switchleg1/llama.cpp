@@ -867,6 +867,8 @@ public:
     ggml_cuda_moe_grouped_context(const ggml_cuda_moe_grouped_context &) = delete;
     ggml_cuda_moe_grouped_context & operator=(const ggml_cuda_moe_grouped_context &) = delete;
 
+    // false keeps this context out of the CPU expert split: misses fill its GPU slots
+    void set_split(bool enabled);
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot);
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot);
     ggml_cuda_moe_candidate_registry_state state() const;
@@ -1176,6 +1178,7 @@ bool ggml_cuda_moe_quantize_q8_1_for_test(const float * input, void * output, in
 void ggml_backend_cuda_moe_hybrid_set_cold_handler(ggml_backend_moe_hybrid_cold_handler_t handler, void * user);
 void ggml_backend_cuda_moe_hybrid_set_cold_strict(bool strict);
 bool ggml_backend_cuda_moe_hybrid_configure(const struct ggml_backend_moe_hybrid_config * config);
+bool ggml_backend_cuda_moe_set_split(ggml_backend_t backend, bool enabled);
 // Registers pinned per-expert sources for later grouped resources; null hosts unregisters.
 bool ggml_backend_cuda_moe_expert_usage(ggml_backend_t backend, const ggml_tensor * tensor, uint32_t * counts, uint32_t n);
 bool ggml_backend_cuda_moe_update_expert_source(const ggml_tensor * tensor, uint32_t expert, const void * host);

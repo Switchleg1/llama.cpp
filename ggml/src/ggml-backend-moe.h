@@ -92,6 +92,10 @@ struct ggml_backend_moe_hybrid_config {
 };
 typedef bool (*ggml_backend_moe_hybrid_configure_t)(const struct ggml_backend_moe_hybrid_config * config);
 
+// Per backend instance: false keeps its expert groups out of the split, so their misses fill the GPU cache.
+#define GGML_BACKEND_MOE_SET_SPLIT_PROC_NAME "ggml_backend_moe_set_split"
+typedef bool (*ggml_backend_moe_set_split_t)(ggml_backend_t backend, bool enabled);
+
 // Prompt processing configuration, process-wide. stream_experts > 0 uploads the experts of a large cached
 // MUL_MAT_ID in groups of this size; kv_host_bulk_store writes large mapped q8_0 KV stores in bulk;
 // topk_segmented sorts multi-row top-k in one launch; ring_bytes of VRAM let the expert groups of upcoming streamed
