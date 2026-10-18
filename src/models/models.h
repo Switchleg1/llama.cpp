@@ -2434,6 +2434,11 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
+        // the KQ mask as rows of one cell, [1, n_kv, n_rows, n_stream]; one view for all layers, so the
+        // scheduler copies the host mask to the device once instead of once per layer
+        ggml_tensor * mask_cells(ggml_tensor * kq_mask, int64_t n_kv, int64_t n_rows, int64_t n_stream);
+        std::vector<ggml_tensor *> mask_cell_views;
+
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,

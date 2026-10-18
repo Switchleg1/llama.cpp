@@ -88,9 +88,17 @@ llama_memory_placement_options placement,
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // spare_cells I32 / spare_val F32 [n_spare, n_tokens/ns, ns] (optional, blk_bias only): the cells of the
+    // spare block that holds the unpooled cells, padded with cell 0 at -inf; their value is the spare block's bias
+    // blk_sel F32 [n_blocks, 1, ns] (with spare_cells): -inf at the spare block, which lists no cells, else 0
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, ggml_tensor * spare_cells = nullptr, ggml_tensor * spare_val = nullptr,
+                       ggml_tensor * blk_sel = nullptr) const;
+
+    // true when each of the ns streams of the ubatch holds one sequence whose cells cover its positions without
+    // holes or repeats; then at most 2*(ratio - 1) cells per stream are unpooled
+    bool qsa_contiguous(const llama_ubatch & ubatch, uint32_t ns) const;
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -153,7 +161,10 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, ggml_tensor * spare_cells = nullptr, ggml_tensor * spare_val = nullptr,
+                       ggml_tensor * blk_sel = nullptr) const;
+
+    bool qsa_contiguous(const llama_ubatch & ubatch) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

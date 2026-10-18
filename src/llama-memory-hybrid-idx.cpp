@@ -289,11 +289,17 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        ggml_tensor * spare_cells,
+        ggml_tensor * spare_val,
+        ggml_tensor * blk_sel) const {
     GGML_ASSERT(ratio > 0);
+    GGML_ASSERT((spare_cells == nullptr) == (blk_sel == nullptr));
     GGML_ASSERT(get_mem_idx() != nullptr);
+    GGML_ASSERT((spare_cells == nullptr) == (spare_val == nullptr) && (spare_cells == nullptr || blk_bias));
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    // block-level selection leaves cell_blk out of the graph, so it may have no buffer
+    GGML_ASSERT(cell_blk->buffer == nullptr || ggml_backend_buffer_is_host(cell_blk->buffer));
 
     const int64_t n_kv     = cell_blk->ne[0];
     const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
@@ -304,7 +310,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    std::vector<int32_t> cell_blk_scratch;
+    if (cell_blk->buffer == nullptr) {
+        cell_blk_scratch.resize(ggml_nelements(cell_blk));
+    }
+    int32_t * dst_cell_blk  = cell_blk->buffer != nullptr ? (int32_t *) cell_blk->data : cell_blk_scratch.data();
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
@@ -523,6 +533,37 @@ void llama_memory_hybrid_idx::set_input_qsa(
             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
         }
 
+        // cells that no full block covers: the spare block's cells
+        std::vector<int32_t> spare;
+        if (spare_cells != nullptr && have_dead) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!cells.is_empty(j) && blk_of[j] < 0) {
+                    spare.push_back((int32_t) j);
+                }
+            }
+        }
+        if (blk_sel != nullptr) {
+            float * dst_sel = (float *) blk_sel->data + s*n_blocks;
+            std::fill(dst_sel, dst_sel + n_blocks, 0.0f);
+            if (have_dead) {
+                dst_sel[dead_bid] = -INFINITY;
+            }
+        }
+        if (spare_cells != nullptr) {
+            const int64_t n_spare = spare_cells->ne[0];
+            GGML_ASSERT((int64_t) spare.size() <= n_spare && "qsa: more unpooled cells than the graph holds");
+            int32_t * dst_cells = (int32_t *) spare_cells->data + s*n_tps*n_spare;
+            float   * dst_val   = (float   *) spare_val->data   + s*n_tps*n_spare;
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                for (int64_t k = 0; k < n_spare; ++k) {
+                    const bool used = k < (int64_t) spare.size();
+                    // the spare block's bias is always 1e9, see below
+                    dst_cells[ii*n_spare + k] = used ? spare[k] : 0;
+                    dst_val  [ii*n_spare + k] = used ? 1e9f : -INFINITY;
+                }
+            }
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -562,6 +603,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
                     if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
+                        cur_blk_bias[b] = -INFINITY;
+                        continue;
+                    }
+
+                    // a block wholly after the query has no visible cell; -inf keeps block-level selection from taking it
+                    if (bid_idx[b] > q) {
                         cur_blk_bias[b] = -INFINITY;
                         continue;
                     }
@@ -698,8 +745,37 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        ggml_tensor * spare_cells,
+        ggml_tensor * spare_val,
+        ggml_tensor * blk_sel) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, spare_cells, spare_val, blk_sel);
+}
+
+bool llama_memory_hybrid_idx_context::qsa_contiguous(const llama_ubatch & ubatch) const {
+    return mem != nullptr && mem->qsa_contiguous(ubatch, get_n_stream());
+}
+
+bool llama_memory_hybrid_idx::qsa_contiguous(const llama_ubatch & ubatch, uint32_t ns) const {
+    if (get_mem_idx() == nullptr || ns == 0 || ubatch.n_tokens % ns != 0) {
+        return false;
+    }
+    const uint32_t n_tps = ubatch.n_tokens/ns;
+    for (uint32_t s = 0; s < ns; ++s) {
+        const llama_seq_id seq = ubatch.seq_id[s*n_tps][0];
+        const auto & cells = get_mem_idx()->get_cells(seq);
+        const llama_pos p0 = cells.seq_pos_min(seq);
+        const llama_pos p1 = cells.seq_pos_max(seq);
+        if (p0 < 0 || cells.get_used() != uint32_t(p1 - p0 + 1)) {
+            return false;
+        }
+        for (llama_seq_id other = 0; other < LLAMA_MAX_SEQ; ++other) {
+            if (other != seq && cells.seq_pos_min(other) >= 0) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
