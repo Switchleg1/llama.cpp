@@ -2421,11 +2421,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_BOUNDARY_OVERLAP"));
     add_opt(common_arg(
         {"--ple-prefetch"},
-        "experimental: advise lazy row pages before CPU GET_ROWS (Linux; Windows unvalidated) (default: disabled)",
-        [](common_params & params) {
-            params.ple_prefetch = true;
+        {"--no-ple-prefetch"},
+        "read all pages of a lazy tensor's rows at once before a CPU GET_ROWS, instead of faulting them in one by one (default: enabled)",
+        [](common_params & params, bool value) {
+            params.ple_prefetch = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PLE_PREFETCH"));
+    ).set_env("LLAMA_ARG_PLE_PREFETCH"));
     add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",

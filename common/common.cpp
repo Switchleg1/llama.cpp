@@ -1612,9 +1612,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
     if (params.ple_prefetch && !llama_set_ple_prefetch(lctx, true)) {
-        COM_ERR("%s", "failed to enable lazy row prefetch\n");
-        pimpl->context.reset();
-        return;
+        COM_WRN("%s", "lazy row prefetch is not available; rows are read on demand\n");
     }
 
     for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {

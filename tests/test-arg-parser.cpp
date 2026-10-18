@@ -623,6 +623,10 @@ static void test(void) {
         common_params ple_params;
         argv = {"binary_name"};
         assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), ple_params, LLAMA_EXAMPLE_SERVER));
+        assert(ple_params.ple_prefetch);
+
+        argv = {"binary_name", "--no-ple-prefetch"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), ple_params, LLAMA_EXAMPLE_SERVER));
         assert(!ple_params.ple_prefetch);
 
         argv = {"binary_name", "--ple-prefetch"};

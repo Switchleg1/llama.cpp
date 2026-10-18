@@ -156,7 +156,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
 | `--decode-overlap` | experimental: overlap backend-sampled decode or the first MTP draft step with result processing (default: disabled)<br/>(env: LLAMA_ARG_DECODE_OVERLAP) |
 | `--decode-boundary-overlap` | experimental: overlap decode boundary preparation and update CUDA graphs (use with --decode-overlap) (default: disabled)<br/>(env: LLAMA_ARG_DECODE_BOUNDARY_OVERLAP) |
-| `--ple-prefetch` | experimental: advise lazy row pages before CPU GET_ROWS (Linux; Windows unvalidated) (default: disabled)<br/>(env: LLAMA_ARG_PLE_PREFETCH) |
+| `--ple-prefetch, --no-ple-prefetch` | read all pages of a lazy tensor's rows at once before a CPU GET_ROWS, instead of faulting them in one by one (default: enabled)<br/>(env: LLAMA_ARG_PLE_PREFETCH) |
 
 
 ### Server-specific params
@@ -463,7 +463,7 @@ docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/l
 
 With staged decode overlap, the existing worker advises its known PLE rows after publishing the ordinary embedding. That path bypasses CPU `GET_ROWS`, so it does not advise the same gather twice.
 
-`--ple-prefetch` (or `LLAMA_ARG_PLE_PREFETCH=1`) opts into page advice for lazy-backed row reads. It is disabled by default. The CPU `GET_ROWS` path uses the actual runtime index tensor, without model or tensor-name matching, in both prefill and decode. It supports contiguous 2D source tables and I32 index vectors, including strided index vectors. Other layouts, non-lazy tables, and GPU gathers retain ordinary reads. Models must already mark the source for lazy loading; the flag does not change loading or placement. Decode overlap is not required.
+`--ple-prefetch` (default on; `--no-ple-prefetch` or `LLAMA_ARG_PLE_PREFETCH=0` turns it off) issues page advice for lazy-backed row reads (`PrefetchVirtualMemory` on Windows, `POSIX_MADV_WILLNEED` elsewhere), so the pages of a whole batch are read at once. The CPU `GET_ROWS` path uses the actual runtime index tensor, without model or tensor-name matching, in both prefill and decode. It supports contiguous 2D source tables and I32 index vectors, including strided index vectors. Other layouts, non-lazy tables, and GPU gathers retain ordinary reads. Models must already mark the source for lazy loading; the flag does not change loading or placement. Decode overlap is not required.
 
 Performance validation is Linux-only. Windows support is experimental and performance-unvalidated: builds targeting Windows 8 or newer (`_WIN32_WINNT >= 0x0602`) use dynamically resolved `PrefetchVirtualMemory`, with at most 256 merged requested page ranges per call. Older targets or a missing API retain ordinary reads. Other POSIX platforms have not been validated. Advice uses bounded scratch, does not pin the table or predict tokens, and does not change row order or dequantization. Cold reads can benefit, but resident reads have extra overhead and advice can block under memory pressure. Advice failure retains ordinary demand reads. Omit the flag and unset its environment variable (or set it to `0`) to disable advice. The CPU backend extension is optional; requesting this flag with a backend build that lacks it fails explicitly.
 

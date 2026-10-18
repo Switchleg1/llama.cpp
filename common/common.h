@@ -571,7 +571,7 @@ struct common_params {
     bool    experimental_logs          = false;
     bool    decode_overlap             = false;
     bool    decode_boundary_overlap    = false;
-    bool    ple_prefetch               = false;
+    bool    ple_prefetch               = true;
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;
