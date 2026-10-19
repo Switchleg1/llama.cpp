@@ -3004,3 +3004,24 @@ Results, warm, alternating against step 1:
 | decode at 100K | 47.2 / 49.3, 46.5 / 51.4 | 49.3 / 54.6, 47.6 / 53.9 |
 
 The prompt loss is the pool's memory: 52 instead of 56 automatic decode slots and a 351 instead of 632 MiB prompt load-ahead ring. The same build decodes 54.9 / 60.6, 53.8 / 56.5 at 8K and 46.9 / 54.6, 50.9 / 53.4 at 100K: about 9% apart, against about 28% before steps 1 and 2. Kernel time per token at 100K (`build/dec100p-nsys.sqlite`) is 15.4 ms, close to short context; what still grows is host time per step (draft calls 3.0 ms instead of 0.66 ms at 8K, other server work about 6.7 instead of 3.6 ms) and about 2 ms of kernels (indexer scores over all blocks, KV page-cache gather, attention).
+
+### Strata prompt trace, kernel by kernel
+
+`build/strata-tokens-nsys.py` runs Strata's engine without `--serve` (`--tokens-file`, `--max-new`), so nsys does not have to carry its stdin/stdout. Same 22,689-token prompt: Strata 7.24 s (3,133 tok/s; 3 chunks of 8,192; 70,353 experts streamed by DMA, 3,325 resident), GPU kernels 6.6 s in total, H2D 162 GB. Ours (24K, warm, step 2 build): about 14.5 s, kernels about 11.6 s, H2D 298 GB (about 50 GB per 4,096-token ubatch).
+
+| | Strata | ours |
+| --- | --- | --- |
+| routed-expert MMQ | 1.65 s, 8,918 calls | 4.58 s, 15,318 calls |
+| dense projections | `Kernel2` 1.88 s (BF16) | MMQ (Q4_K..Q6_K) 1.19 s |
+| attention | `prompt_attn_i8` 0.56 s | `flash_attn_ext` 1.15 s |
+| GDN recurrence | 0.36 s (+ conv, norms 0.2) | 1.30 s |
+
+Per expert type our calls take about as long as Strata's (`mul_mat_q` time is not proportional to tokens), but there are twice as many: each 4,096-token ubatch reads every expert again, Strata's 8,192-token chunks half as often. The down projections (types 20, 42) additionally launched 18,659-20,053 blocks per call against about 1,300-2,600 (grid sized for `ncols_max` = the whole ubatch, so nearly all tiles empty; 329 against 144 us per call).
+
+Tried and reverted:
+
+- `-ub 8192` on the step 2 build: 24K 17.2 / 17.1 s against 15.8 / 16.9 s, 64K 93.8 s against 53.5 s. At 8,192 tokens the MoE activations alone (`ffn_moe_down` f32 [2560, 10, tokens] = 840 MB per layer, plus gate/up) take the VRAM the expert slots and the prompt budget need; Strata combines the expert outputs in a kernel (`moe_combine_kernel`).
+- MMQ grid sized for twice the average tokens per expert, each block walking the rest of its expert's tiles (`jt_stride`, exact; test-backend-ops MUL_MAT_ID 931/931, also with a forced one-tile launch): down projections 1.29 -> 0.70 s and 0.25 -> 0.15 s, but gate/up slower with 320-block grids (0.89 -> 1.11 s and others); `mul_mat_q` 4.58 -> 4.22 s, prompt time unchanged (16.0 / 15.1 s against 16.2 / 15.4 s), and the trace shows idle rising from 11% to 20%: at 24K the prompt is now largely bound by streaming experts.
+- Not shrinking the workspace between prompt chunks of different sizes: 57.1 / 60.8 s against 56.5 / 59.0 s at 70K.
+
+So the main lever is the number of expert passes, which needs 8,192-token chunks, which needs the MoE activation memory of a chunk to shrink (combine expert outputs per group instead of keeping [n_embd, n_expert_used, n_tokens]).
