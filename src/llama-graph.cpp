@@ -3097,7 +3097,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
+        // in place: the expert outputs have no other reader, and a backend that fuses this multiply with
+        // the sum below would otherwise still allocate an unused [n_embd, n_expert_used, n_tokens] tensor
+        experts = ggml_mul_inplace(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 

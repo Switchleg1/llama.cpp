@@ -6288,6 +6288,44 @@ struct ggml_cuda_moe_weighted_reduction_match {
     int                 node_count   = 0;
 };
 
+// ggml_can_fuse_subgraph for the weighted reduction with an in-place multiply: that multiply and the views of it
+// point at the expert outputs, which the fused kernel only reads
+static bool ggml_cuda_moe_reduction_can_fuse_inplace(const ggml_cgraph * cgraph, int node_idx, int count,
+        const ggml_op * ops, int output_idx, const ggml_tensor * experts) {
+    for (int i = 0; i < count; ++i) {
+        const int idx = node_idx + i;
+        const ggml_tensor * node = cgraph->nodes[idx];
+        if (node->op != ops[i] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        if (idx == output_idx) {
+            continue;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int j = i + 1; j < count; ++j) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += cgraph->nodes[node_idx + j]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(cgraph, idx)) {
+            return false;
+        }
+        for (const ggml_tensor * v = node->view_src; v != nullptr; v = v->view_src) {
+            bool inside = v == experts;
+            for (int j = 0; j < count && !inside; ++j) {
+                inside = cgraph->nodes[node_idx + j] == v;
+            }
+            if (!inside) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_match_moe_weighted_reduction(
         const ggml_cgraph * cgraph,
         int node_idx,
@@ -6376,11 +6414,14 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
         if (candidate->op == GGML_OP_VIEW) {
             const int expert = (int) views.size();
-            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted ||
+            // an in-place multiply is itself a view, so views of it point at its source
+            const ggml_tensor * base      = weighted->view_src != nullptr ? weighted->view_src : weighted;
+            const size_t        base_offs = weighted->view_src != nullptr ? weighted->view_offs : 0;
+            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != base ||
                     candidate->type != GGML_TYPE_F32 || candidate->ne[0] != weighted->ne[0] ||
                     candidate->ne[1] != n_tokens || candidate->ne[2] != 1 || candidate->ne[3] != 1 ||
                     candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
-                    candidate->view_offs != (size_t) expert * weighted->nb[1]) {
+                    candidate->view_offs != base_offs + (size_t) expert * weighted->nb[1]) {
                 return false;
             }
             views.push_back(candidate);
@@ -6408,7 +6449,10 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     }
 
     const int output_idx = node_idx + node_count - 1;
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+    if (weighted->view_src != nullptr ?
+            weighted->view_src != experts ||
+                !ggml_cuda_moe_reduction_can_fuse_inplace(cgraph, node_idx, node_count, ops.data(), output_idx, experts) :
+            !ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
         return false;
     }
 
