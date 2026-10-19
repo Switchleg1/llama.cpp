@@ -961,7 +961,7 @@ static __global__ void mul_mat_q(
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntx, const char * __restrict__ x_secondary, const int32_t * __restrict__ x_channel_map,
         const int32_t x_channel_split, const int32_t * __restrict__ x_wait_class,
-        const uint32_t * __restrict__ x_stage_ready) {
+        const uint32_t * __restrict__ x_stage_ready, const int jt_stride) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1098,7 +1098,7 @@ static __global__ void mul_mat_q(
     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
         int tmp = fastdiv(kbc, blocks_per_ne00);
         uint2 tmp2 = fast_div_modulo(tmp, ntx);
-        const int jt = tmp2.y;
+        const int jt0 = tmp2.y;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nchannels_y);
         const int zt = tmp2.y;
@@ -1107,92 +1107,105 @@ static __global__ void mul_mat_q(
         const int wt = tmp2.y;
         const int it = tmp2.x;
 
-        // Defaults for regular matrix multiplication:
-        int col_low    = 0;
-        int col_high   = ncols_dst;
-        int col_diff   = ncols_dst;
-        int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
-        int offset_y_scale;
-        if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
-        } else {
-            GGML_UNUSED(offset_y_scale);
-        }
-
-        if (ids_dst) {
-            col_low  = expert_bounds[zt + 0];
-            col_high = expert_bounds[zt + 1];
-            col_diff = col_high - col_low;
-
-            offset_y   = 0;
-            offset_dst = 0;
+        // with jt_stride (MoE, tiling mode) a block also takes tiles jt + jt_stride, ... of its expert
+        bool skip = false;
+        for (int jt = jt0; ; jt += jt_stride) {
+            // Defaults for regular matrix multiplication:
+            int col_low    = 0;
+            int col_high   = ncols_dst;
+            int col_diff   = ncols_dst;
+            int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
+            int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+            int offset_y_scale;
             if constexpr (type == GGML_TYPE_NVFP4) {
-                offset_y_scale = 0;
+                offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
+            } else {
+                GGML_UNUSED(offset_y_scale);
             }
 
-            if (jt*J >= col_diff) {
-                kbc += blocks_per_ne00.z;
-                kbc -= fastmodulo(kbc, blocks_per_ne00);
+            if (ids_dst) {
+                col_low  = expert_bounds[zt + 0];
+                col_high = expert_bounds[zt + 1];
+                col_diff = col_high - col_low;
 
-                kb0_start = 0;
-                kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));
+                offset_y   = 0;
+                offset_dst = 0;
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    offset_y_scale = 0;
+                }
 
-                continue;
-            }
-
-            __syncthreads();
-#pragma unroll
-            for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
-                const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
-
-                if (j0 + nwarps*warp_size > J && j >= J) {
+                if (jt*J >= col_diff) {
+                    skip = true;
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
-            }
-            __syncthreads();
-        }
+                __syncthreads();
+    #pragma unroll
+                for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+                    const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
 
-        offset_y += (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
-        offset_dst += it*I;
-        const float * y_scale_tile = nullptr;
-        if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale += col_low + jt * J;
-            y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
-        }
-
-        const int tile_x_max_i = nrows_x  - it*I - 1;
-        const int tile_y_max_j = col_diff - jt*J - 1;
-
-        int x_channel = fastdiv(zt, channel_ratio);
-        const char * x_cur = x;
-        if constexpr (use_x_map) {
-            if (x_stage_ready != nullptr) {
-                const int wait_class = x_wait_class[x_channel];
-                if (wait_class != 0) {
-                    if (threadIdx.x == 0 && threadIdx.y == 0) {
-                        const volatile uint32_t * ready = x_stage_ready + wait_class - 1;
-                        while (*ready == 0) {
-                        }
+                    if (j0 + nwarps*warp_size > J && j >= J) {
+                        break;
                     }
-                    __syncthreads();
+
+                    ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                }
+                __syncthreads();
+            }
+
+            offset_y += (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
+            offset_dst += it*I;
+            const float * y_scale_tile = nullptr;
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                offset_y_scale += col_low + jt * J;
+                y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
+            }
+
+            const int tile_x_max_i = nrows_x  - it*I - 1;
+            const int tile_y_max_j = col_diff - jt*J - 1;
+
+            int x_channel = fastdiv(zt, channel_ratio);
+            const char * x_cur = x;
+            if constexpr (use_x_map) {
+                if (x_stage_ready != nullptr) {
+                    const int wait_class = x_wait_class[x_channel];
+                    if (wait_class != 0) {
+                        if (threadIdx.x == 0 && threadIdx.y == 0) {
+                            const volatile uint32_t * ready = x_stage_ready + wait_class - 1;
+                            while (*ready == 0) {
+                            }
+                        }
+                        __syncthreads();
+                    }
+                }
+                x_channel = x_channel_map[x_channel];
+                if (x_channel >= x_channel_split) {
+                    x_cur = x_secondary;
+                    x_channel -= x_channel_split;
                 }
             }
-            x_channel = x_channel_map[x_channel];
-            if (x_channel >= x_channel_split) {
-                x_cur = x_secondary;
-                x_channel -= x_channel_split;
+            const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + x_channel*stride_channel_x + it*I*stride_row_x;
+
+            constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
+            mul_mat_q_process_tile<type, J, fallback, fixup>
+                (x_cur, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+                 stride_row_x, ncols_y, stride_col_dst,
+                 tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+
+
+            if (jt_stride == 0 || !ids_dst || (jt + jt_stride)*J >= col_diff) {
+                break;
             }
         }
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + x_channel*stride_channel_x + it*I*stride_row_x;
+        if (skip) {
+            kbc += blocks_per_ne00.z;
+            kbc -= fastmodulo(kbc, blocks_per_ne00);
 
-        constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, J, fallback, fixup>
-            (x_cur, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
-             stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+            kb0_start = 0;
+            kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));
+
+            continue;
+        }
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1453,6 +1466,7 @@ struct mmq_args {
     int32_t x_channel_split = 0;
     const int32_t * x_wait_class = nullptr;
     const uint32_t * x_stage_ready = nullptr;
+    int64_t ncols_launch = 0; // MoE: tokens per expert to size the grid for; 0 sizes it for ncols_max
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1480,7 +1494,21 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, use_x_map>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
-    const int ntx  = (args.ncols_max + config.J - 1) / config.J;
+    int ntx  = (args.ncols_max + config.J - 1) / config.J;
+    // MoE: most experts get far fewer tokens than ncols_max, so empty tiles would fill the grid.
+    // Size it for ncols_launch instead; each block then walks the rest of its expert's tiles.
+    int jt_stride = 0;
+    if (args.ids_dst != nullptr && args.ncols_launch > 0 && ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+        // keep at least 8 blocks per SM: an expert's later tiles run one after another in the same block
+        const int nty_launch = (args.nrows_x + config.I - 1) / config.I;
+        const int ntzw_launch = args.nchannels_y * args.nsamples_y;
+        const int ntx_launch = std::max({1, int((args.ncols_launch + config.J - 1) / config.J),
+            (8*nsm + nty_launch*ntzw_launch - 1) / (nty_launch*ntzw_launch)});
+        if (ntx_launch < ntx) {
+            ntx       = ntx_launch;
+            jt_stride = ntx_launch;
+        }
+    }
     const int ntzw = args.nchannels_y * args.nsamples_y;
     const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
 
@@ -1502,7 +1530,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready);
+             ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready, 0);
         return;
     }
 
@@ -1511,7 +1539,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    const dim3 block_nums_stream_k(jt_stride > 0 || (GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90) ? ntiles_dst : nsm, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
@@ -1531,7 +1559,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready);
+         ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready,
+         jt_stride);
 
     if (!fixup_needed) {
         return;

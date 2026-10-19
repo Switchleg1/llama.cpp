@@ -134,6 +134,11 @@ void ggml_cuda_mmq_prepare_id_input(
     input.n_experts = src0->ne[2];
 }
 
+// MoE launch columns: twice the average tokens per expert
+static int64_t ggml_cuda_mmq_moe_launch_cols(int64_t rows, int64_t n_experts) {
+    return 2*((rows + n_experts - 1) / n_experts);
+}
+
 static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src0_secondary,
         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
@@ -266,6 +271,7 @@ static void ggml_cuda_mul_mat_q_impl(
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
+    args.ncols_launch = ggml_cuda_mmq_moe_launch_cols(ne_get_rows, ne02);
 
     args.x_secondary = (const char *) src0_secondary;
     args.x_channel_map = source_map;
@@ -301,12 +307,14 @@ void ggml_cuda_mul_mat_q_prepared(
     if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
         ncols_opt = (rows + ne02 - 1) / ne02;
     }
-    const mmq_args args = {
+    mmq_args args = {
         static_cast<const char *>(src0->data), src0->type, reinterpret_cast<const int *>(input.data.ptr),
         input.ids_dst.ptr, input.expert_bounds.ptr + first_expert, static_cast<float *>(dst->data), input.scales.ptr,
         ne00, ne01, rows, static_cast<int64_t>(nb01 / ggml_type_size(src0->type)), rows, static_cast<int64_t>(nb1 / sizeof(float)),
         ne02, ne02, static_cast<int64_t>(nb02 / ggml_type_size(src0->type)), stride_y, static_cast<int64_t>(nb2 / sizeof(float)),
         ne03, ne13, static_cast<int64_t>(nb03 / ggml_type_size(src0->type)), ne12 * stride_y, static_cast<int64_t>(nb3 / sizeof(float)), ne12, ncols_opt};
+    // the average over all experts of the input, not just this group
+    args.ncols_launch = ggml_cuda_mmq_moe_launch_cols(rows, input.n_experts);
     ggml_cuda_mul_mat_q_switch_type<false>(ctx, args, ctx.stream());
 }
 
