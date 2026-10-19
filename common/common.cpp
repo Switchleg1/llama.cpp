@@ -1477,6 +1477,12 @@ static void common_moe_cache_auto_size(common_params & params) {
                         params.moe_expert_cache_host_pinned_size != LLAMA_MOE_HOST_PINNED_OFF) {
                     params.prompt_moe_expert_cache_slots = (int32_t) top_k;
                     params.moe_prefill_ring = (int64_t) ((size_t) (slots - (int32_t) top_k) * per_slot / 4 * 3);
+                    // the prompt workspace adapts to free memory (auto KV budget), the ring does not: let the ring
+                    // take 1/4 of what the generation slots free during a prompt, which keeps the copies ahead
+                    if (params.moe_prefill_kv_budget < 0) {
+                        params.moe_prefill_ring = std::max<int64_t>(params.moe_prefill_ring,
+                            (int64_t) ((size_t) (decode_slots - (int32_t) top_k) * per_slot / 4));
+                    }
                 }
             }
             COM_INF("%s: MoE expert cache auto: %d slots for generation, %d while a prompt is processed, %.0f MiB "
