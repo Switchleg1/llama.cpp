@@ -333,6 +333,112 @@ static __global__ void mm_ids_helper(
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
+// mm_ids_helper for many tokens: NW warps per expert each scan a slice of the tokens into their own part of shared
+// memory, then write their compact rows after the rows of the warps before them. The output is the same as
+// mm_ids_helper's: rows ordered by token, the same ids_src1/ids_dst values, the same bounds and tail.
+template <int n_expert_used_template, int NW>
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*NW, 1)
+static __global__ void mm_ids_helper_mw(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        const int n_tokens, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
+    constexpr int n_expert_used = n_expert_used_template;
+    constexpr int neu_padded    = mm_ids_pow2<n_expert_used_template>::value;
+    static_assert(n_expert_used_template > 0 && neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
+
+    const int expert = blockIdx.x;
+    const int warp   = threadIdx.y;
+    const int lane   = threadIdx.x;
+
+    // dynamic shared memory: the compact rows of all warps, then the per-warp counts
+    extern __shared__ char data_mm_ids_helper[];
+    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
+    int * warp_compact = (int *) (store + n_tokens);
+    int * warp_prev    = warp_compact + NW;
+
+    const int chunk   = (n_tokens + NW - 1) / NW;
+    const int t_begin = min(n_tokens, warp * chunk);
+    const int t_end   = min(n_tokens, t_begin + chunk);
+
+    int nex_prev   = 0;
+    int it_compact = 0;
+    for (int it0 = t_begin; it0 < t_end; it0 += warp_size/neu_padded) {
+        const int it = it0 + lane / neu_padded;
+
+        const int iex = lane % neu_padded;
+        const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < t_end ?
+            ids[it*si1 + iex] : INT_MAX;
+        const int iex_used = expert_used == expert ? iex : -1;
+        nex_prev += expert_used >= 0 && expert_used < expert;
+        if (write_inverse && expert == 0 && expert_used < 0) {
+            ids_src1[it*n_expert_used + iex] = -1;
+        }
+
+        const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+
+        int it_compact_add_lower = 0;
+#pragma unroll
+        for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
+            const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
+            if (lane >= offset) {
+                it_compact_add_lower += tmp;
+            }
+        }
+
+        if (iex_used != -1) {
+            store[t_begin + it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+        }
+
+        it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+    }
+    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+    if (lane == 0) {
+        warp_compact[warp] = it_compact;
+        warp_prev[warp]    = nex_prev;
+    }
+    __syncthreads();
+
+    int expert_prev = 0;
+    int offset      = 0;
+    int total       = 0;
+#pragma unroll
+    for (int w = 0; w < NW; ++w) {
+        expert_prev += warp_prev[w];
+        offset      += w < warp ? warp_compact[w] : 0;
+        total       += warp_compact[w];
+    }
+
+    for (int itc = lane; itc < it_compact; itc += warp_size) {
+        const mm_ids_helper_store store_it = store[t_begin + itc];
+        const int it       = store_it.it();
+        const int iex_used = store_it.iex_used();
+        const int row      = expert_prev + offset + itc;
+        ids_dst[row] = it*n_expert_used + iex_used;
+        if (write_inverse) {
+            ids_src1[it*n_expert_used + iex_used] = row;
+        } else {
+            ids_src1[row] = it*sis1 + iex_used % nchannels_y;
+        }
+    }
+
+    if (!write_inverse && expert == static_cast<int>(gridDim.x) - 1) {
+        for (int i = expert_prev + total + warp*warp_size + lane; i < n_tokens*n_expert_used; i += NW*warp_size) {
+            ids_src1[i] = -1;
+        }
+    }
+    if (warp != 0 || lane != 0) {
+        return;
+    }
+
+    expert_bounds[expert] = expert_prev;
+
+    if (expert < static_cast<int>(gridDim.x) - 1) {
+        return;
+    }
+
+    expert_bounds[gridDim.x] = expert_prev + total;
+}
+
 template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
@@ -349,6 +455,18 @@ static void launch_mm_ids_helper(
     const dim3 block_size(warp_size, 1, 1);
     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
+    if constexpr (n_expert_used_template != 0) {
+        // a warp per expert would scan every token on its own
+        if (n_tokens >= 512) {
+            constexpr int NW = 8;
+            CUDA_SET_SHARED_MEMORY_LIMIT((mm_ids_helper_mw<n_expert_used_template, NW>), smpbo);
+            const size_t nbytes_shared_mw = nbytes_shared + 2*NW*sizeof(int);
+            GGML_ASSERT(nbytes_shared_mw <= smpbo);
+            mm_ids_helper_mw<n_expert_used_template, NW><<<num_blocks, dim3(warp_size, NW, 1), nbytes_shared_mw, stream>>>
+                (ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
+            return;
+        }
+    }
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
