@@ -3047,3 +3047,18 @@ New CUDA kernel for the scalar-gate form with 128-wide state (`gated_delta_net_c
 Decode host time per call after steps 1-2 (temporary stage timers in `llama_context::decode`, 256-token requests after the prompt): draft context at 8K / 100K: batch checks 6 / 6 us, memory update 1 / 1 us, slot search 40-81 / 39-42 us, graph 500-526 / 750-840 us; target slot search 243 / 33 us. Decode 51.6 tok/s at 8K, 49.1 at 100K: long-context decode is now within about 5% of short context; the remaining gap to Strata is the general decode gap.
 
 Tried and reverted: (1) reusing the BF16 conversion of a matmul input across the matmuls that share it (one cached copy in the CUDA context, invalidated when a node writes its source; exact): the shared uses are interleaved with other inputs (`hc_norm` feeds `hc_attn_down` and later `hc_attn_inject`), so only 79 of 436 conversions were reused and conversion is 0.44 s in total; no prompt gain. (2) Skipping the tg and second pp passes of a resizable prompt workspace reservation: each reservation still took 78-118 ms, since the cost is freeing and allocating the pinned host compute buffer; no gain. (3) 1.5x growth headroom for pinned host workspaces: `cudaMallocHost` took about 40 ms per call and 64K got much slower; page-locked memory is already near the Windows limit (the 50 GB registered expert file). The prompt workspace gaps (four of 170-230 ms in a 24K prompt) need the per-ubatch inputs out of pinned memory or the mask built on the device; left for later.
+
+### Decode against Strata, per verification round
+
+Same 1,041-token prompt, 256 tokens, both at 256K settings. Strata (non-serve runner): 68.45 tok/s, 95 rounds of up to 4 drafts, 2.69 tokens per round, 39.4 ms per round. Ours: 56.4 tok/s, 2 drafts (155 of 200 accepted), 2.56 tokens per round, about 45-47 ms per round. Traces (`build/stdec-nsys.sqlite`, `build/decs-nsys.sqlite`, `build/nsys-decode-compare.py`), per round:
+
+| | ours | Strata |
+| --- | --- | --- |
+| kernel time | 38.5 ms | 33.1 ms, of which 17.6 ms `wait_flag_ge_kernel` (GPU spinning on the CPU expert pool) |
+| GPU idle | 9.7 ms, spread over several handoffs | 5.7 ms, one host block per round |
+| expert transfers | `moe_grouped_gather_decode` 13.3 ms (in-step fills read from pinned host memory by an SM kernel), H2D copies 28 MB | ordinary copies 43 MB, `copy_rows_from_mapped` 0.2 ms |
+| GPU expert compute | `mul_mat_vec_q_moe` 3.3 ms and dense `mul_mat_vec_q` 5.7 ms | about 5.9 ms experts, 3.8 ms dense |
+
+Server loop per iteration (temporary section timers): target decode 37.7 ms, drafts 1.8 ms, accept/tail 1.1 ms, speculative process 0.8 ms; host work outside the target decode is about 3.9 ms, comparable to Strata's. Strata's GPU does about 15.6 ms of work per round and waits on its CPU; ours does about 33 ms, a third of it filling slots for experts it computes in the same step.
+
+Decode settings tried (8-prompt benchmark unless noted), none a lever: `--moe-expert-promote` 64:2 55.6 / 55.9, 2:2 56.1 / 56.1, 1:2 53.9, 2:1 56.5 (1,000-token runs: 16:2 54.5 / 52.4, 8:2 55.7 / 55.3, 4:2 55.7 / 54.6, 64:8 54.8 / 54.6, 0 46.3 / 46.6); `--moe-expert-split-native-dot` off 55.5 / 54.9, on 56.2 / 52.8; `--cpu-moe-draft` (68 target slots instead of 52) 49.7 / 49.5 with lower acceptance (1,455 / 3,202 against 1,637 / 2,839). Strata holds 3,325 experts on the GPU against our 2,496 (52 slots); our MTP sidecar takes about 1.5 GB of VRAM (its 512 q4_K experts, about 14 slots) against Strata's 213 MB draft head, and the QSA pool 384 MiB (4 slots).
