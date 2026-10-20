@@ -1615,7 +1615,6 @@ void llama_context::update_moe_prefill_kv_budget() {
     }
     // same margin as the prefill ring; on WDDM an overrun pages instead of failing. The ring is already allocated.
     constexpr uint64_t margin = uint64_t(768) << 20;
-    const double cells = double(sched_reserved_tokens) * double(sched_reserved_kv);
     double budget = 0.0;
     bool measured = false;
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1629,12 +1628,13 @@ void llama_context::update_moe_prefill_kv_budget() {
         size_t free = 0;
         size_t total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
-        if (used <= fixed) {
+        // a shared workspace can be resized by the peer context, so take the cost from this context's last prompt reservation
+        if (i >= moe_prefill_workspace_bytes.size() || moe_prefill_workspace_bytes[i] <= fixed) {
             continue;
         }
         // workspace = fixed + cells x (per-token cost / kv + attention cost); a larger kv lowers the cost per cell
         const uint64_t room = used + free > margin + fixed ? used + free - margin - fixed : 0;
-        const double fit = double(room) / double(used - fixed) * cells;
+        const double fit = double(room) / double(moe_prefill_workspace_bytes[i] - fixed) * double(moe_prefill_workspace_cells);
         budget = measured ? std::min(budget, fit) : fit;
         measured = true;
     }
@@ -1929,6 +1929,10 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
             if (n_tokens == n_tokens_tg) {
                 moe_decode_workspace_bytes.resize(backend_ptrs.size());
                 moe_decode_workspace_bytes[i] = backend_buf_exp_size[i];
+            } else if (live_kv) {
+                moe_prefill_workspace_bytes.resize(backend_ptrs.size());
+                moe_prefill_workspace_bytes[i] = backend_buf_exp_size[i];
+                moe_prefill_workspace_cells = uint64_t(n_tokens) * n_kv;
             }
         }
         if (backend_buf_exp_size[i] > 1) {

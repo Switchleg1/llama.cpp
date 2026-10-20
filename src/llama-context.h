@@ -519,6 +519,8 @@ private:
     // prompt chunk bound in tokens x KV cells; auto raises it into measured free VRAM
     uint64_t moe_prefill_kv_budget_live = 0;
     std::vector<uint64_t> moe_decode_workspace_bytes; // per backend, from the last decode reservation
+    std::vector<uint64_t> moe_prefill_workspace_bytes; // per backend, from the last prompt reservation
+    uint64_t moe_prefill_workspace_cells = 0;         // tokens x kv of that reservation
     void update_moe_prefill_kv_budget();
     uint32_t sched_decode_outputs = 0;
 
