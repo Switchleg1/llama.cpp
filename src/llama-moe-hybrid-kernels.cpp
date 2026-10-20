@@ -167,7 +167,7 @@ static bool cpu_has_avx2_fma() {
     return has;
 }
 
-#if !defined(_MSC_VER)
+#if !defined(_MSC_VER) || defined(__clang__)
 #define LLAMA_MOE_AVX2 __attribute__((target("avx2,fma")))
 #else
 #define LLAMA_MOE_AVX2
